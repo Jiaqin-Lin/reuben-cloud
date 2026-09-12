@@ -60,23 +60,27 @@
 
 ```
 reuben-cloud/
+├─ tsconfig.json                # 根：include packages/*/{src,test}/**/*.ts，让 `npx tsc --noEmit` 在仓库根可用
 ├─ packages/
 │  ├─ sandbox-agent/            # 容器内执行层（Phase 1–3）
-│  │  └─ src/
-│  │     ├─ index.ts            # 启动、env、优雅退出
-│  │     ├─ server.ts           # 路由表 + 鉴权 + 响应工具
-│  │     ├─ ulid.ts             # 无依赖 ULID（~40 行）
-│  │     ├─ exec/
-│  │     │  ├─ registry.ts      # 单执行并发闸 + id 生成 + 状态表
-│  │     │  ├─ spawn.ts         # argv 校验 → 进程组 → 管道接线
-│  │     │  ├─ events.ts        # 事件总线：环形缓冲 + SSE 编码 + 重放
-│  │     │  ├─ output.ts        # ≤64KiB / 100ms 合并器 + 字节计数
-│  │     │  ├─ logfile.ts       # 日志文件（含上限与降级）
-│  │     │  └─ timeout.ts       # SIGTERM → 5s → SIGKILL 进程组
-│  │     ├─ files/{paths,read,write,list}.ts
-│  │     ├─ diff.ts
-│  │     ├─ archive.ts
-│  │     └─ types.ts
+│  │  ├─ src/
+│  │  │  ├─ index.ts            # 启动、env、优雅退出
+│  │  │  ├─ server.ts           # 路由表 + 鉴权 + 响应工具
+│  │  │  ├─ config.ts           # env → Config（Phase 1 新增，理由见 Phase 1 实现备注 1）
+│  │  │  ├─ paths.ts            # 路径包含性校验：Phase 1 只服务 cwd，Phase 2 在同一个类上扩成读多根/写单根
+│  │  │  ├─ ulid.ts             # 无依赖 ULID（~40 行）
+│  │  │  ├─ exec/
+│  │  │  │  ├─ registry.ts      # 单执行并发闸 + id 生成 + 状态表
+│  │  │  │  ├─ spawn.ts         # argv 校验 → 进程组 → 管道接线
+│  │  │  │  ├─ events.ts        # 事件总线：环形缓冲 + SSE 编码 + 重放
+│  │  │  │  ├─ output.ts        # ≤64KiB / 100ms 合并器 + 字节计数
+│  │  │  │  ├─ logfile.ts       # 日志文件（含上限与降级）
+│  │  │  │  └─ timeout.ts       # SIGTERM → 5s → SIGKILL 进程组
+│  │  │  ├─ files/{read,write,list}.ts   # Phase 2（paths.ts 已在 Phase 1 落地，不再另起一份）
+│  │  │  ├─ diff.ts             # Phase 3
+│  │  │  ├─ archive.ts          # Phase 3
+│  │  │  └─ types.ts
+│  │  └─ test/                  # harness.ts + *.test.ts（布局与跑法见 §0.5）
 │  └─ control-plane/            # Phase 5, 8–12
 │     └─ src/
 │        ├─ provider/{types,local-docker}.ts
@@ -97,7 +101,11 @@ reuben-cloud/
 
 ### 0.5 测试策略
 
-- 测试框架：**`node:test` + `node:assert/strict`**（Node 内置，零依赖，与整体取舍一致）。文件命名 `*.test.ts`，跑法 `node --test`。
+- 测试框架：**`node:test` + `node:assert/strict`**（Node 内置，零依赖，与整体取舍一致）。文件命名 `*.test.ts`，放在 `packages/<pkg>/test/`，跑法 `node --test`。
+
+  两个跑法上的细节（都踩过）：
+  - 脚本里写**显式 glob**（`node --test test/*.test.ts`）。`node --test` 无参数时会把 `test/` 目录下的**所有**文件当测试文件跑，连脚手架 `harness.ts` 也会被执行一遍。
+  - 带 `--test-timeout=60000`。`node:test` 默认没有超时，一个挂住的用例会把 CI 挂到天荒。
 - 三层：
   1. **单元测试**：不依赖 Docker，`npm test` 默认跑（Phase 1–3 的大部分、状态机、SSE 解析器）。
   2. **集成测试**：需要 Docker，`npm run test:integration`（Phase 5 起的容器测试、Phase 8 起的 Postgres 测试）。
@@ -109,8 +117,8 @@ reuben-cloud/
 
 | Phase | 主题 | 依赖 | 关键产物 | §K 对应 |
 |---|---|---|---|---|
-| 1 | exec 内核（宿主机裸跑） | — | `exec/*` | 第 1 步（一半） |
-| 2 | 文件与路径 API | 1 | `files/*` | 第 1 步（另一半） |
+| 1 | exec 内核（宿主机裸跑） | — | `exec/*` + `config.ts` / `paths.ts` | 第 1 步（一半） |
+| 2 | 文件与路径 API | 1 | `files/{read,write,list}.ts` + 扩展 `paths.ts` | 第 1 步（另一半） |
 | 3 | diff 与 archive | 1,2 | `diff.ts` `archive.ts` | 第 7 步（沙箱侧） |
 | 4 | 沙箱镜像 | 1–3 | `images/sandbox/Dockerfile` | 第 2 步 |
 | 5 | LocalDockerProvider | 4 | `provider/local-docker.ts` | 第 3 步 |
@@ -140,7 +148,9 @@ reuben-cloud/
 
 ### 交付物
 
-`packages/sandbox-agent/src/{index,server,ulid}.ts` + `src/exec/{registry,spawn,events,output,logfile,timeout}.ts`。
+`packages/sandbox-agent/src/{index,server,ulid,config,paths,types}.ts` + `src/exec/{registry,spawn,events,output,logfile,timeout}.ts` + `test/harness.ts` 与 `test/*.test.ts`。
+
+（`config.ts` / `paths.ts` 不在最初的文件清单里，理由见 Phase 1 末尾的实现备注 1。）
 
 ### 具体如何实现
 
@@ -148,10 +158,20 @@ reuben-cloud/
 
 ```
 SANDBOX_AGENT_TOKEN     必填。缺失就打印一行说明并以非 0 退出（不设默认 token！）
-SANDBOX_AGENT_PORT      默认 8080
+SANDBOX_AGENT_PORT      默认 8080（测试传 0 = 随机端口）
 SANDBOX_AGENT_HOST      默认 127.0.0.1（裸跑安全；容器里由 Dockerfile 显式设 0.0.0.0）
 SANDBOX_WORKSPACE_ROOT  默认 /workspace（裸跑时指向临时目录，测试全靠它）
 SANDBOX_LOG_ROOT        默认 /tmp/reuben-cloud/exec
+SANDBOX_AGENT_HOME      默认 /tmp/agent。子进程的 HOME，agent 启动时 mkdir -p（附录 A-2）
+SANDBOX_AGENT_BASE_PATH 默认见 config.ts DEFAULT_BASE_PATH。子进程的 PATH
+SANDBOX_AGENT_LANG      默认 C.UTF-8     SANDBOX_AGENT_TERM  默认 dumb
+
+# 下列旋钮都有生产默认值，存在的意义是可测（见 Phase 1 实现备注 2）
+SANDBOX_AGENT_MAX_LOG_BYTES              默认 256 MiB
+SANDBOX_AGENT_EVENT_BUFFER_MAX_EVENTS    默认 1000    SANDBOX_AGENT_EVENT_BUFFER_MAX_BYTES 默认 1 MiB
+SANDBOX_AGENT_CHUNK_BYTES                默认 64 KiB  SANDBOX_AGENT_FLUSH_INTERVAL_MS      默认 100
+SANDBOX_AGENT_EXIT_DRAIN_MS              默认 250     SANDBOX_AGENT_KILL_GRACE_MS          默认 5000
+SANDBOX_AGENT_HEARTBEAT_MS               默认 15000
 ```
 
 `WORKSPACE_ROOT` 可配是 Phase 1 的关键设计：**同一份代码，裸跑和容器里跑的是同一条路径逻辑**。裸跑不存在的 `/workspace` 就不会让路径校验逻辑变成另一套。
@@ -317,10 +337,10 @@ Phase 1 里 `status` 只取值 `ready`（`starting` 用不到、`error` 保留�
 | 6 | 正常结束不杀后台 | `["bash","-lc","nohup sleep 300 >/dev/null 2>&1 & echo $!"]` → `completed`，且该 pid **仍然活着**（清理交给 destroy） |
 | 7 | 主动 kill | 长命令 → kill → `killed` 事件 + 进程组真死 |
 | 8 | 大输出截断 | 产出 5 MiB → 收到 `truncated`（`reason:"output_limit"`）；事件流总量 ≤ `maxOutputBytes`；日志文件字节数 = 5 MiB |
-| 9 | 二进制安全 | `printf '\x00\x01\xff'` → 收到的 chunk 是合法 UTF-8，无替换字符 |
+| 9 | 二进制安全 | `printf '\x00\x01\xff'` → 有效字节原样送达（`\x00\x01` + `é` 不被破坏）；单个非法字节 → **恰好一个** U+FFFD；JSON 往返不崩（见 Phase 1 实现备注 3） |
 | 10 | 多字节边界 | 输出 100 KB 中文 → 全文重组后与源字节一致（验证 StringDecoder） |
 | 11 | 重连重放 | 跑一条长命令，读 3 条事件后断开，带 `Last-Event-ID` 重连 → 不丢不重 |
-| 12 | 重放空洞 | 制造 > 1000 条事件，从 id=1 重连 → 收到 `truncated{reason:"replay_gap"}` |
+| 12 | 重放空洞 | 把缓冲容量调小（`eventBufferMaxEvents=3`）后跑出 ≥6 条事件，从 id=1 重连 → 收到 `truncated{reason:"replay_gap"}`（默认容量下要 100 秒起步，见 Phase 1 实现备注 2） |
 | 13 | 409 | 第一个执行未结束时第二个请求 → 409 且带 `activeExecution` |
 | 14 | 鉴权 | 无 token / 错 token / 长度不等的 token → 401 |
 | 15 | 参数校验 | 空 cmd、非数组、含 `\0`、`timeoutMs:600001` → 400；`cwd` 越界 → 400；`cwd` 不存在 → `failed` 事件 |
@@ -354,37 +374,53 @@ Phase 1 里 `status` 只取值 `ready`（`starting` 用不到、`error` 保留�
 
 ### 交付物
 
-`packages/sandbox-agent/src/files/{paths,read,write,list}.ts` + 路由接线 + `files/paths.test.ts`。
+`packages/sandbox-agent/src/files/{read,write,list}.ts` + 路由接线 + 扩展 `src/paths.ts`（Phase 1 已落地，不另起一份）+ `test/files.test.ts`。
 
 ### 具体如何实现
 
-#### 1. `resolveSafePath` —— 整个阶段的核心（`paths.ts`）
+#### 1. `RootResolver` —— 整个阶段的核心（`src/paths.ts`）
+
+Phase 1 已经落地了单根版本（`createRootResolver(root)` / `resolve(input)`，只服务 exec 的 cwd，测试在 `test/paths.test.ts`）。Phase 2 在**同一个类**上扩展成读多根 / 写单根，**不写第二份路径校验**：
 
 ```ts
-type ResolveResult =
-  | { ok: true; abs: string }
-  | { ok: false; reason: "empty" | "nul" | "out_of_bounds" };
+// 现状（Phase 1）
+class RootResolver {
+  readonly root: string;
+  readonly realRoot: string;
+  contains(abs: string): boolean;
+  resolve(input: unknown): ResolveResult;
+}
+createRootResolver(root: string): Promise<RootResolver>
 
-export function resolveSafePath(input: string, forWrite = false): ResolveResult
+// Phase 2 扩展（形状，不要求逐字对齐）
+class RootResolver {
+  resolve(input: unknown, opts?: { forWrite?: boolean }): ResolveResult;
+}
+createRootResolver(opts: { readRoots: string[]; writeRoot: string }): Promise<RootResolver>
+```
+
+```ts
+type ResolveResult = { ok: true; abs: string } | { ok: false; reason: "empty" | "nul" | "out_of_bounds" };
 ```
 
 按顺序做，**每一步都不能省**：
 
 1. 空串 / 非字符串 / 含 `\0` → 拒。
-2. `path.resolve(ROOT_REAL, input)`（相对路径按 root 解析，绝对路径原样）。
-3. 前缀检查：`abs === root || abs.startsWith(root + path.sep)`。
-   **必须带分隔符**——裸 `startsWith(root)` 会让 `/workspace-evil` 通过。
-4. `fs.realpath(abs)` 再查一次包含性。这一步是为了抓符号链接逃逸：workspace 里放一个 `ln -s /etc link`，第 3 步过得了，第 4 步过不了。
-5. 写操作的目标文件可能还不存在，`realpath` 会 ENOENT → 退而 `realpath(dirname(abs))` 再查包含性。
-   这是最容易被漏掉的一个分支，也是 `ln -s /etc x && echo pwn > x/passwd` 那条路。
+2. `path.resolve(root, input)`（相对路径按根解析，绝对路径原样）。
+3. **符号链接解析之后**再查包含性。这一步不能拆成「先看字面前缀、再看 realpath」——root 本身可能就是符号链接（macOS `/var` → `/private/var`），字面前缀检查会把 root 之内、**尚未落盘**的路径误判成越界；而真正要拦的是解析后的落点。
+4. 解析不是只对目标本身做：目标可能还不存在，而它的某一段祖先可能是指向 root 外的符号链接。做法是向上找**最深的已存在祖先**，realpath 之后再查包含性，把不存在的尾段接回去。
+   这是最容易被漏掉的一个分支，也是 `ln -s /etc x && echo pwn > x/passwd` 那条路（尾段既然不存在，里面就不可能有符号链接）。
+5. 写操作（`forWrite`）的包含性只看 writeRoot；读可以是任一 readRoot。理由见下面第 5 节。
 
-`ROOT_REAL` 在启动时 `realpath` 一次并缓存（见 Phase 1 §1）。
+`realRoot` 在启动时 `realpath` 一次并缓存（见 Phase 1 §1）。
+
+**已知残余风险（写在代码注释里，不假装解决）**：校验与 `open()` 之间存在 TOCTOU 窗口，中间可以把符号链接换掉。彻底的解法是内核的 `openat2(RESOLVE_BENEATH)`，Node 没有暴露。这里选择接受它。
 
 **已知残余风险（写进注释，不要假装解决了）**：校验与 `open()` 之间存在 TOCTOU 窗口，中间可以把符号链接换掉。彻底的解法是内核的 `openat2(RESOLVE_BENEATH)`，Node 没有暴露。这里选择接受它，威胁模型是"agent 误用或被提示注入后想读容器里的别的路径"，而容器里除了 `/workspace` 就只有只读根和 `/tmp/reuben-cloud`。**不为此发明黑名单**。
 
 #### 2. `GET /files?path=&offset=&limit=&encoding=&raw=1`
 
-- 全部走 `resolveSafePath`。目录 → 400 `is_directory`（提示用 `/files/list`）；不存在 → 404。
+- 全部走 `RootResolver.resolve`（Phase 1 已落地；Phase 2 加 `forWrite` 与多读根）。目录 → 400 `is_directory`（提示用 `/files/list`）；不存在 → 404。
 - 默认 `encoding=utf8`：JSON 返回 `{path, size, sha256, encoding, content}`。
 - **非法 UTF-8 → 报 400 `invalid_utf8`，并提示改用 `encoding=base64`**。不静默替换成 U+FFFD——静默替换会让"读到的内容和真实内容不同"这件事无人察觉。
 - `encoding=base64`：原字节往返，不猜、不嗅探。**不做自动二进制探测**：猜会猜错。
@@ -409,7 +445,7 @@ export function resolveSafePath(input: string, forWrite = false): ResolveResult
 
 #### 5. 读根扩展（为 Phase 11 的外置结果准备）
 
-允许一个**额外的只读根**：`SANDBOX_AGENT_READ_ROOTS=/workspace,/tmp/reuben-cloud`。
+允许一个**额外的只读根**：`SANDBOX_AGENT_READ_ROOTS=/workspace,/tmp/reuben-cloud`（加进 `config.ts` 的 `Config`）。
 
 - **读**可以在任一允许根之下；**写**永远只在 `/workspace`。
 - 理由：模型工具结果外置到 `/tmp/reuben-cloud/out/`，之后模型要用工具把它读回来（Phase 11）；而写进去的东西必须能被 diff/archive 看见，所以写只能落在 workspace。
