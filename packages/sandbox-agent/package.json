@@ -1,0 +1,11 @@
+{
+  "name": "@reuben-cloud/sandbox-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.ts",
+    "start": "node src/index.ts",
+    "test": "node --test --test-timeout=60000 test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  }
+}
