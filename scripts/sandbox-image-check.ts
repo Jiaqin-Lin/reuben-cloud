@@ -229,7 +229,9 @@ async function startHardenedContainer(): Promise<{ baseUrl: string }> {
     "--security-opt",
     "no-new-privileges=true",
     "--tmpfs",
-    "/tmp:rw,nosuid,size=512m,mode=1777",
+    // 带 `exec`：Docker 对 tmpfs 的缺省里含 noexec，不显式写 exec 就会被加上，
+    // 而 npm postinstall / node-gyp / python console script 都要从 /tmp 执行文件（§F.1）。
+    "/tmp:rw,exec,nosuid,size=512m,mode=1777",
     "--memory",
     "2g",
     "--memory-swap",

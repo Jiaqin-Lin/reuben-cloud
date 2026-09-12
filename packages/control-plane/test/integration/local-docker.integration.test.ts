@@ -191,6 +191,10 @@ describe("LocalDockerProvider（集成）", () => {
       assert.deepEqual(Object.keys(tmpfs), ["/tmp"]);
       assert.match(tmpfs["/tmp"]!, /size=512m/);
       assert.match(tmpfs["/tmp"]!, /mode=1777/);
+      // **必须显式带 `exec`**：Docker 会给 tmpfs 默认加上 noexec，而 npm postinstall /
+      // node-gyp / python venv 的 console script 都要从 /tmp 执行文件（§F.1 明确不加 noexec）。
+      // 这个坑是 Phase 6 的 pip 用例抓到的，断言留在这里防止有人“顺手”去掉。
+      assert.match(tmpfs["/tmp"]!, /(^|,)exec(,|$)/, "tmpfs 必须显式 exec，否则 Docker 会加 noexec");
       assert.deepEqual(host.Binds, [`${handle.volumeName}:/workspace`]);
 
       // 宿主 socket / 宿主命名空间 / bind mount：这几个字段必须都是空/假。

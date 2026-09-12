@@ -151,8 +151,12 @@ export interface ManagedSandbox {
   running: boolean;
 }
 
-/** 只有两种角色。`port-forward` 只在 darwin 上出现。 */
-export type ContainerRole = "sandbox" | "port-forward";
+/**
+ * 容器角色。`sandbox` 是本体，`port-forward` 只在 darwin 上出现（端口转发），
+ * `egress-proxy` 是全局唯一的出网代理（Phase 6）——它带 `managed=true` 标签但是没有 sandboxId，
+ * 对账（Phase 8）必须把它和上面两类分开处理：**代理不是沙箱，不能被当成孤儿删掉**。
+ */
+export type ContainerRole = "sandbox" | "port-forward" | "egress-proxy";
 
 /**
  * Provider 层的失败原因。**结构化原因是这个接口最重要的输出之一**：
@@ -168,6 +172,8 @@ export type ProviderErrorReason =
   | "unsupported_docker_host"
   /** 拉镜像失败（registry 不认、网络不通、manifest 不存在）。 */
   | "image_pull_failed"
+  /** 本地没有这个镜像，而且它**没有 registry 可拉**（egress-proxy 就是本机构建的）。 */
+  | "image_not_found"
   /** 拉镜像超预算（默认 120s，§D）。 */
   | "image_pull_timeout"
   /** 同名容器已经存在，而且不是我们管的（标签不匹配）。绝不删别人的容器。 */
@@ -271,6 +277,12 @@ export const INTERNAL_NETWORK = "reuben-cloud-internal";
  */
 export const PROXY_HOST = "reuben-cloud-proxy";
 export const PROXY_PORT = 3128;
+
+/**
+ * egress-proxy 的容器名。**等于内网别名**：只有全局一个，不带 sandboxId。
+ * Phase 7 的冒烟脚本、Phase 8 的对账、`npm run proxy:up/down` 全部用它找代理。
+ */
+export const PROXY_CONTAINER_NAME = PROXY_HOST;
 
 /** 容器名的唯一来源。sandboxId 已经是 `sbx_<ulid>`，这里只加前缀。 */
 export function sandboxContainerName(sandboxId: string): string {

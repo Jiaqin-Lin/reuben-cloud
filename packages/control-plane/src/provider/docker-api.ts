@@ -14,7 +14,8 @@
  * 但它这几年对旧版本一直在放宽（daemon 的 MinAPIVersion 现在是 1.40），
  * 写死一个版本能保证"本地能跑、CI 上也能跑"，而不是取决于 daemon 的心情。
  *
- * 【在链路中的位置】`local-docker.ts` 是唯一的使用者。它把这里的 `DockerApiError`
+ * 【在链路中的位置】provider 文件夹是**唯一**允许import 这个文件的地方（Phase 5 起是
+ * `local-docker.ts`，Phase 6 加上 `egress-proxy.ts`）。它们把这里的 `DockerApiError`
  * 翻译成 `ProviderError`（带结构化原因），所以这一层不需要知道沙箱、spec 或安全策略，
  * 只需要知道"怎么跟 docker daemon 说话"。
  */
@@ -437,6 +438,8 @@ export function serializeQuery(query: DockerRequestOptions["query"]): string {
 export interface DockerContainerInspect {
   Id: string;
   Name: string;
+  /** 容器使用的镜像 **digest**（`sha256:…`）。用来判断"这个容器还是不是我期望的那个镜像"。 */
+  Image?: string;
   Config?: {
     Image?: string;
     User?: string;
@@ -543,8 +546,10 @@ export interface DockerCreateContainerRequest {
   Cmd?: string[];
   Entrypoint?: string[];
   HostConfig: DockerHostConfig;
-  /** 多网络容器（darwin 的转发容器）。主网络仍由 `HostConfig.NetworkMode` 决定。 */
-  NetworkingConfig?: { EndpointsConfig: Record<string, Record<string, never>> };
+  /** 多网络容器（darwin 的转发容器、Phase 6 的 egress-proxy）。
+   * 主网络仍由 `HostConfig.NetworkMode` 决定；这里列出的是"之外的"那张网。
+   * `Aliases` 是内网 DNS 里的名字（代理必须能被沙箱用 `reuben-cloud-proxy` 找到）。 */
+  NetworkingConfig?: { EndpointsConfig: Record<string, { Aliases?: string[] }> };
 }
 
 /** `GET /networks/{name}` 里我们读的字段（校验已有网络真的是 internal）。 */
@@ -554,4 +559,18 @@ export interface DockerNetworkInfo {
   Driver?: string;
   Internal?: boolean;
   Labels?: Record<string, string> | null;
+}
+
+/**
+ * `GET /images/{ref}/json` 里我们读的字段。
+ *
+ * 用途只有一个：把本机构建的镜像引用解析成 **digest 引用**（`repo@sha256:…`）。
+ * egress-proxy 没有 registry 可拉，所以这个解析必须在本地完成。
+ *  - `RepoDigests`：push/拉过、或者 containerd 存储记过的镜像有；本地构建的通常为空。
+ *  - `Id`：镜像 config 的 sha256。把它当 digest 用能解析到本地镜像（Phase 5 实测如此）。
+ */
+export interface DockerImageInspect {
+  Id: string;
+  RepoTags?: string[] | null;
+  RepoDigests?: string[] | null;
 }

@@ -1,0 +1,28 @@
+# reuben-cloud egress-proxy 白名单（spec Phase 6 §2）。
+#
+# 一行一个模式，`#` 开头是注释，行尾也可以跟注释。规则（由 src/allowlist.ts 执行）：
+#   - 精确域名：registry.npmjs.org
+#   - 子域通配：*.npmjs.org（**只允许这一种通配形式**，且不匹配 apex：npmjs.org 本身不算）
+#   - **禁止裸 `*`**：加载时检查，出现就拒绝启动——一条无心的通配会把整个边界变成装饰品
+#   - 域名一律小写、去尾部点；**IP 直连一律拒绝**（IP 不匹配任何域名模式，自然被拒）
+#   - 不写端口：端口由请求自己带，代理只回答"这个域名在不在名单里"
+#
+# 这份清单的宽度**就是信任边界**（§F.6.3）：每加一行都要有人 review 过。
+# 唯一的用途是"让沙箱能装依赖"，不是"让沙箱能上网"。
+#
+# 【为什么没有 github.com / codeload.github.com / raw.githubusercontent.com】
+# 仓库由 CP 用 GitHub App 的凭据取（§F.2 红线）：沙箱不需要、也不允许碰 GitHub。
+# 同一个理由下，任何"为了图方便"临时加一行 github 的做法都是错的——那会让 clone/push
+# 的凭据边界失去意义。
+
+registry.npmjs.org          # npm registry
+pypi.org                    # pip index
+files.pythonhosted.org      # pip 的包文件 CDN
+proxy.golang.org            # go modules
+sum.golang.org              # go checksum database
+crates.io                   # cargo index
+static.crates.io            # cargo 的包文件 CDN
+index.crates.io             # cargo sparse index
+repo1.maven.org             # maven central
+deb.debian.org              # apt（明文 http，见 proxy.ts 的绝对 URI 分支）
+security.debian.org         # debian security 源

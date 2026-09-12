@@ -288,8 +288,9 @@ function requireIdentifier(value: unknown, field: string, bad: (message: string)
  *  - `Memory == MemorySwap` —— 两者不等等于 swap 可用，内存上限形同虚设。
  *  - `Init: true` —— tini 回收僵尸，否则 agent 起的后台进程会把 pids 上限耗光。
  *  - `Tmpfs` 只有 /tmp 一项 —— 只读根之外的可写点必须逐个显式列出。
- *  - `Binds` 只允许命名卷 —— 没有 bind mount 的输入端（参数由调用方给定字符串，
- *    且调用方只有这一处）。
+ *  - `Binds`：沙箱容器只允许命名卷；唯一一个 bind mount 的消费者是 egress-proxy
+ *    （Phase 6 需要宿主文件与容器内路径是同一份内容才能 SIGHUP 换白名单，见 egress-proxy.ts）。
+ *  - `LogConfig` 默认按附录 A-11 轮转；代理传自己的（100m × 5）。
  */
 export function buildHostConfig(input: {
   networkName: string;
@@ -300,8 +301,10 @@ export function buildHostConfig(input: {
   tmpfsMb: number;
   /** 有值才发布端口（darwin 的转发容器）。沙箱容器**永远**不传它。 */
   publishPort?: number;
-  /** 非默认的 tmpfs 选项（转发容器用 noexec）。 */
+  /** 非默认的 tmpfs 选项（转发容器与 egress-proxy 用 noexec）。 */
   tmpfsOptions?: string;
+  /** 非默认的日志轮转（egress-proxy 用 100m × 5）。 */
+  logConfig?: DockerHostConfig["LogConfig"];
 }): DockerHostConfig {
   const hostConfig: DockerHostConfig = {
     ReadonlyRootfs: true,
@@ -314,14 +317,19 @@ export function buildHostConfig(input: {
     PidsLimit: input.pids,
     Init: true,
     Tmpfs: {
-      "/tmp": input.tmpfsOptions ?? `rw,nosuid,size=${input.tmpfsMb}m,mode=1777`,
+      // 沙箱的 /tmp **必须 exec**：Docker 对 tmpfs 的缺省里带了 noexec，不显式写 `exec`
+      // 就会被加上（实测：`rw,nosuid,size=512m,mode=1777` → 挂载结果里多了 noexec）。
+      // 那会打断 npm 的 postinstall / node-gyp / python venv 里的 console script——
+      // 它们都要从 /tmp 执行一个刚写进去的文件。§F.1 明确说了这条取舍：
+      // 攻击者本来就能在 /workspace 执行任意代码，noexec 换不来实际安全增益，却会真地弄坏可用性。
+      "/tmp": input.tmpfsOptions ?? `rw,exec,nosuid,size=${input.tmpfsMb}m,mode=1777`,
     },
     Binds: input.binds,
     // 内网：没有出口路由，唯一的出网路径是 Phase 6 的代理容器。
     NetworkMode: input.networkName,
     RestartPolicy: { Name: "no" },
     AutoRemove: false,
-    LogConfig: LOG_CONFIG,
+    LogConfig: input.logConfig ?? LOG_CONFIG,
   };
   if (input.publishPort !== undefined) {
     // HostIp 硬编码成 127.0.0.1：**绝不发布到 0.0.0.0**（§Phase 5 的原文）。
@@ -397,6 +405,7 @@ export function buildForwarderContainerRequest(input: {
       publishPort: AGENT_PORT,
     }),
     // 主网络是内网（默认路由不给它），再加一个默认 bridge 让端口发布生效。
+    // Phase 6 的 egress-proxy 反过来：主网络是 bridge（出口路由在那里），内网靠别名挂上去。
     NetworkingConfig: {
       EndpointsConfig: { [input.networkName]: {}, bridge: {} },
     },
@@ -583,7 +592,8 @@ export class LocalDockerProvider implements SandboxProvider {
     try {
       // 第 3/4 步：网络与卷。网络放在卷前面（相对正文挪了一处，理由见实现备注 7）：
       // 它是共享资源（建一次就够、且幂等），失败时不该留下一个待清理的卷。
-      await this.#ensureNetwork(deadline);
+      // Phase 6 的 egress-proxy 也用同一份实现（它必须挂在同一张内网上）。
+      await ensureInternalNetwork(this.docker, this.#options.networkName, { timeoutMs: budgetTimeout(deadline) });
       await this.#createVolume(volumeName, clean, deadline);
       volumeCreated = true;
 
@@ -716,7 +726,7 @@ export class LocalDockerProvider implements SandboxProvider {
         containerName: (summary.Names?.[0] ?? "").replace(/^\//, ""),
         runId: labels[LABEL_RUN_ID] ?? null,
         taskId: labels[LABEL_TASK_ID] ?? null,
-        role: (labels[LABEL_ROLE] === "port-forward" ? "port-forward" : "sandbox") as ContainerRole,
+        role: toContainerRole(labels[LABEL_ROLE]),
         state: summary.State ?? "unknown",
         running: summary.State === "running",
       } satisfies ManagedSandbox;
@@ -803,48 +813,6 @@ export class LocalDockerProvider implements SandboxProvider {
       }
       const cause = error instanceof Error ? error.message : String(error);
       throw new ProviderError("image_pull_failed", `拉镜像失败：${cause}`, { image });
-    }
-  }
-
-  /**
-   * 建内网（幂等）。已存在时**校验它真的是 internal**：
-   * 如果名字被一个普通 bridge 网络占了，这里必须失败而不是"能用就行"——
-   * 用错网络的后果是沙箱直接能上公网，而这件事在功能测试里完全看不出来。
-   */
-  async #ensureNetwork(deadline: number): Promise<void> {
-    try {
-      await this.docker.json("POST", "/networks/create", {
-        body: {
-          Name: this.#options.networkName,
-          Driver: "bridge",
-          Internal: true, // ← 没有出口路由。整个隔离模型的地基。
-          Labels: { [LABEL_MANAGED]: "true", [LABEL_ROLE]: "internal-network" },
-        },
-        timeoutMs: budgetTimeout(deadline),
-      });
-      return;
-    } catch (error) {
-      if (!isDockerError(error, 409)) throw asProviderError(error, "network_create");
-    }
-
-    // 409 = 已经存在。查它的属性，而不是假设它是对的。
-    let info: DockerNetworkInfo;
-    try {
-      info = await this.docker.json<DockerNetworkInfo>(
-        "GET",
-        `/networks/${encodeURIComponent(this.#options.networkName)}`,
-        { timeoutMs: budgetTimeout(deadline) },
-      );
-    } catch (error) {
-      throw asProviderError(error, "network_inspect");
-    }
-    if (info.Internal !== true || (info.Driver ?? "") !== "bridge") {
-      throw new ProviderError(
-        "network_conflict",
-        `网络 ${this.#options.networkName} 已存在，但它不是 internal bridge（Internal=${String(info.Internal)}, Driver=${String(info.Driver)}）。` +
-          `它是沙箱隔离的地基，不能将就。`,
-        { network: this.#options.networkName, internal: info.Internal, driver: info.Driver },
-      );
     }
   }
 
@@ -1220,6 +1188,62 @@ export function asProviderError(error: unknown, step?: string): ProviderError {
     });
   }
   return new ProviderError("docker_error", String(error), { step });
+}
+
+/**
+ * 建共用内网（幂等）。**导出**是因为它不是沙箱的私事：Phase 6 的 egress-proxy 必须挂在
+ * 同一张网络上才能被沙箱用 `reuben-cloud-proxy` 找到，而网络校验不能有第二份实现。
+ *
+ * 已存在时**校验它真的是 internal**：如果名字被一个普通 bridge 网络占了，这里必须失败
+ * 而不是"能用就行"——用错网络的后果是沙箱直接能上公网，而这件事在功能测试里完全看不出来。
+ */
+export async function ensureInternalNetwork(
+  docker: DockerClient,
+  networkName: string,
+  options: { timeoutMs?: number } = {},
+): Promise<void> {
+  try {
+    await docker.json("POST", "/networks/create", {
+      body: {
+        Name: networkName,
+        Driver: "bridge",
+        Internal: true, // ← 没有出口路由。整个隔离模型的地基。
+        Labels: { [LABEL_MANAGED]: "true", [LABEL_ROLE]: "internal-network" },
+      },
+      timeoutMs: options.timeoutMs,
+    });
+    return;
+  } catch (error) {
+    if (!isDockerError(error, 409)) throw asProviderError(error, "network_create");
+  }
+
+  // 409 = 已经存在。查它的属性，而不是假设它是对的。
+  let info: DockerNetworkInfo;
+  try {
+    info = await docker.json<DockerNetworkInfo>("GET", `/networks/${encodeURIComponent(networkName)}`, {
+      timeoutMs: options.timeoutMs,
+    });
+  } catch (error) {
+    throw asProviderError(error, "network_inspect");
+  }
+  if (info.Internal !== true || (info.Driver ?? "") !== "bridge") {
+    throw new ProviderError(
+      "network_conflict",
+      `网络 ${networkName} 已存在，但它不是 internal bridge（Internal=${String(info.Internal)}, Driver=${String(info.Driver)}）。` +
+        `它是沙箱隔离的地基，不能将就。`,
+      { network: networkName, internal: info.Internal, driver: info.Driver },
+    );
+  }
+}
+
+/**
+ * 标签里的角色 → 强类型的角色。认不出的值一律当 `sandbox`（Phase 5 的旧行为），
+ * 但三个已知角色必须显式列出：对账（Phase 8）靠它区分"沙箱本体 / 端口转发 / 出网代理"，
+ * 把代理误当成沙箱会产生一类很难查的"对账总是删掉自己的基础设施"故障。
+ */
+function toContainerRole(value: string | undefined): ContainerRole {
+  if (value === "port-forward" || value === "egress-proxy") return value;
+  return "sandbox";
 }
 
 /** `AbortSignal.timeout()` 与 fetch 超时都会抛这两种名字的错误。直接复用 docker-api 的判据，

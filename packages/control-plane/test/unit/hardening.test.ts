@@ -74,6 +74,8 @@ test("加固参数：HostConfig 逐条对齐 §F.1", () => {
   assert.deepEqual(Object.keys(hostConfig.Tmpfs), ["/tmp"]);
   assert.match(hostConfig.Tmpfs["/tmp"]!, /mode=1777/);
   assert.match(hostConfig.Tmpfs["/tmp"]!, /size=512m/);
+  // 必须显式写 exec：Docker 会给 tmpfs 默认加 noexec（Phase 6 的 pip 用例踩到过）。
+  assert.match(hostConfig.Tmpfs["/tmp"]!, /(^|,)exec(,|$)/);
 
   // 沙箱容器自己不发布任何端口（darwin 的端口发布在转发容器上）。
   assert.equal(hostConfig.PortBindings, undefined);

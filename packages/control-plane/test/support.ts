@@ -186,6 +186,9 @@ function isMissing(stderr: string, kind: string): boolean {
 /** 集成测试默认用的本地镜像 tag（`npm run build:image` 或 `npm run check:image` 建出来的）。 */
 export const DEFAULT_IMAGE_TAG = process.env.SANDBOX_IMAGE ?? "reuben-cloud/sandbox-base:dev";
 
+/** egress-proxy 的本地镜像 tag（`npm run build:proxy-image` 建出来的）。 */
+export const DEFAULT_PROXY_IMAGE_TAG = process.env.EGRESS_PROXY_IMAGE ?? "reuben-cloud/egress-proxy:dev";
+
 /**
  * 把本地镜像解析成 **digest 引用**（`repo@sha256:…`）。
  *
@@ -195,9 +198,10 @@ export const DEFAULT_IMAGE_TAG = process.env.SANDBOX_IMAGE ?? "reuben-cloud/sand
  * containerd 存储的 `.Id` 就是 manifest digest），provider 的 `#ensureImage` 又是
  * "本地命中就不拉"，所以本地开发不需要任何 registry。
  *
+ * @param hint 镜像不存在时告诉使用者该跑哪条命令。两个镜像的构建命令不同，所以让它可选。
  * @throws 镜像不存在时抛出，并告诉使用者先跑构建命令——比让 create 报"拉镜像失败"清楚得多。
  */
-export async function resolveImageRef(tag: string = DEFAULT_IMAGE_TAG): Promise<string> {
+export async function resolveImageRef(tag: string = DEFAULT_IMAGE_TAG, hint = "npm run build:image"): Promise<string> {
   const result = await docker([
     "image",
     "inspect",
@@ -207,7 +211,7 @@ export async function resolveImageRef(tag: string = DEFAULT_IMAGE_TAG): Promise<
   ]);
   if (result.code !== 0) {
     throw new Error(
-      `本地没有镜像 ${tag}。先跑 \`npm run build:image\`（或用 SANDBOX_IMAGE 指定别的镜像）。\n${result.stderr.trim()}`,
+      `本地没有镜像 ${tag}。先跑 \`${hint}\`（或用 SANDBOX_IMAGE / EGRESS_PROXY_IMAGE 指定别的镜像）。\n${result.stderr.trim()}`,
     );
   }
   const [id, repoDigestsJson] = result.stdout.trim().split(" ");
@@ -253,7 +257,7 @@ export async function agentExec(
   baseUrl: string,
   token: string,
   cmd: string[],
-  options: { timeoutMs?: number; maxOutputBytes?: number } = {},
+  options: { timeoutMs?: number; maxOutputBytes?: number; env?: Record<string, string> } = {},
 ): Promise<ExecOutcome> {
   const accepted = await fetch(`${baseUrl}/exec`, {
     method: "POST",
@@ -261,6 +265,7 @@ export async function agentExec(
     body: JSON.stringify({
       cmd,
       timeoutMs: options.timeoutMs ?? 30_000,
+      ...(options.env === undefined ? {} : { env: options.env }),
       ...(options.maxOutputBytes === undefined ? {} : { maxOutputBytes: options.maxOutputBytes }),
     }),
   });
@@ -269,7 +274,10 @@ export async function agentExec(
   }
   const { execution_id: executionId } = (await accepted.json()) as { execution_id: string };
 
-  const events = await readEvents(`${baseUrl}/exec/${executionId}/events`, token, { timeoutMs: 60_000 });
+  // SSE 读取的预算要比命令自己的预算宽一点：命令跑到时限被杀之后，终态事件与剩余输出
+  // 还要有机会被读出来。固定 60s 会让"长命令"用例在最后一条事件上被本地超时误伤。
+  const readTimeoutMs = Math.max(60_000, (options.timeoutMs ?? 30_000) + 15_000);
+  const events = await readEvents(`${baseUrl}/exec/${executionId}/events`, token, { timeoutMs: readTimeoutMs });
   const terminal = events.at(-1)!;
   const collect = (stream: "stdout" | "stderr"): string =>
     events
