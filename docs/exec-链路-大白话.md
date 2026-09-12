@@ -31,6 +31,16 @@ Phase 2 又加了文件那半边三条（往沙箱里灌 tar、读回日志/patc
 `docs/sandbox-spec.md` 的 Phase 2，以及 `src/paths.ts` / `src/files/*.ts` 的头注释里。
 本文只讲 exec 那条链路——文件 API 是另一条链路，混进来会把这张图弄糊。
 
+Phase 3 再加两条「产出」端点（它们是流，不进事件流；细节在 spec 的 Phase 3）：
+
+| 你想干的事 | 调它 |
+|---|---|
+| 相对 base commit 的 patch + 结构化文件列表 | `GET /diff?base=<sha>&path=<repo>`（超 2 MiB 的 patch 外置，给 `patch_log_path`） |
+| 整个 workspace 的 tar.gz（流式，默认含被忽略的构建产物） | `GET /archive`（`?dryRun=1` 先问体积，`?exclude=a,b` 排除） |
+
+这两条和 exec **共用同一个 BUSY 槽**（不能边跑测试边打包），超时、断线杀进程组、
+槽的归还这三件事的公共实现是 `src/stream.ts`。
+
 所有请求都要带 `Authorization: Bearer <token>`——包括 `/health`。别觉得本机跑没用，容器化之后这是内网唯一的门锁。
 
 **它最核心的一个设计决定**：`POST /exec` **不等命令跑完就返回**。返回 202 + 一个 id，然后你拿着 id 去开一条 SSE 长连接收输出。为什么？见 §6 的 Q1。

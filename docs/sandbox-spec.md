@@ -79,6 +79,7 @@ reuben-cloud/
 │  │  │  ├─ files/{read,write,list}.ts   # Phase 2（paths.ts 已在 Phase 1 落地，不再另起一份）
 │  │  │  ├─ diff.ts             # Phase 3
 │  │  │  ├─ archive.ts          # Phase 3
+│  │  │  ├─ stream.ts           # Phase 3：BUSY 槽 + 总时限 + 断线回收进程组（diff/archive 共用）
 │  │  │  └─ types.ts
 │  │  └─ test/                  # harness.ts + *.test.ts（布局与跑法见 §0.5）
 │  └─ control-plane/            # Phase 5, 8–12
@@ -119,7 +120,7 @@ reuben-cloud/
 |---|---|---|---|---|
 | 1 | exec 内核（宿主机裸跑） | — | `exec/*` + `config.ts` / `paths.ts` | 第 1 步（一半） |
 | 2 | 文件与路径 API | 1 | `files/{read,write,list}.ts` + 扩展 `paths.ts` | 第 1 步（另一半） |
-| 3 | diff 与 archive | 1,2 | `diff.ts` `archive.ts` | 第 7 步（沙箱侧） |
+| 3 | diff 与 archive | 1,2 | `diff.ts` `archive.ts` `stream.ts` | 第 7 步（沙箱侧） |
 | 4 | 沙箱镜像 | 1–3 | `images/sandbox/Dockerfile` | 第 2 步 |
 | 5 | LocalDockerProvider | 4 | `provider/local-docker.ts` | 第 3 步 |
 | 6 | egress-proxy | 5 | `deploy/egress-proxy/*` | 第 4 步 |
@@ -517,7 +518,7 @@ type ResolveResult = { ok: true; abs: string } | { ok: false; reason: "empty" | 
 
 ### 交付物
 
-`packages/sandbox-agent/src/{diff,archive}.ts`。
+`packages/sandbox-agent/src/{diff,archive}.ts` + `src/stream.ts`（新增，理由见末尾实现备注 1）。
 
 ### 具体如何实现
 
@@ -606,14 +607,32 @@ tar czf - -C /workspace .
 
 ### 验收标准
 
-- [ ] 上表 11 个用例全绿
-- [ ] patch apply 往返后两边树内容一致（sha256 相等）
-- [ ] archive 包含构建产物
-- [ ] 中断传输后无残留 tar/git 进程
-- [ ] `tsc --noEmit` 通过
+- [x] 上表 11 个用例全绿（跑法：`npm test -w @reuben-cloud/sandbox-agent`，新增 3 个测试文件共 21 条）
+- [x] patch apply 往返后两边树内容一致（sha256 相等）
+- [x] archive 包含构建产物
+- [x] 中断传输后无残留 tar/git 进程
+- [x] `tsc --noEmit` 通过
 
 **完成标记：**
-- [ ] **Phase 3 完成** — diff/archive 可用、可中断、可被 CP 消费
+- [x] **Phase 3 完成** — diff/archive 可用、可中断、可被 CP 消费
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **多一个文件 `src/stream.ts`**：BUSY 槽的复用（`registry.acquireSlot` / `releaseSlot`）、总时限、断线时回收进程组，是 diff 与 archive 共同需要的。写两遍就会有两个进程组回收实现——而 §K 把"进程组回收"列为整个方案唯一有真风险的部分。exec 那边的等价逻辑在 `exec/timeout.ts`（事件流驱动），这里由 HTTP 响应驱动。顺带：`registry.shutdown()` 会连同这些流式任务一起取消，否则 detached 的 tar/git 会在 agent 退出后活下来（容器停掉时会被一起清掉，裸跑 Ctrl-C 不会）。
+2. **`GET /diff` 接受可选的 `?path=`**，默认 workspace 根。仓库在 workspace 里的位置由调用方说：Phase 9 把仓库解到 `/workspace`，Phase 11 的 `REPO_DIR` 又写着 `/workspace/repo`——沙箱不猜，谁灌谁知道。校验走同一份 `RootResolver`（按写校验，因为 `git add -A -N` 会改 `.git/index`）。
+3. **`/diff` 的失败码分得更细**：`invalid_base`（空/含 NUL/以 `-` 开头/超长，不能让它变成 git 的命令行开关）、`unknown_base`（git 认不出来，带 stderr）、`not_a_git_repository`、`git_error`、`patch_too_large`、`spawn_failed`、`stream_timeout`；`?path=` 越界与文件 API 共用 `path_out_of_bounds`。
+4. **patch 外置上限 `SANDBOX_AGENT_MAX_PATCH_SPILL_BYTES`（默认 256 MiB）**：正文只写了"超过 2 MiB 就外置"，但外置落在 tmpfs 上，而 tmpfs 页面计入 cgroup 内存（A-9 为日志写下的同一条理由）。没有第二道线时，一个几百 MiB 的 diff 能把容器 OOM。超限回 413，正好接上 Phase 9 本来就有的 archive 回退。
+5. **patch 不是合法 UTF-8 时也外置**：JSON 字符串装不下任意字节，`Buffer.toString("utf8")` 会把它们换成 U+FFFD——对一份要 `git apply` 的补丁来说，那就是"apply 出来的代码和沙箱里验证过的不是同一份"。这类 patch 同样返回 `truncated:true` + `patch_log_path`（内容完整，只是不在内联字段里）。用例 4b 覆盖。
+6. **`files[]` 多了 `old_path`，状态用词而不是 git 字母**：renamed / copied 的两个路径都要给（UI 要显示 old → new）；A/M/D/R/C/T 映射成词，认不出的给 `unknown`。增删行数来自 `--numstat`，二进制文件是 0/0 + `binary:true`（那个 0 必须结合标志读）。
+7. **`dryRun` 在 Node 里数目录，不调 `du -sb`**：`-b` 是 GNU 专有（macOS 的 BSD du 没有），而且 `file_count` 用 du 也数不出来。口径与 `du -sb` 一致（每个条目 `lstat` 的 `st_size` 累加，不跟随符号链接），exclude 按路径组件名匹配（和 tar 对不带斜杠的 `--exclude` 模式的语义一致）。
+8. **`dryRun` 不占 BUSY 槽**：它只是 stat 一遍，不产生流、不会撕裂归档；而 CP 最需要这个数字的时候恰恰可能是沙箱正忙的时候。真 archive 仍然占槽（A-5）。
+9. **补充参数校验**：`exclude` 最多 64 项、单项 ≤256 字符（它是直接进 tar argv 的），空列表/超限 → 400 `invalid_exclude`；`dryRun` 只认 `1`/`true`/`0`/`false`，拼错回 400 而不是静默当成 false。
+10. **tar 的退出码语义**：0 = 成功；1 = "有些文件读的时候变了"这类警告——归档本身完整，照常结束、只记一条日志；≥2 才断连接。一个字节都没出来就失败时回 JSON 500，而不是一个空的 200（空 200 会被 CP 当成"归档就是空的"）。
+11. **用例 11 的数据换成 256 MiB 不可压缩随机数据**（正文写的是 1 GiB）：1 GiB 零字节 gzip 之后只有 ~1 MiB，客户端和服务端都轻松放下，RSS 断言对"有没有在流式处理"完全免疫。256 MiB 随机数据 gzip 后仍有 256 MiB，断言才有意义，耗时也从 ~30s 降到 ~6s。
+12. **补充用例**（不在上表里）：无改动时返回空 patch 而不是 404；base 非法/不是仓库；patch 是非法 UTF-8；外置 patch 超限；`dryRun`/`exclude` 参数；1ms 时限下 504 且槽要还回；archive 超限后槽要还回；archive 占槽时 `/health` 报 `archive_<ulid>` 且 `/diff` 409。
+13. **git 一律带 `--no-pager`（并用 `--no-color` / `--no-ext-diff`）**：分页器、颜色、外部 diff 都可能被宿主或仓库配置打开，任何一个都能把 patch 污染成导不回去的样子。
+14. **用例 4 的断言多了一层**：除了 `patch_log_path` 可读，还断言这份 patch 与直接跑 `git diff --binary <base>` **逐字节一致**（不是只看长度）；用例 1 也顺手断言端点返回的 patch 与 git 原生输出相等。
+15. **Phase 3 新增的四个 env**（都进了 `config.ts` 的 `Config`）：`SANDBOX_AGENT_STREAM_TIMEOUT_MS`（300s，正文已有）、`SANDBOX_AGENT_MAX_PATCH_BYTES`（2 MiB，即正文的 `MAX_PATCH_BYTES`）、`SANDBOX_AGENT_MAX_PATCH_SPILL_BYTES`（256 MiB，见备注 4）、`SANDBOX_AGENT_DIFF_ROOT`（默认 `/tmp/reuben-cloud/diff`，“大 patch 外置”的落点）。`DIFF_ROOT` 和写入根一样会被 `loadConfig` 自动塞进读集合——否则 CP 拿到了 `patch_log_path` 也读不回来，那是个荒谬的 404。`SANDBOX_AGENT_MAX_ARCHIVE_BYTES`（4 GiB）是 archive 流出字节的兜底上限，软限制在 CP 侧。
 
 ---
 ---
