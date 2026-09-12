@@ -79,18 +79,20 @@ reuben-cloud/
 │  │  │  ├─ files/{read,write,list}.ts   # Phase 2（paths.ts 已在 Phase 1 落地，不再另起一份）
 │  │  │  ├─ diff.ts             # Phase 3
 │  │  │  ├─ archive.ts          # Phase 3
+│  │  │  ├─ forward.ts          # Phase 5：macOS 的端口转发中继（见 Phase 5 实现备注 2）
 │  │  │  ├─ stream.ts           # Phase 3：BUSY 槽 + 总时限 + 断线回收进程组（diff/archive 共用）
 │  │  │  └─ types.ts
 │  │  └─ test/                  # harness.ts + *.test.ts（布局与跑法见 §0.5）
 │  └─ control-plane/            # Phase 5, 8–12
-│     └─ src/
-│        ├─ provider/{types,local-docker}.ts
-│        ├─ db/{client,sandboxes,executions,artifacts,migrations/*.sql}
-│        ├─ manager/{sandbox-manager,reconcile,sweeper}.ts
-│        ├─ client/{sandbox-api,sse}.ts   # 手写 SSE 客户端
-│        ├─ repo/{github-app,clone,pack,push}.ts
-│        ├─ artifacts/{store,offload}.ts
-│        └─ agent/{loop,tools/*,prompt}.ts
+│     ├─ src/
+│     │  ├─ provider/{types,docker-api,local-docker}.ts   # Phase 5（docker-api 的理由见 Phase 5 实现备注 1）
+│     │  ├─ db/{client,sandboxes,executions,artifacts,migrations/*.sql}
+│     │  ├─ manager/{sandbox-manager,reconcile,sweeper}.ts
+│     │  ├─ client/{sandbox-api,sse}.ts   # 手写 SSE 客户端
+│     │  ├─ repo/{github-app,clone,pack,push}.ts
+│     │  ├─ artifacts/{store,offload}.ts
+│     │  └─ agent/{loop,tools/*,prompt}.ts
+│     └─ test/                  # unit/（不需 Docker）+ integration/（需 Docker）+ support.ts（公共脚手架）
 ├─ packages/e2e/                # Phase 7 冒烟脚本
 ├─ images/sandbox/Dockerfile
 ├─ deploy/egress-proxy/{Dockerfile,allowlist.txt,src/proxy.ts}
@@ -109,7 +111,7 @@ reuben-cloud/
   - 带 `--test-timeout=60000`。`node:test` 默认没有超时，一个挂住的用例会把 CI 挂到天荒。
 - 三层：
   1. **单元测试**：不依赖 Docker，`npm test` 默认跑（Phase 1–3 的大部分、状态机、SSE 解析器）。
-  2. **集成测试**：需要 Docker，`npm run test:integration`（Phase 5 起的容器测试、Phase 8 起的 Postgres 测试）。
+  2. **集成测试**：需要 Docker，`npm run test:integration`（Phase 5 起的容器测试、Phase 8 起的 Postgres 测试）。跑之前先 `npm run build:image`（Phase 5 的用例需要一个 digest 引用的本地镜像；用例自己会把 tag 解析成 digest）。
   3. **冒烟/e2e**：需要完整栈，`npm run smoke`（Phase 7 起），**只在 Linux 上跑**。
 - `npm test` 永远不需要 Docker、不需要网络。这是硬要求——它保证提交前那条命令是快的。
 - 需要 Postgres 的测试用一次性容器：`docker run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=x postgres:16-alpine`，测试开始时跑迁移。不引 testcontainers。
@@ -244,7 +246,7 @@ const child = spawn(cmd[0], cmd.slice(1), {
 - `detached: true` 是 Node 里拿到进程组 id 的正规做法，不用调 `setsid` 二进制。之后 `process.kill(-child.pid, sig)` 一次带走整棵树。
   注意：**不要 unref**，我们还需要 `exit` 事件。
 - `stdio[0] = "ignore"`：**没有交互式输入通道**。需要交互的程序会立刻读到 EOF 而失败——这是设计边界，不是 bug。工具层要在提示词里告诉模型这一点（Phase 11）。
-- `baseEnv()` 返回一个**固定的最小集合**（`PATH`、`HOME`、`LANG`、`TERM`、`PYTHONUNBUFFERED`）叠加请求里的 `env`，而不是继承 agent 自己的整个 `process.env`。理由不是防泄密（容器里本来没秘密），是**确定性**——测试里环境变量不随宿主漂移。（`PYTHONUNBUFFERED` 是 Phase 4 补进来的：镜像里那行 `ENV` 到不了子进程，而没有它 python 会整块缓冲，见 Phase 4 实现备注 3。）
+- `baseEnv()` 返回一个**固定的最小集合**（`PATH`、`HOME`、`LANG`、`TERM`、`PYTHONUNBUFFERED`）叠加请求里的 `env`，而不是继承 agent 自己的整个 `process.env`。理由不是防泄密（容器里本来没秘密），是**确定性**——测试里环境变量不随宿主漂移。（`PYTHONUNBUFFERED` 是 Phase 4 补进来的：镜像里那行 `ENV` 到不了子进程，而没有它 python 会整块缓冲，见 Phase 4 实现备注 3。同一位置后来还加了 **6 个代理变量**：`HTTP_PROXY` 等在容器 env 里，不到子进程就等于没有网络，见 Phase 5 实现备注 6。）
 - `child.on("error")` → `failed` 事件（ENOENT 走这条路，`spawn` 本身不抛）。
 - `child.on("exit", (code, signal))` → 终态事件。
 
@@ -681,7 +683,8 @@ COPY packages/sandbox-agent/src ./src
 
 USER 1000:1000
 EXPOSE 8080
-CMD ["node", "src/index.ts"]
+# 绝对路径是必须的：provider（Phase 5）会把 WorkingDir 覆盖成 /workspace。
+CMD ["node", "/app/src/index.ts"]
 ```
 
 要点，逐条都有理由：
@@ -694,7 +697,7 @@ CMD ["node", "src/index.ts"]
 6. **`LANG=C.UTF-8`**：没有它，python3 往管道写非 ASCII 会 `UnicodeEncodeError`。
 7. **没有 `npm install` 这一步**：sandbox-agent 零依赖，`COPY src` 完事。这是 0.2 那个取舍的兑现。
 8. **镜像里 `USER 1000:1000` 和 provider 的 `--user 1000:1000` 都写**：后者防的是"镜像被人换掉"。
-9. **`CMD ["node", "src/index.ts"]`**（exec 形式）：`node` 直接吃 `.ts`，靠的就是 `erasableSyntaxOnly` 这个约束。
+9. **`CMD ["node", "/app/src/index.ts"]`**（exec 形式）：`node` 直接吃 `.ts`，靠的就是 `erasableSyntaxOnly` 这个约束。**路径写绝对**：Phase 5 的 provider 会把容器 WorkingDir 覆盖成 `/workspace`，相对路径会让 agent 以 `MODULE_NOT_FOUND` 退出（见 Phase 5 实现备注 5）。
 10. **没有 `SANDBOX_AGENT_TOKEN` 默认值**。缺失就退出——如果镜像里写了个默认 token，所有沙箱就都用同一个公开的 token。
 11. `--init` 由 provider 传（tini 负责回收僵尸），所以镜像里不装 tini。
 12. HEALTHCHECK 可选。要用的话得带上 token，但 token 是运行时注入的——env 在容器里可见，所以能写：
@@ -744,6 +747,8 @@ CMD ["node", "src/index.ts"]
 5. **`.dockerignore` 在正文四条之外多了 `packages/*/test` 与 `.claude`**：前者不进镜像（镜像里只有 `src`），排掉它让「镜像里到底有什么」一眼可见；后者是本地 agent 配置，属于宿主环境。实测整个构建上下文 197 KiB（没有这两条时上下文主要是 `node_modules`）。
 6. **采纳了正文第 12 条那个可选的 `HEALTHCHECK`**：它只让 `docker ps` 能看出状态（provider 自己轮询 `/health`，不依赖它）。它读的是运行时注入的 token，不给镜像引入任何默认值。
 7. **基础镜像用 tag 不锁 digest**：本地「改一行 → 重建 → 跑」的循环要便宜。digest 强制在 Phase 5 的 provider 侧（`SandboxSpec.image` 必须含 `@sha256:`），CI 构建后记录产物 digest（正文「构建命令」）。
+8. **`CMD` 写绝对路径**（Phase 5 回来改的）：provider 按设计把 `WorkingDir` 覆盖成 `/workspace`，而相对路径的 `CMD` 是按 `WorkingDir` 解析的——容器会以 "Cannot find module '/workspace/src/index.ts'" 退出 (1)。这个 bug 是 Phase 5 集成测试用例 1 第一次跑就抓到的，详细经过见 Phase 5 实现备注 5。
+8. **`CMD` 写绝对路径**（Phase 5 回来改的）：provider 按设计把 `WorkingDir` 覆盖成 `/workspace`，而相对路径的 `CMD` 是按 `WorkingDir` 解析的——容器会以 "Cannot find module '/workspace/src/index.ts'" 退出 (1)。这个 bug 是 Phase 5 集成测试用例 1 第一次跑就抓到的，详细经过见 Phase 5 实现备注 5。
 
 **完成标记：**
 - [x] **Phase 4 完成** — 沙箱镜像可用且非 root（11/11 检查通过）
@@ -756,7 +761,7 @@ CMD ["node", "src/index.ts"]
 
 ### 交付物
 
-`packages/control-plane/src/provider/{types.ts,local-docker.ts}` + 集成测试。
+`packages/control-plane/src/provider/{types,docker-api,local-docker}.ts` + `packages/sandbox-agent/src/forward.ts`（darwin 的中继，理由见实现备注 2）+ `test/unit/*` 与 `test/integration/*`。
 
 ### 具体如何实现
 
@@ -779,6 +784,7 @@ http.request({ socketPath: "/var/run/docker.sock", path: `/v1.44${apiPath}`, met
 1. **校验 spec**：镜像引用必须含 `@sha256:`；limits 在允许范围内；labels 必须带 `reuben-cloud.sandboxId`。校验失败直接抛，不碰 Docker。
 2. **拉镜像**（`POST /images/create?fromImage=...&tag=...`，同步等它返回）。这一步用 **120s 预算**。
    把 pull 拆出来，是为了让 create 的 **15s 预算**变成可预期的——§D 那张超时表里的两行，落到实现就是"两次可分别计时的操作"，不然 15s/120s 根本没法区分。
+   **先查本地、再拉**（`GET /images/{ref}/json` 命中就跳过）：本地构建的镜像（`reuben-cloud/sandbox-base:dev`）没有对应的 registry，无脑 pull 会去 docker.io 找它并 403。见实现备注 1。
 3. **建卷**：`POST /volumes/create`，名字 `reuben-cloud-ws-{sandboxId}`，带 labels。
 4. **建网络**（幂等，进程启动时做一次即可）：`POST /networks/create` `{Name:"reuben-cloud-internal", Driver:"bridge", Internal:true}`。已存在 → 409，当作成功。
 5. **建容器**：
@@ -790,8 +796,7 @@ POST /containers/create?name=reuben-cloud-sbx-{id}
   "User": "1000:1000",
   "WorkingDir": "/workspace",
   "Env": ["SANDBOX_AGENT_TOKEN=<32字节base64url随机>", "HTTP_PROXY=http://reuben-cloud-proxy:3128", ...],
-  "Labels": { "reuben-cloud.managed": "true", "reuben-cloud.sandboxId": "...", "reuben-cloud.runId": "..." },
-  "ExposedPorts": { "8080/tcp": {} },          // 仅 darwin 需要
+  "Labels": { "reuben-cloud.managed": "true", "reuben-cloud.sandboxId": "...", "reuben-cloud.runId": "...", "reuben-cloud.role": "sandbox" },
   "HostConfig": {
     "ReadonlyRootfs": true,
     "CapDrop": ["ALL"],
@@ -803,7 +808,6 @@ POST /containers/create?name=reuben-cloud-sbx-{id}
     "Tmpfs": { "/tmp": "rw,nosuid,size=512m,mode=1777" },
     "Binds": ["reuben-cloud-ws-{id}:/workspace"],
     "NetworkMode": "reuben-cloud-internal",
-    "PortBindings": { "8080/tcp": [{ "HostIp": "127.0.0.1", "HostPort": "" }] },  // 仅 darwin
     "RestartPolicy": { "Name": "no" },
     "AutoRemove": false,
     "LogConfig": { "Type": "json-file", "Config": { "max-size": "10m", "max-file": "3" } }
@@ -817,22 +821,23 @@ POST /containers/create?name=reuben-cloud-sbx-{id}
 - **seccomp：什么都不传**。不传即使用 Docker 的默认 profile；§F.1 那条"必须是默认 profile，不能是 unconfined"翻译成实现就是"这一项不写"。测试断言 `SecurityOpt` 里**不含**任何 `seccomp=` 项。
 - `no-new-privileges:true` 是 API 形式（CLI 的 `--security-opt no-new-privileges=true` 等价）。断言时用「以 `no-new-privileges` 开头」而不是全等，免得被两种拼法绊住。
 - `Tmpfs` 只有 `/tmp` 一项，512 MiB、`mode=1777`。**没有 `/home/agent`**（见 Phase 4 与附录 A-2），**没有 `/var/log/...`**（见 A-1）。tmpfs 的页面**计入 cgroup 内存**，所以 512 MiB 的 tmpfs 是 2 GiB 内存上限里实打实的一部分。
-- `PortBindings` 只在 `process.platform === "darwin"` 时加，且 `HostIp` 必须是 `127.0.0.1`、端口随机。**绝不发布到 `0.0.0.0`**。
+- `PortBindings` **在沙箱容器上永远不出现**。darwin 上发布端口的是另一个容器（见实现备注 2 与下面的第 7 步）：
+  沙箱容器在任何平台上都没有宿主端口，差异只在"宿主怎么够到它"。
 - `NetworkMode` 是内网名——容器只能到代理，出不了公网。
 - `authToken`：`crypto.randomBytes(32).toString("base64url")`，**每次 create 现生成**，通过 env 注入。它只保护一个仅在内网可达的端口，但仍然是每沙箱一个。
 
 6. **start** → `POST /containers/{id}/start`。
 7. **解析 endpoint**：
    - Linux：`GET /containers/{id}/json` → `NetworkSettings.Networks["reuben-cloud-internal"].IPAddress`，endpoint = `http://<ip>:8080`。宿主到 bridge 网络上的容器 IP 默认可达，所以不需要发布任何端口。
-   - darwin：读 `NetworkSettings.Ports["8080/tcp"][0].HostPort`，endpoint = `http://127.0.0.1:<port>`。
-   - 把这段差异收敛到一个纯函数 `resolveEndpoint(inspectJson, platform)`，好单测。
+   - darwin：**端口发布在转发容器上**（`reuben-cloud-sbx-{id}-fwd`，同一个镜像、双网卡、跑 `sandbox-agent/src/forward.ts`），读它的 `NetworkSettings.Ports["8080/tcp"][0].HostPort`，endpoint = `http://127.0.0.1:<port>`。宿主必须能路由到容器，而 macOS 上隔着 VM 做不到；`--internal` 网络上的容器又**不可能**发布端口（Docker 静默忽略，见实现备注 2）。
+   - 把这段差异收敛到一个纯函数 `resolveEndpoint(inspectJson, platform)`，好单测。HostIp 不是 `127.0.0.1` 直接拒绝——那是"绝不发布到 0.0.0.0"这条红线的实现。
 8. **轮询 `/health`**：间隔 250ms，预算 15s（镜像已经预拉过）。带 `Authorization: Bearer <token>`。
    成功 → 返回 handle `{sandboxId, providerRef, endpoint, authToken}`。
    超时或 agent 报 `error` → 抛 `{reason: "health_timeout" | "agent_error"}`，**并且先把容器和卷删掉**（失败路径的清理不能靠调用方记得做）。
 
 #### 3. 失败清理（不泄漏）
 
-`create()` 用一个 `try/catch` 包住，catch 里按**创建的反向顺序**清理：容器 → 卷。网络是共享的，不删。清理本身也要 catch（删一个已经没了的容器会 404，忽略）。
+`create()` 用一个 `try/catch` 包住，catch 里按**创建的反向顺序**清理：转发容器（darwin）→ 沙箱容器 → 卷。网络是共享的，不删。清理本身也要 catch（删一个已经没了的容器会 404，忽略）。
 
 `destroy(sandboxId)` 必须**幂等**：容器不存在的 404 当作成功；卷的 404 当作成功。因为对账（Phase 8）会重复调用它。
 
@@ -840,8 +845,8 @@ POST /containers/create?name=reuben-cloud-sbx-{id}
 
 #### 4. 给对账用的查询接口
 
-- `listManaged()`：`GET /containers/json?all=1&filters={"label":["reuben-cloud.managed=true"]}`。
-- `inspect(sandboxId)`：按名字或标签找容器，返回 `{state, endpoint, agentStatus}`；没有则 `null`。
+- `listManaged()`：`GET /containers/json?all=1&filters={"label":["reuben-cloud.managed=true"]}`。返回的行带 `role`（`sandbox` / `port-forward`，后者只在 darwin 出现）——**对账必须能区分两者**，否则会把转发容器当成沙箱本体。
+- `inspect(sandboxId)`：按名字或标签找容器，返回 `{state, endpoint, agentStatus, activeExecution, version}`；没有则 `null`。token 从容器的 `Config.Env` 里读回来（CP 重启后要继续跟老沙箱说话，这是唯一的办法；明文 env/明文存 DB 这件事已经记过账）。
 
 Phase 8 的对账逻辑完全建立在这两个方法上，所以它们从第一天就要有，不能等到 Phase 8 现加。
 
@@ -869,13 +874,41 @@ Phase 8 的对账逻辑完全建立在这两个方法上，所以它们从第一
 
 ### 验收标准
 
-- [ ] 上表 8 项全绿
-- [ ] `docker inspect` 逐条复核加固参数（**手工看一遍**，不要只看测试绿）
-- [ ] 连做 10 次 create/destroy，`docker ps -a` 和 `docker volume ls` 无残留
-- [ ] `DOCKER_HOST=tcp://...` 时启动报错退出
+- [x] 上表 8 项全绿（实测 11/11，跑法 `npm run test:integration -w @reuben-cloud/control-plane`）
+- [x] `docker inspect` 逐条复核加固参数（**手工看了一遍**，输出见实现备注 9）
+- [x] 连做 10 次 create/destroy，`docker ps -a` 和 `docker volume ls` 无残留（用例 7，实测 darwin 冷启动 median 884ms / p95 974ms）
+- [x] `DOCKER_HOST=tcp://...` 时启动报错退出（`unsupported_docker_host`，单测覆盖）
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **多一个文件 `src/provider/docker-api.ts`**：unix socket 上的 HTTP 客户端（请求/响应、错误映射、ndjson 进度流、`DOCKER_HOST` 解析）。理由和 Phase 1 的 `config.ts` / Phase 3 的 `stream.ts` 一样——它是可单测的传输层（假 daemon 就是一个真的 unix socket HTTP server，比 mock `http.request` 诚实得多），而 `local-docker.ts` 该只有沙箱语义。另一条硬理由：**`local-docker.ts` 是整个 CP 里唯一允许 import docker socket 的地方**，把传输层拆出去之后这句话才是结构性的。
+2. **darwin 的端口发布靠一个转发容器，不是 `PortBindings`**（本文第 5 步的 JSON 里原来写着"仅 darwin 需要"）。实测发现：Docker Engine 对"只挂在 `--internal` 网络上的容器"**根本不编程端口映射**——容器照常起，`docker port` 什么都不显示、`NetworkSettings.Ports` 是空的（`-p 127.0.0.1::8080` / `-p 8080:8080` / `-p 127.0.0.1:18099:8080` 三种写法实测一样；moby/moby discussion #53256 有同样的最小复现。这是引擎行为，不是 Docker Desktop 的怪癖）。而 macOS 上宿主又**路由不到**容器的 172.x 地址（实测 `curl http://172.22.0.3:8080/health` 直接不通）。两层叠加的结果：不另想办法就没有 darwin 路径。
+   做法：darwin 上额外起一个 `reuben-cloud-sbx-{id}-fwd`，同一个镜像、`Cmd` 换成 `node src/forward.ts --listen 8080 --target reuben-cloud-sbx-{id}:8080`，**双网卡**（内网能到 agent + 默认 `bridge` 让端口发布生效），只发布到 `127.0.0.1` 的随机端口，资源上限更低（128 MiB / 0.25 核 / 64 pids / `noexec` 的 /tmp）。沙箱容器自己**任何平台都不发布端口**。
+   为什么不偷懒让 darwin 干脆不用内网：那样本地开发时沙箱直接能上公网，于是"没配代理也能装依赖"这件事在本地永远测不出来，而它在生产里 100% 会失败。宁可多一个中继容器，也不要一台和生产行为不一样的开发机。
+   新增的 `packages/sandbox-agent/src/forward.ts` 是一个 ~60 行的 TCP 中继（**只能连到 `--target`**，不是代理），带 6 条单测（双向字节、并发连接、目标连不上不殉、close() 释放、CLI 参数与 SIGTERM）。
+3. **转发容器的名字冲突也必须处理**：重建（同一个 sandboxId）时沙箱容器与转发容器会**同时**是 409。第一版只处理了沙箱那一个，用例"create 撞上自己的残留容器"直接卡在转发容器的 409 上。现在两条走同一个 `#createContainerWithConflict`：我们的残留 → 删掉重来；不是我们的 → `container_exists`，**绝不删别人的容器**。
+4. **`#ensureImage` 先查本地再拉**：本地构建的镜像没有 registry 可拉（`POST /images/create?fromImage=reuben-cloud/sandbox-base@sha256:…` 会去 docker.io 找它并 403）。先 `GET /images/{ref}/json` 命中就跳过，顺带让本地"改一行 → 重建 → 跑集成测试"这条循环不需要任何 registry。digest 校验不变：`@sha256:` 那 64 位要么本地命中，要么能被 registry 解析。
+5. **镜像的 CMD 改成绝对路径 `/app/src/index.ts`**（Phase 4 的 Dockerfile 已同步）。原因：provider 按 spec 把 `WorkingDir` 覆盖成 `/workspace`，而相对路径是按 `WorkingDir` 解析的——`node src/index.ts` 会去找 `/workspace/src/index.ts` 然后 `MODULE_NOT_FOUND`（容器 `Exited (1)`，日志里那句话是唯一线索）。镜像的启动命令本来也不应该依赖当前目录。这个 bug 是集成测试用例 1 第一次跑就抓到的。
+6. **代理变量必须能到子进程**（涉及 `sandbox-agent`，与本文 Phase 1 §5 的"固定最小集合"有关）：provider 往容器 env 里写 `HTTP_PROXY`，而 exec 的子进程环境是一份固定集合、**不继承** agent 自己的 env——代理地址到不了被执行的命令。在 internal 网络里没有代理就等于没有网络，所以 `npm install` 会 100% 失败，而这件事在单元测试里完全看不出来。修法：`config.ts` 新增 `proxyEnv`（启动时从 env 读 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 及小写共 6 个），`buildEnv` 把它插在固定集合之后、请求 env 之前。确定性不变（值仍然来自 Config，spawn 依旧不读 `process.env`），token 依旧不进子进程。集成测试用例 1 里那句 `printenv HTTP_PROXY` 就是这条链路的凭据。
+7. **创建的实际顺序**：校验 → 拉镜像 → **建网络 → 建卷** → 建容器 → 启动 →（darwin 转发容器）→ 解析 endpoint → 轮询 health。相对正文只挪了一处：网络是共享资源（建一次就够，且幂等），放在卷前面——它失败时不该留下一个待清理的卷。
+8. **health 轮询与 15s 创建预算共用一个 deadline**：正文第 8 步说 health 轮询"预算 15s"，而 §D 的表说"创建（镜像已缓存）15s"。两者取同一个 deadline 才能同时成立（拉镜像那次计时是分开的）。到点回 `health_timeout`，`details` 里带上最后一次看到的状态与 endpoint——"等了 15 秒还是 starting" 和 "一次都没答话" 是两种不同的故障。
+9. **手工复核输出**（验收标准第二条，值得留档）：
+   ```
+   User 1000:1000 | ReadonlyRootfs true | CapDrop ["ALL"] | CapAdd null | Privileged false
+   SecurityOpt ["no-new-privileges:true","apparmor=docker-default"]   ← 无 seccomp=
+   Memory 2147483648 / MemorySwap 2147483648 | NanoCpus 1000000000 | PidsLimit 2048 | Init true
+   Tmpfs {"/tmp":"rw,nosuid,size=512m,mode=1777"} | Binds ["reuben-cloud-ws-…:/workspace"]
+   NetworkMode reuben-cloud-internal | PortBindings {} | PidMode "" | IpcMode "private"
+   darwin 转发容器：Ports {"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":52333}]}，双网卡 bridge+internal
+   ```
+10. **测试分成两层**（§0.5 的硬要求）：`test/unit/*.test.ts`（21 条，不需要 Docker）守住"**发出去的请求体**里的加固参数"与 endpoint 解析；`test/integration/*.test.ts`（11 条，需要 Docker）守"**容器实际是**什么"。只有集成测试的话，没装 Docker 的机器上这组不变量就没人守；只有单测的话，"我们发的"和"容器是的"可能不是一回事。
+11. **补充用例**（不在上表里）：`listManaged` 的 role 区分与 `inspect` 的 `activeExecution`（对账要用它判断"CP 重启前有执行在跑"）；endpoint 可达且无 token 是 401；create 撞上自己的残留容器会删掉重建；名字被别人占用时拒绝且**不动别人的容器**；`DOCKER_HOST=tcp://…` 时构造器报 `unsupported_docker_host`；`docker-api` 的 7 条（跨 chunk 的 ndjson、404 语义、非 JSON 错误体、daemon 不在、超时、query 编码、socket 路径解析）。
+12. **用例 4 的失败原因接受两种**：不存在的 digest 在 registry 明确拒绝时是 `image_pull_failed`，registry 连不上/卡住时是 `image_pull_timeout`（拉取预算先到）。两者都是"拉镜像失败"，测试不该绑在某一个 registry 的行为上。
+13. **`destroy` 里转发容器先删、再 `stop?t=10`**：`stop` 那条路径不能省——直接 `kill -9` 会在卷里留下半个写入状态。转发容器先删是因为它挂着端口、且它没有任何需要优雅退出的东西。
+14. **`create` 失败时的回滚顺序是转发容器 → 沙箱容器 → 卷**，且每步都吞异常（清一个已经没了的容器会 404，那不是新错误，不能覆盖真正的原因）。用例 4 与用例 6 都断言"零残留"（按 `reuben-cloud.sandboxId` 标签过滤，不是按名字前缀）。
 
 **完成标记：**
-- [ ] **Phase 5 完成** — 沙箱能被创建、加固、回收，且不泄漏
+- [x] **Phase 5 完成** — 沙箱能被创建、加固、回收，且不泄漏（集成 11/11、单测 21/21、`tsc --noEmit` 通过；手工复核过加固参数与零残留）
 
 ---
 

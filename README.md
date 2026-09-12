@@ -4,7 +4,7 @@
 >
 > 沙箱子系统的**实施规格**（Phase 拆分、测试要点、验收标准）见 [`docs/sandbox-spec.md`](docs/sandbox-spec.md)；**设计文档与取舍理由**见 [`docs/sandbox.md`](docs/sandbox.md)。
 >
-> **第一次读代码？** 先看 [`docs/exec-链路-大白话.md`](docs/exec-链路-大白话.md)（一次 exec 从 HTTP 到终态事件的完整链路）和 [`docs/typescript-速查.md`](docs/typescript-速查.md)（本仓库用到的 TS 语法速查）。
+> **第一次读代码？** 从 `packages/sandbox-agent/src/index.ts`（沙箱内的执行服务入口）和 `packages/control-plane/src/provider/local-docker.ts`（CP 侧创建沙箱的那层）读起。
 
 ---
 
@@ -606,7 +606,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 
 - [x] `sandbox-agent` 服务：`/health` + `/exec`(SSE) + `/files`（先在宿主机裸跑，不碰 Docker）
 - [x] 沙箱镜像：多语言运行时 + git + 非 root 用户
-- [ ] `LocalDockerProvider`：加固参数 + internal 网络 + named volume
+- [x] `LocalDockerProvider`：加固参数 + internal 网络 + named volume（`packages/control-plane/src/provider/`，集成测试 `npm run test:integration`；macOS 上多一个端口转发容器，见 spec Phase 5 实现备注 2）
 - [ ] egress-proxy：全局常驻，静态白名单只开依赖源，**不含 github.com**
 - [ ] CP 侧仓库进出：clone → tar → 灌入沙箱；diff → apply → push（**凭据只在 CP**）
 - [ ] `GET /diff` + `GET /archive` + 落对象存储
