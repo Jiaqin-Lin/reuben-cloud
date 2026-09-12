@@ -27,6 +27,34 @@ export const MAX_TIMEOUT_MS = 600_000;
 export const DEFAULT_MAX_OUTPUT_BYTES = 1_048_576;
 export const MAX_MAX_OUTPUT_BYTES = 268_435_456;
 
+/**
+ * 内联读文件的上限（`GET /files` 不带 `limit` 时的默认值，也是显式 `limit` 的天花板）。
+ * 超出的文件要么显式传 `limit`+`offset` 分片读，要么走 `raw=1` 流式拉——**不静默截断**。
+ * 注意 raw 模式不传 `limit` 时不受它约束：流式响应没有内存膨胀问题。
+ */
+export const DEFAULT_MAX_READ_BYTES = 1_048_576;
+
+/**
+ * 单次上传（`PUT /files`）的字节上限。默认 512 MiB——比它大的仓库本来就该走归档通道。
+ * 超限时先删临时文件、回 413、再断开请求流（只回 413 不断开局连接会吊住）。
+ */
+export const DEFAULT_MAX_WRITE_BYTES = 536_870_912;
+
+/** `GET /files/list` 一次最多返回多少条目，超出置 `truncated`。 */
+export const DEFAULT_MAX_LIST_ENTRIES = 1000;
+
+/**
+ * `GET /files/list` 的递归深度上限。超过直接 400，不静默钳制。
+ * 递归本身不需要防环：list 不跟随符号链接（跟随会让它变成绕过路径校验的越权通道）。
+ */
+export const MAX_LIST_DEPTH = 8;
+
+/**
+ * 额外的只读根缺省值：Phase 11 的工具结果会外置到 `/tmp/reuben-cloud/out/`，
+ * 之后模型要用 `read` 工具把它读回来，而写仍然只能落在 workspace（否则 diff 看不见）。
+ */
+export const DEFAULT_EXTRA_READ_ROOT = "/tmp/reuben-cloud";
+
 /** 输出合并：≥64KiB 或 ≥100ms 就 flush（§C.2）。 */
 export const DEFAULT_CHUNK_BYTES = 65_536;
 export const DEFAULT_FLUSH_INTERVAL_MS = 100;
@@ -80,6 +108,17 @@ export interface Config {
   host: string;
   /** 工作区根。裸跑指向临时目录，容器里是 /workspace —— 同一套路径逻辑。 */
   workspaceRoot: string;
+  /**
+   * 读允许落在哪些根之下（第一个恒等于 workspaceRoot）。写永远只看 workspaceRoot。
+   * 顺序有意义：报错里的「允许路径」列表按这个顺序打印。
+   */
+  readRoots: string[];
+  /** 单个文件的内联读上限（字节），`GET /files` 的默认 limit 与硬上限。 */
+  maxReadBytes: number;
+  /** 单次上传上限（字节），`PUT /files`。 */
+  maxWriteBytes: number;
+  /** `GET /files/list` 最多返回多少条目。 */
+  maxListEntries: number;
   /** 执行日志目录，一次执行一个 `{id}.log`。容器里在 tmpfs 上，所以必须限大小。 */
   logRoot: string;
   /** 子进程 HOME。agent 启动时 mkdir -p。 */
@@ -124,11 +163,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
+  // 先解析写根：读根的缺省值要基于它（而不是硬编码 /workspace）。
+  const workspaceRoot = env.SANDBOX_WORKSPACE_ROOT ?? "/workspace";
+
   return {
     token,
     port: intEnv(env, "SANDBOX_AGENT_PORT", 8080),
     host: env.SANDBOX_AGENT_HOST ?? "127.0.0.1",
-    workspaceRoot: env.SANDBOX_WORKSPACE_ROOT ?? "/workspace",
+    workspaceRoot,
+    // 读集合里永远有写根（parseReadRoots 负责塞），否则刚写进去的文件读不回来。
+    readRoots: parseReadRoots(env.SANDBOX_AGENT_READ_ROOTS, workspaceRoot),
+    maxReadBytes: intEnv(env, "SANDBOX_AGENT_MAX_READ_BYTES", DEFAULT_MAX_READ_BYTES),
+    maxWriteBytes: intEnv(env, "SANDBOX_AGENT_MAX_WRITE_BYTES", DEFAULT_MAX_WRITE_BYTES),
+    maxListEntries: intEnv(env, "SANDBOX_AGENT_MAX_LIST_ENTRIES", DEFAULT_MAX_LIST_ENTRIES),
     logRoot: env.SANDBOX_LOG_ROOT ?? "/tmp/reuben-cloud/exec",
     home: env.SANDBOX_AGENT_HOME ?? DEFAULT_HOME,
     basePath: env.SANDBOX_AGENT_BASE_PATH ?? DEFAULT_BASE_PATH,
@@ -151,6 +198,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     heartbeatMs: intEnv(env, "SANDBOX_AGENT_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS),
     killGraceMs: intEnv(env, "SANDBOX_AGENT_KILL_GRACE_MS", DEFAULT_KILL_GRACE_MS),
   };
+}
+
+/**
+ * 解析 `SANDBOX_AGENT_READ_ROOTS`（逗号分隔）。
+ * 缺省 = 写根 + `DEFAULT_EXTRA_READ_ROOT`；写根**永远**会被塞回结果的第一位。
+ * 这里不做存在性检查也不 realpath——那是 createRootResolver 的事（它要 mkdir）。
+ */
+function parseReadRoots(raw: string | undefined, writeRoot: string): string[] {
+  const parts = raw === undefined || raw === "" ? [DEFAULT_EXTRA_READ_ROOT] : raw.split(",");
+  const extra = parts.map((item) => item.trim()).filter((item) => item !== "");
+  // 去重是为了让 config.readRoots 干净：调用方（和日志）会读它，重复项只会让人困惑。
+  return [...new Set([writeRoot, ...extra])];
 }
 
 /**

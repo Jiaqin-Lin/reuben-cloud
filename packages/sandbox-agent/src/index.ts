@@ -33,9 +33,14 @@ async function main(): Promise<void> {
   });
 
   // 依赖注入的四个对象，顺序不能变：roots/sc 离不开 config，registry 离不开前两者。
-  const roots = await createRootResolver(config.workspaceRoot);
+  // readRoots 里第一个永远是写根（config.loadConfig 保证），额外读根本身可能还不存在，
+  // createRootResolver 会 mkdir 它。
+  const roots = await createRootResolver({
+    writeRoot: config.workspaceRoot,
+    readRoots: config.readRoots,
+  });
   const registry = new ExecutionRegistry(config, roots);
-  const server = createAgentServer(config, registry);
+  const server = createAgentServer(config, registry, roots);
 
   // 把“监听成功/失败”包成 Promise：否则代码会直接跑到底，
   // 连端口被占了都发现不了（listen 是异步的）。
@@ -52,7 +57,7 @@ async function main(): Promise<void> {
   const address = server.address() as AddressInfo;
   console.log(
     `[sandbox-agent] v${VERSION} listening on http://${address.address}:${address.port} ` +
-      `workspace=${roots.realRoot} logs=${config.logRoot}`,
+      `workspace=${roots.realRoot} read=${roots.realReadRoots.join(",")} logs=${config.logRoot}`,
   );
 
   // shuttingDown 是个防重入锁：SIGTERM 和 SIGINT 几乎同时到（或者手贱连按两次 Ctrl-C）

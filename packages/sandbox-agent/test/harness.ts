@@ -36,8 +36,14 @@ export interface TestAgent {
   baseUrl: string;
   /** 配置的 workspace 根（可能是符号链接，比如 macOS 的 /var）。 */
   root: string;
-  /** realpath 之后的 workspace 根——路径校验用的就是它。 */
+  /** realpath 之后的 workspace 根——写路径校验用的就是它。 */
   realRoot: string;
+  /**
+   * 第二个读根（每个测试 agent 自己一个临时目录，关掉时删）。
+   * 存在它是为了让「读多根 / 写单根」能被真测到：它不在 workspace 里面，
+   * 所以写进去必须被拒、读出来必须成功。
+   */
+  extraRoot: string;
   /** 带鉴权头的 fetch。`token: null` = 故意不带 token（测 401 用）。 */
   request(pathname: string, init?: RequestInit & { token?: string | null }): Promise<Response>;
   /** 对 /exec 发一个 JSON POST。不跟随事件流，只拿 202 响应。 */
@@ -65,12 +71,16 @@ export interface TestAgentOptions {
 export async function startTestAgent(options: TestAgentOptions = {}): Promise<TestAgent> {
   // mkdtemp 会建一个随机名的空目录。rq-agent- 是前缀，方便出问题时认出来。
   const root = await mkdtemp(path.join(os.tmpdir(), "rc-agent-"));
+  // 第二个读根：不在 workspace 里面（不然“写不进去”这件事根本测不出来）。
+  const extraRoot = await mkdtemp(path.join(os.tmpdir(), "rc-agent-read-"));
   // 下面这些 env 全是为了这个用例好断言；真正必填的只有 TOKEN。
   const env: NodeJS.ProcessEnv = {
     SANDBOX_AGENT_TOKEN: TEST_TOKEN,
     SANDBOX_AGENT_HOST: "127.0.0.1",
     SANDBOX_AGENT_PORT: "0",
     SANDBOX_WORKSPACE_ROOT: root,
+    // 不设它的话缺省会指向真实的 /tmp/reuben-cloud——测试不该碰全局路径。
+    SANDBOX_AGENT_READ_ROOTS: `${root},${extraRoot}`,
     SANDBOX_LOG_ROOT: path.join(root, "logs"),
     SANDBOX_AGENT_HOME: path.join(root, "home"),
     // 显式指定，而不是让 agent 继承宿主 env（那是确定性问题的来源）。
@@ -83,9 +93,12 @@ export async function startTestAgent(options: TestAgentOptions = {}): Promise<Te
   await mkdir(config.logRoot, { recursive: true });
   await mkdir(config.home, { recursive: true });
 
-  const roots = await createRootResolver(config.workspaceRoot);
+  const roots = await createRootResolver({
+    writeRoot: config.workspaceRoot,
+    readRoots: config.readRoots,
+  });
   const registry = new ExecutionRegistry(config, roots);
-  const server = createAgentServer(config, registry);
+  const server = createAgentServer(config, registry, roots);
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -115,6 +128,7 @@ export async function startTestAgent(options: TestAgentOptions = {}): Promise<Te
     baseUrl,
     root,
     realRoot: roots.realRoot,
+    extraRoot,
     request,
     // 注意这里不是 server.listen，而是把 JSON 序列化都封好了。
     exec: (body: unknown) =>
@@ -128,6 +142,7 @@ export async function startTestAgent(options: TestAgentOptions = {}): Promise<Te
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(root, { recursive: true, force: true });
+      await rm(extraRoot, { recursive: true, force: true });
     },
   };
 }

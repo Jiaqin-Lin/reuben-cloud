@@ -1,26 +1,26 @@
 /**
- * 路由表 + 鉴权 + 响应工具。手写匹配，不引路由库（`node:http` 足够）。
+ * 路由表 + 鉴权。手写匹配，不引路由库（`node:http` 足够）。
  *
  * 鉴权写在最前面，对所有路由生效——包括 /health。裸跑阶段这个 token 看起来没用
  * （本机、127.0.0.1），但容器化之后它是内网唯一的防线；事后补的鉴权就是这个项目里
  * 最容易被漏掉的一行。
+ *
+ * 【在链路中的位置】Phase 2 起路由表覆盖 exec（4 条）+ files（3 条），
+ * 但它只做「method + path → 交给谁」的分发，具体逻辑住在 registry.ts / files/* 里。
+ * 响应工具（sendJson / 鉴权）搬到了 http.ts，理由见那个文件的头注释。
  */
 
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Server } from "node:http";
-import { timingSafeEqual } from "node:crypto";
 import { VERSION, type Config } from "./config.ts";
+import type { RootResolver } from "./paths.ts";
 import type { ExecutionRegistry } from "./exec/registry.ts";
-import type {
-  ErrorResponse,
-  ExecAcceptedResponse,
-  HealthResponse,
-  KillResponse,
-} from "./types.ts";
-
-/** /exec 的请求体很小（argv 数组）。给足余量，但必须有上限。 */
-const MAX_BODY_BYTES = 256 * 1024;
+import { handleFileList } from "./files/list.ts";
+import { handleFileRead } from "./files/read.ts";
+import { handleFileWrite } from "./files/write.ts";
+import { isAuthorized, readJsonBody, sendError, sendJson } from "./http.ts";
+import type { ExecAcceptedResponse, HealthResponse, KillResponse } from "./types.ts";
 
 /**
  * 建一个 HTTP server（还没开始 listen，那是 index.ts 的事）。
@@ -28,13 +28,18 @@ const MAX_BODY_BYTES = 256 * 1024;
  * 为什么要包一层 `.catch()`：`handle` 是 async 函数，它抛出的异常 Node 不会自动变成 500，
  * 而是变成一个未处理的 Promise 拒绝（进程可能直接挂）。所以这里统一兜底成 500。
  *
- * @param config 读 token / 停不限用
- * @param registry 执行注册表，三个路由都通过它做事
+ * @param config 读 token / 各种上限
+ * @param registry 执行注册表，exec 的四条路由都通过它做事
+ * @param roots 路径校验器，Phase 2 起 files 的三条路由要用（exec 的 cwd 校验也用它）
  * @returns 配好路由但未监听的 Server
  */
-export function createAgentServer(config: Config, registry: ExecutionRegistry): Server {
+export function createAgentServer(
+  config: Config,
+  registry: ExecutionRegistry,
+  roots: RootResolver,
+): Server {
   return createServer((req, res) => {
-    handle(req, res, config, registry).catch((err: unknown) => {
+    handle(req, res, config, registry, roots).catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
       // 响应已经开始发了就不能再写头部（会报 ERR_HEADERS_SENT），只能把它关掉。
       if (res.headersSent || res.writableEnded) {
@@ -47,14 +52,17 @@ export function createAgentServer(config: Config, registry: ExecutionRegistry): 
 }
 
 /**
- * 路由分发。整个 agent 就四个路（比 spec 里的 9 个少，剩下的是 Phase 2/3 的事）：
+ * 路由分发。整个 agent 有七条路由：
  *
  *   GET  /health
  *   POST /exec
  *   GET  /exec/{id}/events   （SSE，会一直挂着不返回）
  *   POST /exec/{id}/kill
+ *   GET  /files              （读：JSON 或 raw 流）
+ *   PUT  /files              （写：流式裸字节）
+ *   GET  /files/list         （列目录）
  *
- * 手写匹配而不是引路由库：4 条路由不值得一个依赖（和“零依赖”的整体取舍一致）。
+ * 手写匹配而不是引路由库：7 条路由不值得一个依赖（和“零依赖”的整体取舍一致）。
  *
  * @throws 本函数不吞异常，由 createAgentServer 的 catch 统一变 500。
  */
@@ -63,11 +71,12 @@ async function handle(
   res: ServerResponse,
   config: Config,
   registry: ExecutionRegistry,
+  roots: RootResolver,
 ): Promise<void> {
   // 鉴权在所有路由之前，包括 /health。这一行容易被当成“本机跑不需要”而忘掉，
   // 但容器化之后它就是内网唯一的防线。
   if (!isAuthorized(req.headers.authorization, config.token)) {
-    sendJson(res, 401, { error: "unauthorized" });
+    sendError(res, 401, "unauthorized");
     return;
   }
 
@@ -106,6 +115,21 @@ async function handle(
     return;
   }
 
+  // ---- Phase 2：文件 API。三条路由都只是把参数原样转交给 files/*，
+  // 路径校验、上限、响应形状都在那边（这里保持"只有分发"）。
+  if (method === "GET" && pathname === "/files") {
+    await handleFileRead(res, url, roots, config);
+    return;
+  }
+  if (method === "PUT" && pathname === "/files") {
+    await handleFileWrite(req, res, url, roots, config);
+    return;
+  }
+  if (method === "GET" && pathname === "/files/list") {
+    await handleFileList(res, url, roots, config);
+    return;
+  }
+
   // /exec/{id}/events 和 /exec/{id}/kill。两个捕获组：([^/]+)=id，
   // (events|kill)=动作。`[^/]+` 的“不能带斜杠”是故意的：防止 /exec/a/b/kill 被当成 id="a/b"。
   const execRoute = /^\/exec\/([^/]+)\/(events|kill)$/.exec(pathname);
@@ -123,7 +147,7 @@ async function handle(
     }
   }
 
-  sendJson(res, 404, { error: "not_found" });
+  sendError(res, 404, "not_found");
 }
 
 /**
@@ -141,7 +165,7 @@ function handleEvents(
 ): void {
   const record = registry.get(id);
   if (record === undefined) {
-    sendJson(res, 404, { error: "not_found" });
+    sendError(res, 404, "not_found");
     return;
   }
   // Last-Event-ID 是 SSE 协议自带的重连头：客户端断线重连时会自动带上它，
@@ -158,7 +182,7 @@ function handleEvents(
 function handleKill(res: ServerResponse, registry: ExecutionRegistry, id: string): void {
   const result = registry.kill(id);
   if (!result.ok) {
-    sendJson(res, 404, { error: "not_found" });
+    sendError(res, 404, "not_found");
     return;
   }
   // 幂等：已经在终态就返回当前状态，这不是错误——重试语义需要它。
@@ -167,15 +191,6 @@ function handleKill(res: ServerResponse, registry: ExecutionRegistry, id: string
     status: result.execution.status === "running" ? "killing" : result.execution.status,
   };
   sendJson(res, 200, payload);
-}
-
-/** 拼 /health 的响应。status 现在永远写 ready（starting / error 是为容器化预留的）。 */
-function healthPayload(registry: ExecutionRegistry): HealthResponse {
-  return {
-    status: "ready", // Phase 1 只会是 ready（starting 用不到、error 保留）
-    version: VERSION,
-    activeExecution: registry.activeExecution,
-  };
 }
 
 /**
@@ -190,94 +205,11 @@ function parseLastEventId(raw: string | undefined): number | null {
   return value;
 }
 
-/**
- * 校验 `Authorization: Bearer <token>`。
- * 大小写不敏感（HTTP 标准），但 token 本身必须完全一致。
- * 先比长度再调 safeEqual——故意的：能在常数时间里比对的事情不要提前泄露信息。
- */
-function isAuthorized(header: string | undefined, token: string): boolean {
-  if (header === undefined) return false;
-  const prefix = "bearer ";
-  if (header.length <= prefix.length) return false;
-  if (header.slice(0, prefix.length).toLowerCase() !== prefix) return false;
-  return safeEqual(header.slice(prefix.length), token);
-}
-
-/**
- * 常数时间字符串比较，防“计时攻击”。
- *
- * 为什么不能用 `a === b`：JS 的字符串比较发现不同就立刻返回，
- * 于是“前缀对了几个字符”会反映在耗时上；攻击者可以逐字节把 token 猜出来。
- * timingSafeEqual 无论如何都比完全部字节。
- */
-function safeEqual(candidate: string, expected: string): boolean {
-  const a = Buffer.from(candidate, "utf8");
-  const b = Buffer.from(expected, "utf8");
-  // 长度不等直接返回 false —— timingSafeEqual 长度不等会抛异常。
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
-}
-
-/** readJsonBody 的返回：成功带解析结果，失败带该发的状态码和响应体。 */
-type BodyResult = { ok: true; value: unknown } | { ok: false; status: number; body: ErrorResponse };
-
-/**
- * 把请求体读完并 JSON.parse。
- *
- * 这里只有三个分支：太大（413）、空的/不是 JSON（400）、读流时断了（400）。
- * 具体的字段校验不在这里——那是 spawn.ts 的 validateExecRequest 的事。
- * 分成两层是因为“是不是合法 JSON”和“字段合不合法”是两种不同的错误。
- */
-async function readJsonBody(req: IncomingMessage): Promise<BodyResult> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  let tooLarge = false;
-
-  try {
-    for await (const chunk of req) {
-      const buf = chunk as Buffer;
-      size += buf.length;
-      if (size > MAX_BODY_BYTES) {
-        // 继续把流排干而不是 break：break 会销毁 socket，413 就送不出去了。
-        // 超限之后不再累积，内存不随 body 增长。
-        tooLarge = true;
-        chunks.length = 0;
-        continue;
-      }
-      chunks.push(buf);
-    }
-  } catch {
-    return { ok: false, status: 400, body: { error: "invalid_json", message: "request aborted" } };
-  }
-
-  if (tooLarge) {
-    return { ok: false, status: 413, body: { error: "body_too_large", limit: MAX_BODY_BYTES } };
-  }
-  if (size === 0) {
-    return { ok: false, status: 400, body: { error: "invalid_json", message: "empty body" } };
-  }
-
-  try {
-    return { ok: true, value: JSON.parse(Buffer.concat(chunks).toString("utf8")) };
-  } catch {
-    return { ok: false, status: 400, body: { error: "invalid_json", message: "body is not valid JSON" } };
-  }
-}
-
-/**
- * 统一的 JSON 响应出口。**所有**响应都从这里走，保证头部一致。
- * 先判定“已经开始发了吗”——否则写头部会抛异常，把原本的 4xx 变成一个 500 噪声。
- */
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  if (res.headersSent || res.writableEnded) {
-    res.end();
-    return;
-  }
-  const json = JSON.stringify(body);
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(json),
-    "Cache-Control": "no-store",
-  });
-  res.end(json);
+/** 拼 /health 的响应。status 现在永远写 ready（starting / error 是为容器化预留的）。 */
+function healthPayload(registry: ExecutionRegistry): HealthResponse {
+  return {
+    status: "ready", // Phase 1 只会是 ready（starting 用不到、error 保留）
+    version: VERSION,
+    activeExecution: registry.activeExecution,
+  };
 }

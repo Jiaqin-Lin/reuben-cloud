@@ -130,12 +130,81 @@ export interface TerminalEventData {
   message?: string;
 }
 
+// ---------------------------------------------------------------- Phase 2：文件 API
+
+/** 一个文件条目的类型。`other` = FIFO / socket / 设备这种既不是普通文件也不是目录的东西。 */
+export type FileEntryType = "file" | "dir" | "symlink" | "other";
+
+/** `GET /files` 支持的内容编码。不做二进制探测，用哪个由调用方说了算。 */
+export type FileReadEncoding = "utf8" | "base64";
+
+/**
+ * `GET /files` 的 JSON 响应（`encoding=utf8` 与 `base64` 长同一个形状）。
+ *
+ * 注意三个尺寸/哈希字段不是一回事：`size` 是文件总字节数，`bytes` 是本次返回的字节数，
+ * `sha256` 只覆盖**本次返回的那段字节**——范围读时算全文哈希没有意义。
+ */
+export interface FileReadResponse {
+  /** 解析符号链接之后的绝对路径。CP 之后要读别的范围就原样传回来。 */
+  path: string;
+  /** 文件总字节数（不是本次返回的长度）。 */
+  size: number;
+  /** 本次返回内容的 sha256（十六进制小写）。 */
+  sha256: string;
+  /** `content` 用哪种编码。 */
+  encoding: FileReadEncoding;
+  /** 本次读取的起始字节偏移。 */
+  offset: number;
+  /** 本次返回的字节数（utf8 时等于 `Buffer.byteLength(content)`）。 */
+  bytes: number;
+  /** 内容本体。`base64` 时是原字节的 base64，不做任何猜测。 */
+  content: string;
+}
+
+/** `PUT /files` 的响应体。CP 拿 sha256 校验灌入的 tar 完整。 */
+export interface FileWriteResponse {
+  /** 写入之后的绝对路径（原子 rename 的落点）。 */
+  path: string;
+  /** 实际收到的字节数。 */
+  size: number;
+  /** 写入内容的 sha256（十六进制小写）。 */
+  sha256: string;
+}
+
+/** `GET /files/list` 里的一项。 */
+export interface FileEntry {
+  /**
+   * `depth=1` 时是文件名；`depth>1` 时是**相对本次请求路径**的相对路径（如 `src/a.ts`），
+   * 不带前导 `/`。客户端要绝对路径就自己与响应的 `path` 拼。
+   */
+  name: string;
+  type: FileEntryType;
+  /** lstat 的 size（符号链接就是链接本体的长度，因为不跟随）。 */
+  size: number;
+  /** mtime，毫秒时间戳。 */
+  mtime: number;
+}
+
+/**
+ * `GET /files/list` 的响应。故意是对象而不是裸数组：`truncated` 需要一个落点。
+ */
+export interface FileListResponse {
+  /** 被列出目录的绝对路径（符号链接已解析）。 */
+  path: string;
+  entries: FileEntry[];
+  /** 是否因为超过条目上限而没列完（截掉的是条目，不是内容）。 */
+  truncated: boolean;
+}
+
 /**
  * 所有非 2xx 响应的统一形状。
  * 典型 error 取值：unauthorized / not_found / busy / invalid_cmd / invalid_cwd /
  * path_out_of_bounds / invalid_env / invalid_timeout / timeout_exceeds_max /
  * invalid_max_output_bytes / body_too_large / invalid_json / shutting_down /
- * internal_error。CP 靠 `error` 字段分支，不靠 HTTP 状态码猜。
+ * internal_error；文件 API 另有 missing_path / invalid_path / invalid_range /
+ * invalid_encoding / invalid_raw / invalid_depth / invalid_content_type /
+ * is_directory / not_a_file / not_directory / invalid_utf8 / too_large /
+ * upload_aborted / permission_denied。CP 靠 `error` 字段分支，不靠 HTTP 状态码猜。
  */
 export interface ErrorResponse {
   /** 机器可读的错误码，CP 按它决定怎么处理。 */
