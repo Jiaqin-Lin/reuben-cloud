@@ -1,3 +1,8 @@
+/**
+ * ULID 的单元测试。四条断言分别对应它的四条承诺：长度/字符集、时间单调、同毫秒不重、
+ * 字典序 = 时间序（最后一条最实用：按 id 排序的日志就是按时间排的）。
+ */
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ulid } from "../src/ulid.ts";

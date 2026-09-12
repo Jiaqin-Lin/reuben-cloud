@@ -1,18 +1,31 @@
+/**
+ * OutputMerger 的单元测试（不需要起 agent，也不需要 Docker）。
+ * 验证四件事：切块不超过上限、100ms 窗口会 flush、多字节字符不被切断、字节计数按原始字节算。
+ * 这组测试直接 new OutputMerger 手动 push，所以是“对着零件测”而不是“对着整机测”。
+ */
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import { OutputMerger, type OutputMergerOptions } from "../src/exec/output.ts";
 
+/** collector 收集到的每一块：文本 + 原始字节数。 */
 interface Chunk {
   text: string;
   bytes: number;
 }
 
+/**
+ * 造一个合并器，把所有回调收进数组，供断言用。
+ * `Omit<OutputMergerOptions, "onChunk">` = “和 OutputMergerOptions 一样，但把 onChunk 去掉”——
+ * 因为 onChunk 由这个函数自己提供（测试要的恰恰是把它换成收集器）。
+ */
 function collector(options: Omit<OutputMergerOptions, "onChunk">) {
   const chunks: Chunk[] = [];
   const merger = new OutputMerger({ ...options, onChunk: (text, bytes) => chunks.push({ text, bytes }) });
   return { chunks, merger };
 }
 
+/** 睡一会儿——用来验证“时间窗口到了就 flush”。 */
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

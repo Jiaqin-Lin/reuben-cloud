@@ -1,3 +1,9 @@
+/**
+ * RootResolver 的单元测试：验路径包含性校验。这是安全边界之一，所以用例尽量把
+ * 典型的绕过手法都盖了：字符串前缀（/workspace-evil）、NUL 字节、符号链接逃逸
+ * （ln -s /etc link 这种）。不要删其中的“符号链接逃逸”那一条——它是这个文件存在的理由。
+ */
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
@@ -5,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { createRootResolver, type RootResolver } from "../src/paths.ts";
 
+/** 建一个临时根目录 + 一个指向它的 resolver；cleanup 删目录。 */
 async function fixture(): Promise<{ root: string; resolver: RootResolver; cleanup: () => Promise<void> }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "rc-paths-"));
   const resolver = await createRootResolver(root);

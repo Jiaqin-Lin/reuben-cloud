@@ -3,6 +3,8 @@
 > 一个云端自主编码 Agent 平台。你下班，它上班。
 >
 > 沙箱子系统的**实施规格**（Phase 拆分、测试要点、验收标准）见 [`docs/sandbox-spec.md`](docs/sandbox-spec.md)；**设计文档与取舍理由**见 [`docs/sandbox.md`](docs/sandbox.md)。
+>
+> **第一次读代码？** 先看 [`docs/exec-链路-大白话.md`](docs/exec-链路-大白话.md)（一次 exec 从 HTTP 到终态事件的完整链路）和 [`docs/typescript-速查.md`](docs/typescript-速查.md)（本仓库用到的 TS 语法速查）。
 
 ---
 
