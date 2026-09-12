@@ -4,6 +4,11 @@
  * 并发模型是设计而不是临时限制（§C.2）：一个沙箱同时只允许一个 exec，
  * 第二个请求返回 409。需要并发就开多个沙箱。
  *
+ * Phase 3 起这个闸还管着 `/diff` 与 `/archive`（附录 A-5）：它们和 exec 共享
+ * workspace 的读写语义，边跑测试边打包会产生一个撕裂的归档。因此它们用
+ * `acquireSlot("diff_…")` / `acquireSlot("archive_…")` 抢**同一个**槽，
+ * 错误语义（409 busy / 503 shutting_down）也完全一致。
+ *
  * 状态表的唯一权威在 CP 的 Postgres 里；这里只维护「这个进程现在还活着吗」这个事实。
  */
 
@@ -144,6 +149,12 @@ export type StartResult =
   | { ok: true; execution: ExecutionRecord }
   | { ok: false; status: number; body: ErrorResponse };
 
+/**
+ * `acquireSlot()` 的结果。形状与 StartResult 的失败分支一样（status + body），
+ * 因为两者向 CP 表达的是同一件事：槽没抢到，原因是 409 还是 503。
+ */
+export type SlotResult = { ok: true } | { ok: false; status: number; body: ErrorResponse };
+
 /** registry.kill() 的结果：ok=false 只有一种含义——这个 id 没见过（→ 404）。 */
 export type KillResult = { ok: true; execution: ExecutionRecord } | { ok: false };
 
@@ -159,6 +170,12 @@ export class ExecutionRegistry {
   #gate = new BusyGate();
   /** 置上之后 start() 一律 503，拒绝接新活（正在优雅退出）。 */
   #shuttingDown = false;
+  /**
+   * Phase 3：长活流式任务（diff/archive）的取消钩子。
+   * 它们不是 ExecutionRecord（没有事件流、没有日志文件），但优雅退出时必须一起带走——
+   * detached 的子进程不会随 agent 进程退出而死，不杀就会留下孤儿 tar/git。
+   */
+  #cancellations = new Set<() => void>();
 
   constructor(config: Config, roots: RootResolver) {
     this.#config = config;
@@ -237,6 +254,52 @@ export class ExecutionRegistry {
   }
 
   /**
+   * 抢 BUSY 槽。Phase 3 的 diff/archive 用它，拿到槽之后才起 git/tar。
+   *
+   * 失败分两种情况，和 `/exec` 的措辞保持一致：
+   *  - 正在关停 → 503 `shutting_down`（别再起新进程了，马上要 exit）
+   *  - 已经有人在跑 → 409 `busy` + `activeExecution`（调用方看得出是谁占着）
+   *
+   * @param id 占槽者的 id（`exe_…` / `diff_…` / `archive_…`）。/health 会原样返回它。
+   */
+  acquireSlot(id: string): SlotResult {
+    if (this.#shuttingDown) {
+      return { ok: false, status: 503, body: { error: "shutting_down" } };
+    }
+    const slot = this.#gate.acquire(id);
+    if (!slot.ok) {
+      return {
+        ok: false,
+        status: 409,
+        body: { error: "busy", activeExecution: slot.activeExecution },
+      };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * 还槽。**比对 id**（在 BusyGate.release 里做）：一个晚到的旧任务不能把新任务的槽释放掉。
+   * 每个 acquireSlot 都必须在 finally 里配一次 releaseSlot，否则沙箱会永久 409。
+   */
+  releaseSlot(id: string): void {
+    this.#gate.release(id);
+  }
+
+  /**
+   * 登记一个长活流式任务的取消回调，返回注销函数。shutdown() 会调用所有登记中的回调。
+   *
+   * 为什么用回调而不是让 registry 直接持有 JobGuard：registry 不需要知道流的任何细节
+   * （那是 stream.ts 的事），它只需要在退出时能"把这个任务杀掉"。
+   * 依赖方向只有 stream.ts → registry，反过来用回调表达，省掉一个循环依赖。
+   */
+  registerCancellation(cancel: () => void): () => void {
+    this.#cancellations.add(cancel);
+    return () => {
+      this.#cancellations.delete(cancel);
+    };
+  }
+
+  /**
    * 优雅退出：杀掉所有在跑的进程组，等它们真的死掉。
    * 顺序是重点——先杀进程组再关 server，否则容器里会留下孤儿。
    *
@@ -247,6 +310,12 @@ export class ExecutionRegistry {
    */
   async shutdown(): Promise<void> {
     this.#shuttingDown = true;
+
+    // 先取消 diff/archive：它们是 detached 的子进程，不杀就会在 agent 退出后活下来
+    // （容器停掉时会被一起清掉，但裸跑 Ctrl-C 不会）。取消只是发 SIGKILL，不用等——
+    // 它们各自的 handler 会正常把槽还回去，而我们马上就要 close 连接了。
+    for (const cancel of [...this.#cancellations]) cancel();
+
     const running = [...this.#executions.values()].filter((r) => r.status === "running");
     for (const record of running) requestKill(record, "killed", this.#config);
     if (running.length === 0) return;

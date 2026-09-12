@@ -6,7 +6,8 @@
  * 最容易被漏掉的一行。
  *
  * 【在链路中的位置】Phase 2 起路由表覆盖 exec（4 条）+ files（3 条），
- * 但它只做「method + path → 交给谁」的分发，具体逻辑住在 registry.ts / files/* 里。
+ * Phase 3 再加 diff / archive 两条。但它只做「method + path → 交给谁」的分发，
+ * 具体逻辑住在 registry.ts / files/* / diff.ts / archive.ts 里。
  * 响应工具（sendJson / 鉴权）搬到了 http.ts，理由见那个文件的头注释。
  */
 
@@ -16,6 +17,8 @@ import type { Server } from "node:http";
 import { VERSION, type Config } from "./config.ts";
 import type { RootResolver } from "./paths.ts";
 import type { ExecutionRegistry } from "./exec/registry.ts";
+import { handleArchive } from "./archive.ts";
+import { handleDiff } from "./diff.ts";
 import { handleFileList } from "./files/list.ts";
 import { handleFileRead } from "./files/read.ts";
 import { handleFileWrite } from "./files/write.ts";
@@ -52,7 +55,7 @@ export function createAgentServer(
 }
 
 /**
- * 路由分发。整个 agent 有七条路由：
+ * 路由分发。整个 agent 有九条路由：
  *
  *   GET  /health
  *   POST /exec
@@ -61,8 +64,10 @@ export function createAgentServer(
  *   GET  /files              （读：JSON 或 raw 流）
  *   PUT  /files              （写：流式裸字节）
  *   GET  /files/list         （列目录）
+ *   GET  /diff               （相对 base commit 的 patch，Phase 3）
+ *   GET  /archive            （整仓 tar.gz 流，Phase 3）
  *
- * 手写匹配而不是引路由库：7 条路由不值得一个依赖（和“零依赖”的整体取舍一致）。
+ * 手写匹配而不是引路由库：九条路由不值得一个依赖（和“零依赖”的整体取舍一致）。
  *
  * @throws 本函数不吞异常，由 createAgentServer 的 catch 统一变 500。
  */
@@ -127,6 +132,17 @@ async function handle(
   }
   if (method === "GET" && pathname === "/files/list") {
     await handleFileList(res, url, roots, config);
+    return;
+  }
+
+  // ---- Phase 3：diff 与 archive。两条都是「占 exec 的同一个 BUSY 槽」的长活任务
+  // （附录 A-5），槽的抢占、超时、断线杀进程都在被调方里，这里只做分发。
+  if (method === "GET" && pathname === "/diff") {
+    await handleDiff(res, url, roots, registry, config);
+    return;
+  }
+  if (method === "GET" && pathname === "/archive") {
+    await handleArchive(res, url, registry, config);
     return;
   }
 

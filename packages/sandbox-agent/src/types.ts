@@ -204,7 +204,10 @@ export interface FileListResponse {
  * internal_error；文件 API 另有 missing_path / invalid_path / invalid_range /
  * invalid_encoding / invalid_raw / invalid_depth / invalid_content_type /
  * is_directory / not_a_file / not_directory / invalid_utf8 / too_large /
- * upload_aborted / permission_denied。CP 靠 `error` 字段分支，不靠 HTTP 状态码猜。
+ * upload_aborted / permission_denied；Phase 3 另有 invalid_base / unknown_base /
+ * not_a_git_repository / git_error / patch_too_large / invalid_dry_run /
+ * invalid_exclude / spawn_failed / archive_failed / stream_timeout。
+ * CP 靠 `error` 字段分支，不靠 HTTP 状态码猜。
  */
 export interface ErrorResponse {
   /** 机器可读的错误码，CP 按它决定怎么处理。 */
@@ -218,4 +221,74 @@ export interface ErrorResponse {
    * 值类型是 unknown，所以读出来必须先判断类型才能用。
    */
   [key: string]: unknown;
+}
+
+// ---------------------------------------------------------------- Phase 3：diff 与 archive
+
+/**
+ * `GET /diff` 里一个文件的变更类型。刻意用词而不是 git 的字母：CP 不用再维护一份
+ * A/M/D/R 映射表，而且以后要加 `T`（file→symlink 这类 typechange）也不用改契约名。
+ */
+export type DiffFileStatus =
+  | "added"
+  | "modified"
+  | "deleted"
+  | "renamed"
+  | "copied"
+  | "typechanged"
+  | "unknown";
+
+/** `GET /diff` 响应里的 `files[]` 一项。 */
+export interface DiffFileEntry {
+  /** 变更后的路径；删除的文件就是它原来的路径。路径相对仓库根，不带前导 `/`。 */
+  path: string;
+  /** 仅 `renamed` / `copied` 有：变更前的路径。其他状态没有这个字段。 */
+  old_path?: string;
+  status: DiffFileStatus;
+  /**
+   * 新增行数。二进制文件是 0——注意那个 0 不代表"没有新增"，
+   * 要结合下面的 `binary` 读（`binary:true` 时增删行数没有意义）。
+   */
+  additions: number;
+  /** 删除行数，同上。 */
+  deletions: number;
+  /** git 认为这是不是二进制文件（来自 numstat 的 `-` 标记）。 */
+  binary: boolean;
+}
+
+/**
+ * `GET /diff` 的响应。两条输出一条都不能少：
+ *  - `files` 给 CP 存库 / 渲染行级视图 / 算影响面
+ *  - `patch` 给 CP 去 `git apply --binary`
+ */
+export interface DiffResponse {
+  /** 解析之后的 base commit（完整 sha，不是调用方传进来的写法）。 */
+  base: string;
+  /** 取 diff 时的 HEAD commit（完整 sha）。 */
+  head: string;
+  files: DiffFileEntry[];
+  /** 内联的 patch 文本；`truncated:true` 时是 null——去 `patch_log_path` 读。 */
+  patch: string | null;
+  /** patch 的真实字节数（内联与外置都一样）。 */
+  patch_bytes: number;
+  /**
+   * patch 是否**没有内联**。两种原因都会置 true：
+   *  - 超过 `SANDBOX_AGENT_MAX_PATCH_BYTES`（JSON 放不下）
+   *  - patch 不是合法 UTF-8（JSON 字符串装不下任意字节，不能静默换 U+FFFD）
+   * 两种情况下完整内容都在 `patch_log_path`，用 `GET /files?raw=1` 取回，字节一致。
+   */
+  truncated: boolean;
+  /** 外置 patch 的绝对路径（落在 `diffRoot` 下）；没外置时是 null。 */
+  patch_log_path: string | null;
+}
+
+/** `GET /archive?dryRun=1` 的响应。CP 用它做「卷 + 归档体积上限」的软限制判断。 */
+export interface ArchiveDryRunResponse {
+  /**
+   * 整棵 workspace 的 apparent size 之和（字节）＝ 每个条目的 `st_size` 累加，
+   * 与 `du -sb` 同口径（目录本身也算，符号链接按链接长度算）。
+   */
+  size_bytes: number;
+  /** 非目录条目数（普通文件 + 符号链接 + FIFO 这类"其他"）。 */
+  file_count: number;
 }

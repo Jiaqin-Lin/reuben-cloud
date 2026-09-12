@@ -52,6 +52,7 @@ export const MAX_LIST_DEPTH = 8;
 /**
  * 额外的只读根缺省值：Phase 11 的工具结果会外置到 `/tmp/reuben-cloud/out/`，
  * 之后模型要用 `read` 工具把它读回来，而写仍然只能落在 workspace（否则 diff 看不见）。
+ * Phase 3 的外置 patch（`diffRoot`）也在这底下，`loadConfig` 会把它一并塞进读集合。
  */
 export const DEFAULT_EXTRA_READ_ROOT = "/tmp/reuben-cloud";
 
@@ -71,6 +72,45 @@ export const DEFAULT_MAX_LOG_BYTES = 268_435_456;
 
 /** 心跳：空闲超过 15s 发一行注释帧，防止中间层掐掉长连接。 */
 export const DEFAULT_HEARTBEAT_MS = 15_000;
+
+/**
+ * diff / archive 自己的 HTTP 层时限（默认 300s）。
+ * 它们**不走 exec 的超时机制**——超时机制是围绕事件流和进程组写的，而这两个端点
+ * 的数据面是一条 HTTP 响应。到点就杀掉整棵进程树：一个跑了 5 分钟还没打完的 tar
+ * 大概率是卡死（或者 workspace 出了别的问题），继续拖着只会占着 BUSY 槽。
+ */
+export const DEFAULT_STREAM_TIMEOUT_MS = 300_000;
+
+/**
+ * patch 内联进 JSON 的上限（默认 2 MiB）。超过就写到 `diffRoot/{id}.patch`，
+ * 响应里给 `truncated:true` + `patch_log_path`，CP 用 `GET /files?raw=1` 取回——
+ * 内容不截断，只是换一个地方放（和 exec 的大输出外置是同一个思路）。
+ */
+export const DEFAULT_MAX_PATCH_BYTES = 2_097_152;
+
+/**
+ * 外置 patch 的体积上限（默认 256 MiB）。
+ *
+ * 为什么在外置之上还要一道线：patch 落在 tmpfs 上，tmpfs 的页面**计入 cgroup 内存**
+ * （附录 A-9 为日志写下的同一条理由）。没有这道线时，一个几百 MiB 的 diff 能把
+ * 整个容器 OOM 掉。超过就回 413 `patch_too_large`，让 CP 走 archive 回退（Phase 9 本来就有）。
+ */
+export const DEFAULT_MAX_PATCH_SPILL_BYTES = 268_435_456;
+
+/**
+ * archive 流出字节的兜底上限（默认 4 GiB）。
+ *
+ * 「卷 + 归档体积上限」的软限制在 CP 侧做（它先 dryRun 再决定拉不拉，附录 A-6）；
+ * 沙箱这一道只是防跑飞：流到一半超了就直接断连接并记日志，不静默产出一个半截归档。
+ * 注意它数的是**流出字节**（tar.gz 压缩之后），不是 dryRun 报的 apparent size。
+ */
+export const DEFAULT_MAX_ARCHIVE_BYTES = 4_294_967_296;
+
+/**
+ * 外置 patch 的落点。必须在某个读根之下，否则 CP 拿到了路径也读不回来——
+ * `loadConfig` 会把它自动并入读集合（和 writeRoot 永远在读集合里是同一条理由）。
+ */
+export const DEFAULT_DIFF_ROOT = "/tmp/reuben-cloud/diff";
 
 /** 超时/主动 kill 的优雅窗口：SIGTERM → 5s → SIGKILL 进程组（§D）。 */
 export const DEFAULT_KILL_GRACE_MS = 5_000;
@@ -121,6 +161,16 @@ export interface Config {
   maxListEntries: number;
   /** 执行日志目录，一次执行一个 `{id}.log`。容器里在 tmpfs 上，所以必须限大小。 */
   logRoot: string;
+  /** 外置 patch 的落点，一次 diff 可能有一个 `{id}.patch`（超限或非法 UTF-8 时才有）。 */
+  diffRoot: string;
+  /** diff / archive 的总时限（毫秒）。超时就杀进程组。 */
+  streamTimeoutMs: number;
+  /** patch 内联进 JSON 的字节上限。超过就外置。 */
+  maxPatchBytes: number;
+  /** 外置 patch 的字节上限。超过回 413，让 CP 走 archive 回退。 */
+  maxPatchSpillBytes: number;
+  /** archive 流出字节的兜底上限。软限制在 CP 侧，这里只防跑飞。 */
+  maxArchiveBytes: number;
   /** 子进程 HOME。agent 启动时 mkdir -p。 */
   home: string;
   /** 子进程的 PATH。固定值，不继承宿主，理由见 spawn.ts 的 buildEnv。 */
@@ -165,18 +215,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   // 先解析写根：读根的缺省值要基于它（而不是硬编码 /workspace）。
   const workspaceRoot = env.SANDBOX_WORKSPACE_ROOT ?? "/workspace";
+  // 外置 patch 的落点也要先算出来：它必须能读回来，所以要进读集合。
+  const diffRoot = env.SANDBOX_AGENT_DIFF_ROOT ?? DEFAULT_DIFF_ROOT;
 
   return {
     token,
     port: intEnv(env, "SANDBOX_AGENT_PORT", 8080),
     host: env.SANDBOX_AGENT_HOST ?? "127.0.0.1",
     workspaceRoot,
-    // 读集合里永远有写根（parseReadRoots 负责塞），否则刚写进去的文件读不回来。
-    readRoots: parseReadRoots(env.SANDBOX_AGENT_READ_ROOTS, workspaceRoot),
+    // 读集合里永远有写根与外置 patch 目录（parseReadRoots 负责塞）：
+    // 前者保证刚写进去的文件读得回来，后者保证 CP 能按 patch_log_path 把 patch 读回去。
+    readRoots: parseReadRoots(env.SANDBOX_AGENT_READ_ROOTS, [workspaceRoot, diffRoot]),
     maxReadBytes: intEnv(env, "SANDBOX_AGENT_MAX_READ_BYTES", DEFAULT_MAX_READ_BYTES),
     maxWriteBytes: intEnv(env, "SANDBOX_AGENT_MAX_WRITE_BYTES", DEFAULT_MAX_WRITE_BYTES),
     maxListEntries: intEnv(env, "SANDBOX_AGENT_MAX_LIST_ENTRIES", DEFAULT_MAX_LIST_ENTRIES),
     logRoot: env.SANDBOX_LOG_ROOT ?? "/tmp/reuben-cloud/exec",
+    diffRoot,
+    streamTimeoutMs: intEnv(env, "SANDBOX_AGENT_STREAM_TIMEOUT_MS", DEFAULT_STREAM_TIMEOUT_MS),
+    maxPatchBytes: intEnv(env, "SANDBOX_AGENT_MAX_PATCH_BYTES", DEFAULT_MAX_PATCH_BYTES),
+    maxPatchSpillBytes: intEnv(
+      env,
+      "SANDBOX_AGENT_MAX_PATCH_SPILL_BYTES",
+      DEFAULT_MAX_PATCH_SPILL_BYTES,
+    ),
+    maxArchiveBytes: intEnv(env, "SANDBOX_AGENT_MAX_ARCHIVE_BYTES", DEFAULT_MAX_ARCHIVE_BYTES),
     home: env.SANDBOX_AGENT_HOME ?? DEFAULT_HOME,
     basePath: env.SANDBOX_AGENT_BASE_PATH ?? DEFAULT_BASE_PATH,
     lang: env.SANDBOX_AGENT_LANG ?? DEFAULT_LANG,
@@ -202,14 +264,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
 /**
  * 解析 `SANDBOX_AGENT_READ_ROOTS`（逗号分隔）。
- * 缺省 = 写根 + `DEFAULT_EXTRA_READ_ROOT`；写根**永远**会被塞回结果的第一位。
+ * 缺省 = `DEFAULT_EXTRA_READ_ROOT`；`alwaysInclude` 里的路径**永远**会被塞回结果。
  * 这里不做存在性检查也不 realpath——那是 createRootResolver 的事（它要 mkdir）。
+ *
+ * @param alwaysInclude 写根（刚写进去的文件必须能读回来）与外置 patch 目录（CP 要按
+ *                      `patch_log_path` 把收不下的 patch 读回去）。两者都是"缺了就会变成
+ *                      一次莫名其妙 404"的东西，所以不交给调用方记得配。
  */
-function parseReadRoots(raw: string | undefined, writeRoot: string): string[] {
+function parseReadRoots(raw: string | undefined, alwaysInclude: string[]): string[] {
   const parts = raw === undefined || raw === "" ? [DEFAULT_EXTRA_READ_ROOT] : raw.split(",");
   const extra = parts.map((item) => item.trim()).filter((item) => item !== "");
   // 去重是为了让 config.readRoots 干净：调用方（和日志）会读它，重复项只会让人困惑。
-  return [...new Set([writeRoot, ...extra])];
+  return [...new Set([...alwaysInclude, ...extra])];
 }
 
 /**

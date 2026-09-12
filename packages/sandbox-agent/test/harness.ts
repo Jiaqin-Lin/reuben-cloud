@@ -5,6 +5,7 @@
  * 裸跑和容器里跑的是同一条路径逻辑，不需要两套。
  */
 
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -83,6 +84,8 @@ export async function startTestAgent(options: TestAgentOptions = {}): Promise<Te
     SANDBOX_AGENT_READ_ROOTS: `${root},${extraRoot}`,
     SANDBOX_LOG_ROOT: path.join(root, "logs"),
     SANDBOX_AGENT_HOME: path.join(root, "home"),
+    // Phase 3 的外置 patch 也要在临时目录里（而且是读根底下，不然 CP 读不回来）。
+    SANDBOX_AGENT_DIFF_ROOT: path.join(extraRoot, "diff"),
     // 显式指定，而不是让 agent 继承宿主 env（那是确定性问题的来源）。
     SANDBOX_AGENT_BASE_PATH: process.env.PATH ?? DEFAULT_BASE_PATH,
     ...options.env,
@@ -434,4 +437,35 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, message: string)
       setTimeout(() => reject(new Error(message)), ms).unref();
     }),
   ]);
+}
+
+/**
+ * 跑一条外部命令并收集输出。测试用（Phase 3 的 diff/archive 用例要调 git/tar/pgrep）。
+ * 生产代码不走这里——沙箱里跑命令一律是 exec 那套（进程组 + 事件流 + 日志文件）。
+ *
+ * 与 exec 的区别就是它很“薄”：不起新会话、不管超时、不限制输出，一切都交给调用方。
+ */
+export function runCommand(
+  cmd: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: Buffer; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd[0]!, cmd.slice(1), {
+      cwd: options.cwd,
+      // 不传就用 process.env：和沙箱无关的检查（pgrep）需要宿主环境。
+      env: options.env ?? process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    let stderr = "";
+    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    // ENOENT（比如系统里没有 pgrep）当 reject 处理：那是测试环境的问题，不该静默。
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      resolve({ code, signal, stdout: Buffer.concat(stdout), stderr });
+    });
+  });
 }
