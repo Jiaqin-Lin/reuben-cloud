@@ -86,6 +86,7 @@ reuben-cloud/
 │  └─ control-plane/            # Phase 5, 8–12
 │     ├─ src/
 │     │  ├─ provider/{types,docker-api,local-docker}.ts   # Phase 5（docker-api 的理由见 Phase 5 实现备注 1）
+│     │  ├─ provider/egress-proxy.ts      # Phase 6：代理容器的生命周期（理由见 Phase 6 实现备注 3）
 │     │  ├─ db/{client,sandboxes,executions,artifacts,migrations/*.sql}
 │     │  ├─ manager/{sandbox-manager,reconcile,sweeper}.ts
 │     │  ├─ client/{sandbox-api,sse}.ts   # 手写 SSE 客户端
@@ -95,8 +96,8 @@ reuben-cloud/
 │     └─ test/                  # unit/（不需 Docker）+ integration/（需 Docker）+ support.ts（公共脚手架）
 ├─ packages/e2e/                # Phase 7 冒烟脚本
 ├─ images/sandbox/Dockerfile
-├─ deploy/egress-proxy/{Dockerfile,allowlist.txt,src/proxy.ts}
-├─ scripts/{sandbox-image-check.ts,migrate.ts,dev-db.sh}
+├─ deploy/egress-proxy/{Dockerfile,allowlist.txt,src/{proxy,allowlist}.ts}   # allowlist.ts 的理由见 Phase 6 实现备注 1
+├─ scripts/{sandbox-image-check.ts,egress-proxy.ts,migrate.ts,dev-db.sh}
 └─ docs/
 ```
 
@@ -125,7 +126,7 @@ reuben-cloud/
 | 3 | diff 与 archive | 1,2 | `diff.ts` `archive.ts` `stream.ts` | 第 7 步（沙箱侧） |
 | 4 | 沙箱镜像 | 1–3 | `images/sandbox/Dockerfile` | 第 2 步 |
 | 5 | LocalDockerProvider | 4 | `provider/local-docker.ts` | 第 3 步 |
-| 6 | egress-proxy | 5 | `deploy/egress-proxy/*` | 第 4 步 |
+| 6 | egress-proxy | 5 | `deploy/egress-proxy/*` + `provider/egress-proxy.ts` | 第 4 步 |
 | 7 | 冒烟脚本 + 隔离红线 CI | 5,6 | `packages/e2e/*` `.github/workflows/smoke.yml` | 第 8 步 |
 | 8 | 持久层：表 / 状态机 / 对账 | 5 | `db/*` `manager/*` | 第 6 步 |
 | 9 | 仓库进出：clone → 灌入 → diff → apply → push | 8 | `repo/*` | 第 5 步 |
@@ -906,6 +907,9 @@ Phase 8 的对账逻辑完全建立在这两个方法上，所以它们从第一
 12. **用例 4 的失败原因接受两种**：不存在的 digest 在 registry 明确拒绝时是 `image_pull_failed`，registry 连不上/卡住时是 `image_pull_timeout`（拉取预算先到）。两者都是"拉镜像失败"，测试不该绑在某一个 registry 的行为上。
 13. **`destroy` 里转发容器先删、再 `stop?t=10`**：`stop` 那条路径不能省——直接 `kill -9` 会在卷里留下半个写入状态。转发容器先删是因为它挂着端口、且它没有任何需要优雅退出的东西。
 14. **`create` 失败时的回滚顺序是转发容器 → 沙箱容器 → 卷**，且每步都吞异常（清一个已经没了的容器会 404，那不是新错误，不能覆盖真正的原因）。用例 4 与用例 6 都断言"零残留"（按 `reuben-cloud.sandboxId` 标签过滤，不是按名字前缀）。
+15. **`tmpfs /tmp` 必须显式写 `exec`**（Phase 6 回头修的）：Docker 会给 tmpfs 默认补上 `noexec`，原来那句
+    `rw,nosuid,size=512m,mode=1777` 实测挂出来是 `noexec`。§F.1 明确不加 noexec，而它会打断 npm postinstall /
+    node-gyp / python venv 的 console script——都是从 /tmp 执行刚写进去的文件。详见 Phase 6 实现备注 10。
 
 **完成标记：**
 - [x] **Phase 5 完成** — 沙箱能被创建、加固、回收，且不泄漏（集成 11/11、单测 21/21、`tsc --noEmit` 通过；手工复核过加固参数与零残留）
@@ -918,7 +922,8 @@ Phase 8 的对账逻辑完全建立在这两个方法上，所以它们从第一
 
 ### 交付物
 
-`deploy/egress-proxy/{Dockerfile,allowlist.txt,src/proxy.ts}`。
+`deploy/egress-proxy/{Dockerfile,allowlist.txt,src/proxy.ts}` + `src/allowlist.ts`（多这一个文件的理由见实现备注 1）
++ `packages/control-plane/src/provider/egress-proxy.ts`（代理容器的生命周期）+ `scripts/egress-proxy.ts`（`npm run proxy:up/down/status`，理由见实现备注 3）+ `packages/control-plane/test/{unit,integration}/egress-proxy*.test.ts`。
 
 ### 具体如何实现
 
@@ -977,6 +982,7 @@ security.debian.org
 #### 3. 容器与网络
 
 - 代理容器跑在同一台宿主上，**双挂**：`reuben-cloud-internal`（内网，别名 `reuben-cloud-proxy`）+ 默认 `bridge`（有出口）。
+  照抄成 `NetworkMode: "bridge"` + `EndpointsConfig: {<内网>}` **是不够的**：Docker 把 `"bridge"` 当默认值，视同"没指定"，容器会只挂上内网——没有默认路由、没有 DNS 转发，于是**所有放行的域名都 502**。两张网都必须出现在 `EndpointsConfig` 里（主网络也再列一次）。详细经过见实现备注 2。
 - 代理容器同样加固：非 root、`CapDrop: ["ALL"]`（监听 3128 是非特权端口，不需要任何 capability）、`ReadonlyRootfs: true`、`no-new-privileges`。它经手的是不可信流量，没理由给它更多。
 - 沙箱通过 `HTTP_PROXY` / `HTTPS_PROXY` / `http_proxy` / `https_proxy`（大小写都给，npm 和 apt 各认各的）+ `NO_PROXY=localhost,127.0.0.1` 找到它。
 
@@ -1004,9 +1010,13 @@ security.debian.org
 - 白名单是**全局静态常量**，不是 per-sandbox / per-task（`SandboxSpec` 里没有 `network` 字段）。改动要重启/重载代理。
 - 不允许裸 `*`；不允许 IP；不允许 `github.com`。
 - 代理**不持有任何凭据**。
+- **端口一个都不发布**：代理只在共用内网上可见。发布到宿主机等于给"绕过白名单"开一条路（§F.2 已知边界第一条）。
+- 白名单用**只读单文件 bind mount** 挂进容器（换清单要 SIGHUP，只读根下 `docker cp` 写不进去）。这是全项目唯一一处 bind mount；沙箱容器那边永远只有命名卷。
 - 已知边界（写进文档，不假装没有）：内网里的容器可以访问宿主上监听 `0.0.0.0` 的服务；同一内网里的沙箱之间互通。MVP 的单任务场景下可接受，M2 再谈 per-sandbox 网络。
 
 ### 测试要点
+
+落点：白名单规则 / 进程内代理行为 / 容器请求体在 `packages/control-plane/test/unit/egress-proxy-*.test.ts`（不需要 Docker、不需要外网）；上面那张表的 12 条在 `packages/control-plane/test/integration/egress-proxy.integration.test.ts`（需要 Docker，12 条里只有 1、6、8、9 需要外网，其余走一个本地 origin 容器）。
 
 | # | 用例 | 断言 |
 |---|---|---|
@@ -1025,13 +1035,67 @@ security.debian.org
 
 ### 验收标准
 
-- [ ] 上表 12 项全绿
-- [ ] §J 网络两条红线达成：非白名单（含 github.com）不可达、白名单可装包
-- [ ] 代理日志里能看到全部出网域名
-- [ ] `curl https://github.com` 从沙箱里**确实失败**
+- [x] 上表 12 项全绿（跑法：先 `npm run build:proxy-image`，再 `npm run test:integration -w @reuben-cloud/control-plane`）
+- [x] §J 网络两条红线达成：非白名单（含 github.com）不可达、白名单可装包（npm 与 pip 各一次真实装包）
+- [x] 代理日志里能看到全部出网域名（单元测试与集成测试都断言了字段表）
+- [x] `curl https://github.com` 从沙箱里**确实失败**（403，不是"超时"）
 
 **完成标记：**
-- [ ] **Phase 6 完成** — 出网被白名单限制，github.com 不可达
+- [x] **Phase 6 完成** — 出网被白名单限制，github.com 不可达（单元 56/56、集成 13/13、`tsc --noEmit` 通过）
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **多一个文件 `deploy/egress-proxy/src/allowlist.ts`**：把"这个域名放不放行"的规则拆成可单测的纯函数
+   （解析、归一化、IP 判定、authority 解析）。理由和 Phase 1 的 `config.ts`、Phase 3 的 `stream.ts` 一样——
+   边界规则混在 socket 代码里就只能靠起容器验证，拆出来之后大小写/尾点/裸通配/IP 这些绕过手法全是毫秒级断言。
+2. **网络必须两张都列在 `EndpointsConfig` 里**（§3 已同步）：`NetworkMode: "bridge"` 是默认值，Docker 视同没指定，
+   于是 `EndpointsConfig` 成为完整集合——只列内网就**真的只有内网**。实测症状是：容器在跑、`/healthz` 正常、
+   但每一个放行的域名都回 502，日志里是 `getaddrinfo EAI_AGAIN` + `ENETUNREACH`。把 `bridge: {}` 也列进去之后
+   默认路由才走 bridge。这与 Phase 5 的转发容器同一个形状（它也把自己的主网络列了一遍）。
+   `matchesDesired()` 因此多了一条显式检查：**两张网都得在**——一个"看起来健康、其实所有出网都坏"的代理
+   是最难查的一类故障。
+3. **多两个落点：`packages/control-plane/src/provider/egress-proxy.ts` 与 `scripts/egress-proxy.ts`**（+ 三个 npm script
+   `build:proxy-image` / `proxy:up` / `proxy:down` / `proxy:status`）。本文只交付了容器内的代理代码，
+   但"谁把代理起起来"没有落点：它要挂内网、要挂白名单、要按 §F.1 加固、要能在 Phase 7 的冒烟里被复用。
+   放在 provider 旁边是因为它是 CP 侧的基础设施代码，和 `local-docker.ts` 一起构成"CP 里唯一允许碰 docker socket 的地方"；
+   它**不是 `SandboxProvider`**（没有 sandboxId / 卷 / agent，硬塞进那 5 个方法只会让接口语义变糊）。
+   `ensureRunning()` 幂等：镜像 digest、白名单挂载、两张网络任何一项对不上就重建。
+4. **`ContainerRole` 多一个 `egress-proxy` 值，`listManaged()` 要区分它**：代理带 `managed=true` 但没有 `sandboxId`。
+   不显式区分的话，Phase 8 的对账会把代理当成"DB 里没有的孤儿沙箱"删掉——那就等于把出网基础设施删了。
+   Phase 8 写对账时必须显式跳过 `role=egress-proxy`。
+5. **代理的镜像解析只查本地**（`resolveLocalImageReference` + 新增 `ProviderError` 原因 `image_not_found`）：
+   代理镜像没有 registry 可拉，走 provider 那条"先查本地再拉"的路会在拉取时 403。解析结果优先 `RepoDigests`、
+   其次镜像 `Id`，与 Phase 5 的本地镜像处理保持一致；失败信息直接告诉使用者跑 `npm run build:proxy-image`。
+6. **`/healthz` 是新增的**（origin-form，只有直接打到 3128 且不做 Host 转发的请求才会命中）：
+   `ensureRunning` 与镜像的 `HEALTHCHECK` 需要它。它**不能**用代理方式访问——那会走正常白名单流程，不给自己开后门。
+7. **SIGHUP 重载失败时保留旧名单**：文件读坏 / 语法错（含裸 `*`）只记一行错误日志，代理继续用当前那份跑。
+   "拒绝启动"只针对启动——部署错误要立刻暴露，运行期事故不该让整个出网点停摆。
+8. **白名单的宿主文件 → 容器可见有几十毫秒延迟**（Docker Desktop 的 gRPC-FUSE；Linux 上是实时的）：
+   所以 `reload()` 只负责"让进程重读它现在能看到的那份"。集成测试在 HUP 之前会先确认容器里已经看见新内容——
+   不这么做会得到一个只在 mac 上出现的假失败（"重载成功但规则没变"）。
+9. **`pip install requests` 的用例改成了 venv 变体**：Debian 12 的 python3 带 PEP 668 的 `EXTERNALLY-MANAGED` 标记，
+   裸 `pip install` 会被 pip 自己拒绝；而且沙箱根文件系统是只读的，系统 site-packages 本来就写不进去。
+   `python3 -m venv /tmp/venv && /tmp/venv/bin/pip install requests` 走的是同一条出网链路
+   （`pypi.org` + `files.pythonhosted.org`），验证的正是 spec 用例 9 想证明的东西。
+10. **顺带修掉一个 Phase 5 的真 bug：tmpfs 的 `noexec`。** Docker 会给 tmpfs 默认加上 `noexec`，
+    provider 原来传的 `rw,nosuid,size=512m,mode=1777` 会被补成 `noexec`（实测 `mount` 输出如此）。
+    §F.1 明确说 `/tmp` **故意不加 noexec**，而它会实打实地打断 npm postinstall / node-gyp /
+    python venv 的 console script（都是从 /tmp 执行一个刚写进去的文件）——pip 用例第一次跑就是
+    `Permission denied`。修法：沙箱的 tmpfs 显式写 `exec`（`buildHostConfig` + `scripts/sandbox-image-check.ts`），
+    并在 Phase 5 的单测/集成测试里各钉一条断言；转发容器与代理自己的 tmpfs 仍然是 `noexec`（它们不从 /tmp 执行东西）。
+11. **CONNECT 的客户端 socket 必须在最前面挂 `error` 监听**：`connect` 事件给的是一条已经脱离 HTTP 解析器的裸 socket，
+    任何一个没有监听器的 `error`（客户端 RST 最常见）都会以未捕获异常把代理进程带走——表现是"所有沙箱同时失去出网"。
+    这个 bug 是手工验证时踩到的（npm 放弃一次 502 后 RST，代理直接退出），单测里有一条专门反复 RST 再断言 `/healthz` 还活着。
+12. **两个为真实环境加的稳定性旋钮**：
+    - `START_TIMEOUT_MS = 120s`（只有 start 调用用它）：start 要等 Docker 建网、挂载、拉 init，
+      冷启动的 Docker Desktop 上实测见过 64 秒（热了之后 0.2 秒）。算进通用的 30s 会让 `proxy:up` 偶尔凭空失败。
+    - `RUNNING_STABLE_MS = 500ms`：看到 `Running=true` 之后隔 500ms 再确认一次。裸 `*` 的坏配置容器会先跑
+      ~400ms 再退出，只查一次就会把"坏配置"当成"启动成功"。
+13. **测试落点与 tsconfig**：代理的测试放在 control-plane 的 `test/unit` / `test/integration` 下（它是 CP 消费的东西），
+    因此根 `tsconfig.json` 的 include 多了 `deploy/*/src/**/*.ts`。`npm test` 仍然不需要 Docker、不需要网络。
+14. **集成测试会短暂接管 `reuben-cloud-proxy` 这个容器名**：沙箱里注入的 `HTTP_PROXY` 指向的就是这个名字，
+    换个名字测的就不是同一条链路。`after()` 会用仓库里那份清单把它恢复回去；大部分策略用例走一个本地 origin 容器，
+    只有 1/6/8/9 真的出网。
 
 ---
 

@@ -607,7 +607,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 - [x] `sandbox-agent` 服务：`/health` + `/exec`(SSE) + `/files`（先在宿主机裸跑，不碰 Docker）
 - [x] 沙箱镜像：多语言运行时 + git + 非 root 用户
 - [x] `LocalDockerProvider`：加固参数 + internal 网络 + named volume（`packages/control-plane/src/provider/`，集成测试 `npm run test:integration`；macOS 上多一个端口转发容器，见 spec Phase 5 实现备注 2）
-- [ ] egress-proxy：全局常驻，静态白名单只开依赖源，**不含 github.com**
+- [x] egress-proxy：全局常驻，静态白名单只开依赖源，**不含 github.com**（`deploy/egress-proxy/` + `packages/control-plane/src/provider/egress-proxy.ts`；起停：`npm run proxy:up|down|status`，集成测试 `npm run test:integration`；从沙箱里 `curl https://github.com` 确实 403）
 - [ ] CP 侧仓库进出：clone → tar → 灌入沙箱；diff → apply → push（**凭据只在 CP**）
 - [ ] `GET /diff` + `GET /archive` + 落对象存储
 - [ ] 冒烟脚本 + 隔离红线测试（**必须在 Linux 上跑**）
