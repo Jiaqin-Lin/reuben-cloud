@@ -8,9 +8,9 @@
 
 ## 0. 一句话说清这东西是干嘛的
 
-**sandbox-agent 是一个跑在沙箱容器里的小 HTTP 服务，唯一的工作是"帮你执行命令，并把执行过程实时汇报出去"。**
+**sandbox-agent 是一个跑在沙箱容器里的小 HTTP 服务，唯一的工作是"帮你执行命令 + 读写工作区里的文件，并把过程实时汇报出去"。**
 
-它不思考、不决策、不认识模型。它的 API 就四个：
+它不思考、不决策、不认识模型。exec 那半边四条：
 
 | 你想干的事 | 调它 |
 |---|---|
@@ -18,6 +18,18 @@
 | 跑一条命令 | `POST /exec` |
 | 把这条命令的实时输出给我（长连接，不断线） | `GET /exec/{id}/events` |
 | 别跑了，停 | `POST /exec/{id}/kill` |
+
+Phase 2 又加了文件那半边三条（往沙箱里灌 tar、读回日志/patch、列目录）：
+
+| 你想干的事 | 调它 |
+|---|---|
+| 读一个文件（JSON 内联，或 `raw=1` 流式） | `GET /files?path=&offset=&limit=&encoding=&raw=1` |
+| 写一个文件（body 就是裸字节，边写边算 sha256） | `PUT /files?path=` |
+| 列一个目录 | `GET /files/list?path=&depth=` |
+
+文件 API 的细节（读多根/写单根、1 MiB 内联上限、原子 rename、symlink 不跟随）在
+`docs/sandbox-spec.md` 的 Phase 2，以及 `src/paths.ts` / `src/files/*.ts` 的头注释里。
+本文只讲 exec 那条链路——文件 API 是另一条链路，混进来会把这张图弄糊。
 
 所有请求都要带 `Authorization: Bearer <token>`——包括 `/health`。别觉得本机跑没用，容器化之后这是内网唯一的门锁。
 

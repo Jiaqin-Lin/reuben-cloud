@@ -28,7 +28,7 @@
 | 内部网络 | `reuben-cloud-internal` |
 | 出网代理容器 / 别名 | `reuben-cloud-proxy`（内网别名同名） |
 | 执行日志 | `/tmp/reuben-cloud/exec/{executionId}.log`（路径变更理由见附录 A-1） |
-| 工具结果外置 | `/tmp/reuben-cloud/out/{executionId}.txt` |
+| 工具结果外置（暂缓，见 A-14） | `/tmp/reuben-cloud/out/{executionId}.txt` |
 | 大 patch 外置 | `/tmp/reuben-cloud/diff/{executionId}.patch` |
 | 分支前缀 | `reuben-cloud/<taskId>` |
 | CP 临时目录 | `/tmp/reuben-cloud-cp/<runId>/` |
@@ -374,7 +374,7 @@ Phase 1 里 `status` 只取值 `ready`（`starting` 用不到、`error` 保留�
 
 ### 交付物
 
-`packages/sandbox-agent/src/files/{read,write,list}.ts` + 路由接线 + 扩展 `src/paths.ts`（Phase 1 已落地，不另起一份）+ `test/files.test.ts`。
+`packages/sandbox-agent/src/files/{read,write,list}.ts` + 路由接线 + 扩展 `src/paths.ts`（Phase 1 已落地，不另起一份）+ `test/files.test.ts` + `src/http.ts`（新增，理由见实现备注 10）。
 
 ### 具体如何实现
 
@@ -443,12 +443,14 @@ type ResolveResult = { ok: true; abs: string } | { ok: false; reason: "empty" | 
 - **不跟随符号链接**：`type` 直接标 `symlink`。跟随会让 list 变成一条绕过路径校验的越权通道。
 - 条目上限 1000，超出 `{truncated:true}`。
 
-#### 5. 读根扩展（为 Phase 11 的外置结果准备）
+#### 5. 读根扩展（为 Phase 11 的日志续读准备）
 
 允许一个**额外的只读根**：`SANDBOX_AGENT_READ_ROOTS=/workspace,/tmp/reuben-cloud`（加进 `config.ts` 的 `Config`）。
 
 - **读**可以在任一允许根之下；**写**永远只在 `/workspace`。
-- 理由：模型工具结果外置到 `/tmp/reuben-cloud/out/`，之后模型要用工具把它读回来（Phase 11）；而写进去的东西必须能被 diff/archive 看见，所以写只能落在 workspace。
+- 理由：exec 的日志（以及将来非文件型工具的外置结果）落在 `/tmp/reuben-cloud` 下，
+  模型要用 `read` 工具按 offset 读回来（Phase 11）；而写进去的东西必须能被 diff/archive 看见，
+  所以写只能落在 workspace。
 - 现在就把这个参数做进去，别等到 Phase 11 再改路径逻辑。
 
 ### 技术边界
@@ -482,14 +484,30 @@ type ResolveResult = { ok: true; abs: string } | { ok: false; reason: "empty" | 
 
 ### 验收标准
 
-- [ ] 上表 15 个用例全绿
-- [ ] 越界路径**全部** 400（含 symlink 与 URL 编码两类）
-- [ ] 256 MiB 上传期间 RSS 增量 < 50 MiB
-- [ ] 二进制往返 sha256 一致
-- [ ] `tsc --noEmit` 通过
+- [x] 上表 15 个用例全绿
+- [x] 越界路径**全部** 400（含 symlink 与 URL 编码两类）
+- [x] 256 MiB 上传期间 RSS 增量 < 50 MiB
+- [x] 二进制往返 sha256 一致
+- [x] `tsc --noEmit` 通过
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **`limit` 的语义要分成「没传」和「传了」两种**（正文只有一行，写码时必须二选一）：
+   - **没传 `limit`**：内联 JSON 读的上限是 `MAX_READ_BYTES`（1 MiB）；文件剩余部分超过它 → 413 `too_large`，**不静默截断**（和 `timeoutMs` 同一条规矩：调用方会误以为拿到了全文）。用例 9 的两条走的就是这条。
+   - **传了 `limit`**：只要 ≤ `MAX_READ_BYTES` 就一定是「返回这一段」，哪怕文件还有更多——否则大文件分片读永远拿不到第一片（每一片都会因为「后面还有」而被 413）。分片读是 Phase 11 `read` 工具的用法。
+2. **`raw=1` 不受 1 MiB 上限约束**：它是流式响应，没有内联 JSON 那种内存与 base64 膨胀问题。不传 `limit` =「从 `offset` 到文件末尾」。CP 读大日志、读超限 patch 走的就是这条路（Phase 3/10 依赖它）。传了 `limit` 仍然按范围切，`limit` 本身仍受 `MAX_READ_BYTES` 约束。
+3. **`GET /files/list` 的响应是对象，不是裸数组**：`{path, entries, truncated}`。裸数组没地方挂 `truncated`。`entries[].name` 在 `depth>1` 时是**相对本次请求路径**的相对路径（`depth=1` 时就是文件名）。
+4. **相对路径只有一个基准：writeRoot**。绝对路径可以落在任一读根之下，相对路径按写根解析。第二个读根必须用绝对路径访问——CP 拿到的是 `/tmp/reuben-cloud/exec/{exe_id}.log` 这种绝对路径，本来就不需要相对形式；而按「先试读根 1 再试读根 2」去猜会变成一个歧义规则。
+5. **writeRoot 永远在读集合里**：`SANDBOX_AGENT_READ_ROOTS` 缺省是 `{WORKSPACE_ROOT},{/tmp/reuben-cloud}`，且无论怎么配都会把 writeRoot 塞回读集合——不然刚 `PUT` 进去的文件 `GET` 不回来，那是荒谬的。额外读根在启动时 `mkdir -p`（它可能还不存在）。
+6. **JSON 读的 `sha256` 是「本次返回的那段字节」的哈希**，不是整个文件的；`size` 是文件总大小，`bytes` 是本次返回的字节数。`raw=1` 不算 sha256——流式路径不为了校验把文件再读一遍。
+7. **写超限时先发 413、等响应 flush 之后再 `req.destroy()`**。正文写「超了要 `req.destroy()`」，但顺序反了 413 会被 socket 销毁吃掉，CP 只能看到 connection reset、分不清原因。实现是 `res.once("finish", () => req.destroy())` 之后再发响应。临时文件在这之前就删掉。
+8. **`PUT /files` 显式拒绝 `multipart/form-data`**：不解析它是边界，但要报 400 `invalid_content_type`——否则 multipart 的边界字符串会被当成文件内容静默写进去。
+9. **`depth` 上限 8，超过 400**（`invalid_depth`），不静默钳制。
+10. **多一个文件 `src/http.ts`**：`sendJson` / `sendError` / `readJsonBody` / `isAuthorized` 从 `server.ts` 搬出来。原因：三个 `files/*` 处理器要发响应，而 `server.ts` 要 import 它们——不搬就成循环依赖。顺带把 `server.ts` 变回「只有路由和鉴权」。
+11. **中途断开用 for-await 的异常来判断，不监听已废弃的 `req.on("aborted")`**：正文提的那个事件在 Node 里已经 deprecated，而 `for await (const chunk of req)` 在客户端断开时就会抛错——同一件事，少一个监听器。判据是两个条件（请求体没读完 **且** 错误像断线），只看前者会把「磁盘满导致 pipeline 顺手掐掉源流」误判成客户端断线。见 `write.ts` 的 `isClientAbort`。
 
 **完成标记：**
-- [ ] **Phase 2 完成** — 文件 API 可用且越界全部被拒
+- [x] **Phase 2 完成** — 文件 API 可用且越界全部被拒
 
 ---
 
@@ -1382,7 +1400,7 @@ git -c http.extraHeader="..." push origin HEAD:refs/heads/reuben-cloud/<taskId>
 
 ### 交付物
 
-`packages/control-plane/src/agent/{loop.ts,prompt.ts,transcript.ts,model.ts}` + `src/agent/tools/{bash,read,write,list}.ts`。
+`packages/control-plane/src/agent/{loop.ts,prompt.ts,transcript.ts,model.ts}` + `src/agent/tools/{bash,read,write,list,truncate}.ts`。
 
 ### 具体如何实现
 
@@ -1423,14 +1441,99 @@ Anthropic 实现要点：
 
 | 工具 | 对应沙箱 API | 参数 |
 |---|---|---|
-| `bash` | `POST /exec` | `{cmd: string[], cwd?, timeoutMs?}` —— schema 里明确写"cmd 是 argv 数组，不是 shell 字符串；需要管道时显式用 `["bash","-lc","..."]`" |
-| `read` | `GET /files` | `{path, offset?, limit?}` |
-| `write` | `PUT /files` | `{path, content}` |
-| `list` | `GET /files/list` | `{path, depth?}` |
+| `bash` | `POST /exec` | `{cmd: string[], cwd?, timeoutMs?}` —— schema 里明确写"cmd 是 argv 数组，不是 shell 字符串；需要管道时显式用 `["bash","-lc","..."]`"。输出按 **tail** 截断（见 §3.5） |
+| `read` | `GET /files` | `{path, offset?, limit?}` —— **offset 是行号（1 起），limit 是行数**，都不是字节。硬上限 2000 行 / 50 KiB（见 §3.5） |
+| `write` | `PUT /files` | `{path, content}` —— 不设行/字节上限（模型单次输出本来就有限），沙箱的 512 MiB 是垫底 |
+| `list` | `GET /files/list` | `{path, depth?}` —— 沙箱侧 1000 条上限之外，再套同一套 2000 行 / 50 KiB 截断 |
+
+**所有四个工具的 `path` 都先按 `REPO_DIR`（`/workspace/repo`）解成绝对路径再发给沙箱**。
+为什么不能把相对路径直接下去：沙箱的 `RootResolver` 以 **workspace 根**（`/workspace`）为相对基准，
+而模型心里的 cwd 是 `/workspace/repo`——`read("src/a.ts")` 会静默变成 `/workspace/src/a.ts`。
+这一行在工具层统一做（`path.resolve(REPO_DIR, input)`），四个工具共用一个小 helper。
+
+`read` 的 schema description 直接把上限和续读办法写进去（模型看不到本文，只看到这段话）：
+
+```ts
+description:
+  "Read a text file. Output is truncated to 2000 lines or 50KB, whichever comes first. " +
+  "Use offset (1-indexed line number) and limit (max lines) for large files; " +
+  "continue with the offset printed in the truncation notice until the file is complete."
+```
 
 参数校验**自己写**一小段（30 行）：必填项、类型、`cmd` 必须是非空字符串数组。校验失败不要抛异常，返回 `is_error: true` 的 `tool_result` 并把原因说清楚——让模型自己改。
 
-工具的返回值就是 `tool_result` 的字符串内容。
+工具的返回值就是 `tool_result` 的字符串内容。但"字符串内容"有一条硬预算法则在管，见下一节。
+
+#### 3.5 工具输出的截断规则（`tools/truncate.ts`）
+
+这一节的做法抄自 **pi**（同一个作者、同一类问题，参考实现：pi 仓库的
+`packages/coding-agent/src/core/tools/truncate.ts`）。核心是**两条独立上限，先到先算**：
+
+| 上限 | 值 | 防的是什么 |
+|---|---|---|
+| 行数 | `MAX_TOOL_LINES = 2000` | 模型单次能看到的最大行数 |
+| 字节 | `MAX_TOOL_BYTES = 50 KiB` | "一行 1 MB"（压缩过的 JS、minified 日志、base64） |
+
+**任何 tool_result 都不会超过这两条线**，包括模型自己传了 `offset` / `limit` 的情况：
+`offset` 只改起点，`limit` 只能往小了调——**截断发生在行数上，offset 不是解锁开关**。
+这条规矩在 `truncateHead()` / `truncateTail()` 里各写一次，四个工具都调它，不允许各写一份。
+
+三个必须遵守的性质：
+
+- **不返回半行**。切就切在换行符上（唯一的例外是 bash tail 时"最后一行本身超 50 KiB"，
+  那时从行尾往左取够字节，并在提示里说明 `lastLinePartial`）。
+- **截断时一定给可执行的下一步**。不是干申一句"内容太长"，而是把下一刀的 offset 或日志路径写进结果。
+  这是 pi 里最值得抄的一个细节：模型看到 `Use offset=2001 to continue` 就会自己续读，看到"内容被截断"只会反复重试。
+- **提示文字本身不计入 50 KiB 预算**。它只有一行，而且必须让模型看见，算进去只会多一个边界 bug。
+
+三种切法：
+
+| 工具 | 切法 | 为什么 | 截断提示的形态 |
+|---|---|---|---|
+| `read` | `truncateHead`（保开头） | 模型要的就是从指定行往后的内容 | `\n\n[Showing lines 1-2000. Use offset=2001 to continue.]` |
+| `bash` | `truncateTail`（保结尾） | 报错和最终结果在结尾，前面通常是噪音 | `\n\n[Showing lines 9801-11800 of 11800. Full output: {log_path}]` |
+| `list` | `truncateHead` + 沙箱自己的 `truncated` 标记 | 条目本来就有 1000 条上限 | `[truncated: showing first 1000 entries]` |
+
+`read` 的四种收尾形态（对应四条分支，测试要点 12–16 逐条验）：
+
+1. **行数先到**：`[Showing lines 1-2000. Use offset=2001 to continue.]`
+2. **字节先到**：`[Showing lines 1-742 (50KB limit). Use offset=743 to continue.]`
+   （50 KiB 装不下 2000 行时先生效；源码平均 ~40 字节/行，所以写代码时这个分支才是常态）
+3. **模型自己传的 `limit` 先到、后面还有**：`[120 more lines in file. Use offset=321 to continue.]`
+4. **第一行本身就超 50 KiB**：不返回半行，返回一句可执行的提示：
+   `[Line 8712 is 1.2MB, exceeds 50KB limit. Use bash: sed -n '8712p' {path} | head -c 51200]`
+   （pi 就是这么干的；`bash` 工具本来就在，不需要为这个分支发明新机制）
+
+**总行数（`of 11800`）只在"这次已经读到文件尾"时才写**。大文件不为了报一个总数去把整个文件扫一遍。
+
+**行号契约**（定死，写进 schema description 和 system prompt）：
+
+- `offset` = **行号，从 1 开始**；`limit` = 行数。两者都**不是字节**。
+- 一行的定义：按 `\n` 分隔；`\r\n` 里的 `\r` 不算新的一行（提示里行号仍按 `\n` 数）；
+  文件末尾没有换行符也照算最后一行——`"a\nb"` 是 2 行，`"a\nb\n"` 也是 2 行。
+- `offset` 超过总行数 → `is_error:true`，消息带总行数：`Offset 9000 is beyond end of file (8431 lines total)`。
+- 提示里的 `offset=` 永远是"下一行"（1-indexed），模型可以原样回传。
+
+**这一层在 CP，不在沙箱。** 沙箱的 `GET /files` 保持字节语义不变（它还要服务 `raw=1` 的 patch/tar/二进制）；
+"行"只对模型有意义，所以 "字节 ↔ 行" 的翻译只发生在工具层。做法：
+
+1. 文件 ≤ 1 MiB（沙箱内联上限）时一次拿全文（普通 JSON 读），本地切——覆盖绝大多数源码文件。
+2. 大文件按 **`raw=1` 的字节窗口**分段取（一个窗口 1 MiB）：
+   - 为什么不走默认的 JSON 读：沙箱的 `utf8` 读是**严格校验**的，而字节窗口会随机切在多字节字符中间
+     → 直接 400 `invalid_utf8`。`raw=1` 不校验编码，正好配上流式解码：
+     CP 侧用 `new TextDecoder("utf-8", {stream: true})` 增量解码，跨窗口的半个字符由它兜住
+     （和 Phase 1 输出合并器一模一样的套路）。窗口边界上的半行同理留到下一个窗口。
+   - 从**上一次同文件续读的锚点**（`{path, size, mtimeMs, lineNumber, byteOffset}`，
+     一个 Run 一份、LRU 8 个文件）直接跳到对应字节。没命中就从 0 开始扫。
+     没有这个锚点的话，"分片读完一个 10 MB 文件"会变成 O(n²) 的重复扫描（读第 5 片要把前 4 片再扫一遍）。
+3. 每个窗口在本地按行数 + 字节预算切，够了就停，不再往下取。"后面还有没有内容"用
+   "字节游标 < 文件大小"判断（`size` 第一次读的响应里就有）——不需要把文件读完才知道要不要给 `offset=` 提示。
+4. 记下本次结果第一行的 `(lineNumber, byteOffset)` 作为新锚点，供下一轮 `offset=` 命中。
+
+**`bash` 的全文去哪儿**：不新文件，就是沙箱自己的 exec 日志 `{log_path}`（`/tmp/reuben-cloud/exec/{exe_xxx}.log`）。
+前提：`SANDBOX_LOG_ROOT` 必须在 `SANDBOX_AGENT_READ_ROOTS` 之下（默认配置满足；
+如果以后有人把日志目录改到别处，要么同步改读根，要么在启动时把 logRoot 自动加进去）。
+只读第二根存在的理由就是这个——见 §5。
 
 #### 4. 循环（`loop.ts`）
 
@@ -1454,14 +1557,31 @@ for turn in 1..MAX_TURNS(40):
 - 失败的工具有返回：`{type:"tool_result", tool_use_id, content:"<错误>", is_error:true}`。**不要丢掉它**。
 - **循环硬上限**：40 轮（`MAX_TURNS`）、总墙钟 30 分钟、累计输出 token 上限。三个都要有，到任何一个就停，并在 Run 结果里如实写"因达到上限而停止"。
 - **重复调用检测**：同一工具 + 同样参数连续出现 3 次 → 往对话里插一条提示（"你已经用相同参数调用过这个工具三次，换一个方法或者说明你卡在哪"），再犯就停。
-- 上下文的 MVP 策略：**工具结果外置 + 简单的旧结果裁剪**。完整版 ContextCompiler 是 M2 的事，现在不做。裁剪只丢最旧的 `tool_result` 内容，**不丢 user/assistant 的文字**。
+- 上下文的 MVP 策略：**工具结果按 §3.5 硬截断 + 简单的旧结果裁剪**。完整版 ContextCompiler 是 M2 的事，现在不做。裁剪只丢最旧的 `tool_result` 内容，**不丢 user/assistant 的文字**。
 
-#### 5. 工具结果外置
+#### 5. 大结果怎么办：截断 + 去日志里续读（**与原文的有意偏差**，理由见附录 A-14）
 
-- 阈值：单次工具结果的文本超过 **8 KiB**（或 200 行）→ 全文写到沙箱的 `/tmp/reuben-cloud/out/<executionId>.txt`，`tool_result` 里只放：前 50 行 + 总数 + 文件路径 + 一句"用 read 工具读完整内容"。
-- 为什么要写进沙箱而不是留在 CP 内存：模型下一轮要用 `read` 工具**按范围**读回来。留在 CP 里就没有"按范围读"这个动作了，模型只能让你把整段塞回去。
-- 这就用上了 Phase 2 的**只读第二根** `/tmp/reuben-cloud`。写仍然只在 `/workspace`。
-- 上限：单个外置文件 ≤ 32 MiB，总数 ≤ 64 个；超了就直接给更狠的摘要（这是防 `/tmp` 被塞满的兜底，不是主要机制）。
+原文的机制是"结果超过 8 KiB 或 200 行 → 复制到 `/tmp/reuben-cloud/out/<executionId>.txt`，内联前 50 行"。
+现在改成 pi 的两条线（§3.5）：**每条 tool_result 硬上限 2000 行 / 50 KiB，多出来的部分根本不进上下文；
+`bash` 的全文去向是沙箱自己的 exec 日志 `{log_path}`，写在提示里**。理由：
+
+- **两个阈值会打架**：8 KiB 的外置阈值比 50 KiB 的硬上限小一个数量级，于是一条 199 行的 `read`
+  结果动不动就被外置成"前 50 行 + 请再读一次"，模型被白白多绕一圈。硬上限已经保证了单条结果
+  不会失控，外置阈值就不再提供额外保护。
+- **全文副本没必要**：`POST /exec` 已经在沙箱里把 stdout+stderr 完整落盘（Phase 1 的 `logfile.ts`），
+  而且那个路径正好在只读第二根之下。pi 需要自己写临时文件，是因为它的 bash 工具只有内存累加器；
+  我们有一个更好的持久化来源。
+- **少一套生命周期**：外置文件的 32 MiB / 64 个上限、清理、命名，全都不用写了。
+
+保留的部分：
+
+- **旧结果裁剪照旧**：只丢最旧的 `tool_result` 内容，不丢 user/assistant 文字。
+  现在每条都有 2000 行 / 50 KiB 的硬上限，裁剪收益可以按条数估。
+- **`/tmp/reuben-cloud/out/` 暂缓实现**，但命名和只读根都留着（附录 A-10）：
+  将来有非文件型工具（MCP、外部 API 返回值）再回来加"外置 + 前 N 行预览"。
+  现在 4 个工具全都能用 `offset` 续读，不需要它。
+- **`bash` 的 stdout/stderr 不分开**：日志文件本来就是交错的，和终端里看到的一致（Phase 1 定下来的）。
+  模型看到的 tail 也是交错的。真要分清就自己写 `cmd 2>/tmp/err.log`——那是模型的自由。
 
 #### 6. System prompt（`prompt.ts`）
 
@@ -1473,6 +1593,8 @@ MVP 版本要讲清楚的事：
 - 没有 `github.com`：不要试图 `git clone` / `curl` GitHub。
 - 改完之后**跑测试**再收工。
 - 输出要节制：不要 `cat` 整个大文件（用 `read` 的 offset/limit）；不要 `ls -R` 整个仓库。
+- **工具结果会被截断**：单次最多 2000 行或 50 KB。看到 `Use offset=N to continue` 就接着读，
+  看到 `Full output: <path>` 就用 `read` 去读那个文件——不要重复跑同一条命令。
 
 刻意保持短。提示词是要迭代的东西，第一版写长了反而不好改。
 
@@ -1497,6 +1619,7 @@ MVP 版本要讲清楚的事：
 - 不做多 provider 路由（接口留着，实现一家）。
 - 不做流式 token 到 UI（Phase 13 才做；`onText` 回调预留接口）。
 - 循环必须有硬上限（轮数 / 墙钟 / token）。
+- 工具输出必须有硬上限（2000 行 / 50 KiB，见 §3.5）。这个上限在**工具层**实施，沙箱的 `/files` 不感知"行"。
 - 模型 API key **只在 CP**，从不进沙箱（这是 §F.3 的红线之一）。
 
 ### 测试要点
@@ -1507,20 +1630,26 @@ MVP 版本要讲清楚的事：
 | 2 | 并行工具 | 一条响应里两个 `tool_use` → 两个 `tool_result` 在**同一条** user 消息里 |
 | 3 | 工具参数校验 | `cmd` 是字符串不是数组 → `is_error:true`，不抛异常 |
 | 4 | 工具失败 | `read` 越界 → `is_error:true`，循环继续 |
-| 5 | 结果外置 | 200 KB 的 bash 输出 → 上下文里只有摘要 + 路径；`read` 能按 offset 读回原文 |
+| 5 | bash 输出截断 | 输出 3000 行 → tool_result 只有最后 2000 行 + `Full output: {log_path}`；`read` 能按 offset 从日志里读回开头 |
 | 6 | 轮数上限 | 永远调用工具的 stub → 40 轮后停止，Run 结果如实说明 |
 | 7 | 重复检测 | 连续 3 次相同调用 → 注入提示；再犯 → 停止 |
 | 8 | 真实模型 smoke（`@live`，默认跳过） | 预置一个失败的测试，真跑一遍产出 patch |
 | 9 | transcript 完整性 | JSONL 里含 system、tools、每轮的 usage |
 | 10 | 缓存命中 | 多轮之后 `cache_read_input_tokens > 0` |
 | 11 | key 不进沙箱 | 容器内全盘搜索无模型 API key |
+| 12 | **read 行数硬上限** | 5000 行的文件 → 恰好返回 2000 行 + `Use offset=2001 to continue` |
+| 13 | **带 offset 也照样截断** | `read{offset:1000}` 一个 10000 行的文件 → 返回的是 1000–2999 行（不多一行），提示 `offset=3000` |
+| 14 | **字节先到** | 每行 100 字节 × 2000 行 → 返回 ≤ 50 KiB，提示里的 `offset` 与实际返回行数自洽 |
+| 15 | **第一行超 50 KiB** | 单行 100 KB 的文件 → 返回 `sed -n 'Np' ... | head -c 51200` 的提示，不是半行、不是空内容 |
+| 16 | **行号契约 + 续读不重不漏** | `"a\nb"` / `"a\nb\n"` 都算 2 行；CRLF 不算两行；offset 越界 → is_error + 总行数；5000 行文件分 3 次续读拼起来与源文件逐行相等 |
 
 ### 验收标准
 
-- [ ] 上表 11 项全绿（`@live` 那项在本地手工跑过一次）
+- [ ] 上表 16 项全绿（`@live` 那项在本地手工跑过一次）
 - [ ] §K 第 9 步：给一个真实 issue，跑完产出一个 patch
 - [ ] transcript 能在不重跑的情况下还原出每一轮的输入输出
 - [ ] `cache_read_input_tokens` 在多轮时确实非 0
+- [ ] 单条 `tool_result` 永远 ≤ 2000 行 / 50 KiB（含模型自带 offset/limit 的情况）
 
 **完成标记：**
 - [ ] **Phase 11 完成** — Agent 循环能针对真实 issue 产出 patch
@@ -1664,10 +1793,11 @@ PR 正文要有的东西（这是 README 说的"可信度报告"的雏形）：
 | A-7 | §G 三张表 | 增加 `sandbox_state_transitions` | §D 要求"每次转换写审计日志，这是崩溃恢复的唯一依据"——审计日志需要一个落点 |
 | A-8 | `artifacts.kind` ∈ {diff, workspace_archive} | 增加 `exec_log` | §G.2 要求"重要输出在销毁前转存"，被截断的执行日志需要一个 kind |
 | A-9 | — | 单次执行日志上限 256 MiB | tmpfs 页面计入 cgroup 内存。不设上限时，一个 `yes` 就能把容器自己 OOM 掉 |
-| A-10 | — | 文件 API 支持只读第二根 `/tmp/reuben-cloud` | 工具结果外置到那里，模型要用 `read` 读回来；而外置文件不能写进 `/workspace`（会污染 diff 和归档） |
+| A-10 | — | 文件 API 支持只读第二根 `/tmp/reuben-cloud` | exec 日志与（将来的）工具结果外置都在那里，模型要用 `read` 按 offset 读回来；而它们不能写进 `/workspace`（会污染 diff 和归档） |
 | A-11 | 出网日志"先只写日志文件" | stdout + Docker json-file 轮转 | 自己写轮转是新的 bug 来源；Docker 已经给了一份带时间戳的持久日志 |
 | A-12 | 分支 `nightshift/<task>` | `reuben-cloud/<taskId>`，重跑用 `--force-with-lease` 覆盖 | 用户看到的分支应稳定对应一个 Task；保护机制见 Phase 12 |
 | A-13 | — | PR 默认 draft | 明确表示"待人工确认"，也不会自动触发评审请求 |
+| A-14 | 工具结果 > 8 KiB / 200 行 → 外置到 `/tmp/reuben-cloud/out/` | 改成 pi 式截断：单条 tool_result 硬上限 2000 行 / 50 KiB（read 保头、bash 保尾），bash 全文用沙箱自己的 `log_path` 续读 | 外置阈值与硬上限会打架（199 行的 read 结果会被无谓外置成"前 50 行"），且 bash 全文已经在 exec 日志里，不需要副本。参考 pi 的 `truncate.ts`；`out/` 留给将来的非文件型工具 |
 
 ## B. 风险登记
 
