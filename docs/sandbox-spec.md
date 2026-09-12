@@ -94,7 +94,7 @@ reuben-cloud/
 ├─ packages/e2e/                # Phase 7 冒烟脚本
 ├─ images/sandbox/Dockerfile
 ├─ deploy/egress-proxy/{Dockerfile,allowlist.txt,src/proxy.ts}
-├─ scripts/{migrate.ts,dev-db.sh}
+├─ scripts/{sandbox-image-check.ts,migrate.ts,dev-db.sh}
 └─ docs/
 ```
 
@@ -244,7 +244,7 @@ const child = spawn(cmd[0], cmd.slice(1), {
 - `detached: true` 是 Node 里拿到进程组 id 的正规做法，不用调 `setsid` 二进制。之后 `process.kill(-child.pid, sig)` 一次带走整棵树。
   注意：**不要 unref**，我们还需要 `exit` 事件。
 - `stdio[0] = "ignore"`：**没有交互式输入通道**。需要交互的程序会立刻读到 EOF 而失败——这是设计边界，不是 bug。工具层要在提示词里告诉模型这一点（Phase 11）。
-- `baseEnv()` 返回一个**固定的最小集合**（`PATH`、`HOME`、`LANG`、`TERM`）叠加请求里的 `env`，而不是继承 agent 自己的整个 `process.env`。理由不是防泄密（容器里本来没秘密），是**确定性**——测试里环境变量不随宿主漂移。
+- `baseEnv()` 返回一个**固定的最小集合**（`PATH`、`HOME`、`LANG`、`TERM`、`PYTHONUNBUFFERED`）叠加请求里的 `env`，而不是继承 agent 自己的整个 `process.env`。理由不是防泄密（容器里本来没秘密），是**确定性**——测试里环境变量不随宿主漂移。（`PYTHONUNBUFFERED` 是 Phase 4 补进来的：镜像里那行 `ENV` 到不了子进程，而没有它 python 会整块缓冲，见 Phase 4 实现备注 3。）
 - `child.on("error")` → `failed` 事件（ENOENT 走这条路，`spawn` 本身不抛）。
 - `child.on("exit", (code, signal))` → 终态事件。
 
@@ -649,7 +649,7 @@ tar czf - -C /workspace .
 
 ### 交付物
 
-`images/sandbox/Dockerfile`、仓库根 `.dockerignore`。
+`images/sandbox/Dockerfile`、仓库根 `.dockerignore`、`scripts/sandbox-image-check.ts`（新增，理由见实现备注 1）。
 
 ### 具体如何实现
 
@@ -672,8 +672,8 @@ ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 \
 
 # 可写点必须显式存在且在镜像里就有正确属主：
 #   /workspace 由命名卷覆盖，Docker 用镜像里该目录的属主初始化新卷 → 必须 chown 成 1000
-RUN useradd -u 1000 -m -s /bin/bash agent \
- && mkdir -p /workspace /app /tmp/reuben-cloud \
+#   （base 镜像自带 uid/gid 1000 的用户 node，不再 useradd —— 会 UID 冲突，见实现备注 2）
+RUN mkdir -p /workspace /app /tmp/reuben-cloud \
  && chown -R 1000:1000 /workspace /app /tmp/reuben-cloud
 
 WORKDIR /app
@@ -729,14 +729,24 @@ CMD ["node", "src/index.ts"]
 
 ### 验收标准
 
-- [ ] 镜像能起，`/health` 带 token 通过
-- [ ] `id -u` = 1000
-- [ ] 无 token 拒绝启动
-- [ ] `python3` 中文输出即时可见
-- [ ] 命名卷初始化后 `/workspace` 属主是 1000（在 Phase 5 一起验）
+- [x] 镜像能起，`/health` 带 token 通过
+- [x] `id -u` = 1000
+- [x] 无 token 拒绝启动
+- [x] `python3` 中文输出即时可见
+- [x] 命名卷初始化后 `/workspace` 属主是 1000（在 Phase 5 一起验）
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **多一个文件 `scripts/sandbox-image-check.ts`**（跑法 `npm run check:image`）：本文只有「测试要点」那张表，没有一个能跑它的落点。它不能塞进 `npm test`——§0.5 硬要求那条命令永远不需要 Docker；Phase 7 的 `npm run smoke` 又需要完整栈（CP + Postgres + 代理），在 Phase 4 还替不了它。脚本按表逐条检查（8 条），并**镜像了 Phase 5 的加固参数**（`--read-only` / `--cap-drop ALL` / `--tmpfs /tmp` / `--user 1000:1000` / `--init`）：不套那组约束，「/ 不可写」在非 root 下会白送通过，检查就成了自欺。顺带三个开关/表外断言：`--keep`（失败时留下容器和卷，进去看比翻日志快）、`--skip-build`（CI 复用已构建的镜像）、以及三条更早暴露问题的断言——镜像 `Config.Env` 里没有 `SANDBOX_AGENT_TOKEN`（静态）、容器 `Config.User` 与运行时 `id -u` 都是 1000、命名卷初始化后 `/workspace` 属主 1000（验收里写的是「Phase 5 一起验」，现在验更便宜）。
+2. **没有 `useradd -u 1000`**：`node:24-bookworm-slim` 自带 uid/gid 1000（用户 `node`），照抄正文会以 `UID 1000 is not unique` 直接构建失败。契约是 uid/gid（provider 传的是 `--user 1000:1000`），用户名叫什么无所谓；复用现成用户还顺带保住了 `/etc/passwd` 里有对应条目（`os.userInfo()` 之类不会炸）。
+3. **`PYTHONUNBUFFERED` 必须写进 `buildEnv()` 的固定集合**：镜像里那行 `ENV PYTHONUNBUFFERED=1` 到不了 exec 的子进程——子进程环境是 `spawn.ts` 的固定最小集合 + 请求里的 env，agent 自己的环境不在其中。所以用例 4 第一次跑就是红的：python 整块缓冲，输出和终态同一时刻到达（实测差值 0ms）。修法是在固定集合里加一个**常量**（不是把 agent 的 env 透传进来，确定性不变）；修完实测「中文在终态前 508ms 到达」。Phase 1 §5 的那句话已同步。
+4. **检查脚本的缓存断言用 `exporting config` 的 digest，不用 `docker image inspect .Id`**：containerd 镜像存储下 `.Id` 是 **manifest list** 的 digest，而 BuildKit 每次构建都会重写带时间戳的 attestation manifest——它**必然**每次都变（实测：两次全缓存构建的 `.Id` 不同，而 config digest 相同）。config digest 覆盖的才是镜像内容，用例 7 用这个断言。
+5. **`.dockerignore` 在正文四条之外多了 `packages/*/test` 与 `.claude`**：前者不进镜像（镜像里只有 `src`），排掉它让「镜像里到底有什么」一眼可见；后者是本地 agent 配置，属于宿主环境。实测整个构建上下文 197 KiB（没有这两条时上下文主要是 `node_modules`）。
+6. **采纳了正文第 12 条那个可选的 `HEALTHCHECK`**：它只让 `docker ps` 能看出状态（provider 自己轮询 `/health`，不依赖它）。它读的是运行时注入的 token，不给镜像引入任何默认值。
+7. **基础镜像用 tag 不锁 digest**：本地「改一行 → 重建 → 跑」的循环要便宜。digest 强制在 Phase 5 的 provider 侧（`SandboxSpec.image` 必须含 `@sha256:`），CI 构建后记录产物 digest（正文「构建命令」）。
 
 **完成标记：**
-- [ ] **Phase 4 完成** — 沙箱镜像可用且非 root
+- [x] **Phase 4 完成** — 沙箱镜像可用且非 root（11/11 检查通过）
 
 ---
 

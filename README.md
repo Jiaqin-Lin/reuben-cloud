@@ -604,8 +604,8 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 
 **沙箱侧**（详细开发顺序见 `docs/sandbox.md` §K）：
 
-- [ ] `sandbox-agent` 服务：`/health` + `/exec`(SSE) + `/files`（先在宿主机裸跑，不碰 Docker）
-- [ ] 沙箱镜像：多语言运行时 + git + 非 root 用户
+- [x] `sandbox-agent` 服务：`/health` + `/exec`(SSE) + `/files`（先在宿主机裸跑，不碰 Docker）
+- [x] 沙箱镜像：多语言运行时 + git + 非 root 用户
 - [ ] `LocalDockerProvider`：加固参数 + internal 网络 + named volume
 - [ ] egress-proxy：全局常驻，静态白名单只开依赖源，**不含 github.com**
 - [ ] CP 侧仓库进出：clone → tar → 灌入沙箱；diff → apply → push（**凭据只在 CP**）

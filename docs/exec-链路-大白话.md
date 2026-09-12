@@ -488,7 +488,7 @@ index.ts · shutdown(signal)
 `detached` 在这里只有一个目的：**让子进程成为进程组组长**，这样 `process.kill(-pid, sig)` 能一次带走整棵树。它不意味着"结束时要杀掉子进程"。正常结束时（`completed`）后台进程继续活着——这是设计（集成测试要起数据库、要起 dev server），清理交给沙箱销毁。
 
 **Q8：为什么 agent 不继承自己的 `process.env` 给子进程？**
-两个理由：**确定性**（测试行为不随宿主机漂移）和**避免泄漏**（`SANDBOX_AGENT_TOKEN` 不可能从环境漏进被执行的命令）。所以 `buildEnv()` 给的是一个固定最小集合（PATH/HOME/LANG/TERM）+ 请求里显式传的 env。
+两个理由：**确定性**（测试行为不随宿主机漂移）和**避免泄漏**（`SANDBOX_AGENT_TOKEN` 不可能从环境漏进被执行的命令）。所以 `buildEnv()` 给的是一个固定最小集合（PATH/HOME/LANG/TERM/PYTHONUNBUFFERED）+ 请求里显式传的 env。`PYTHONUNBUFFERED` 是 Phase 4 补进来的常量：镜像里那句 `ENV` 到不了子进程，而没有它 python 会整块缓冲（跑完才一次性出结果）。
 
 **Q9：为什么事件 id 从 1 开始？为什么 `replay_gap` 那条没有 id？**
 id 从 1 开始、单调递增、永不回退（即使缓冲淘汰了它）。重放时客户端说"我收到 42 了"，服务端就发 43 之后的。`replay_gap` 不是缓冲里的真实事件，它只是一条通知——给它编个 id 会破坏"id 单调且连续"这个前提，所以它故意没有 id。
