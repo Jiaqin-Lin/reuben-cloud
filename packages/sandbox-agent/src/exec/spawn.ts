@@ -468,6 +468,12 @@ function terminalData(record: ExecutionRecord, status: TerminalStatus): Terminal
  * 写进固定集合是唯一既保住确定性（常量，不随宿主漂移）又让镜像那句承诺生效的位置。
  * 注意它不是“把 agent 的环境透传进来”：这里只是恰好取了同一个值。
  *
+ * 【为什么还有 config.proxyEnv】Phase 5 写集成测试时发现的缺口：provider 在容器 env 里
+ * 注入 `HTTP_PROXY`，而子进程环境是这份固定集合——代理地址到不了被执行的命令。
+ * 在 internal 网络里没有代理就等于没有网络，所以 `npm install` 会 100% 失败。
+ * 修法是把它加进这里（值来自 Config，仍然是启动时读一次的快照，确定性不变）：
+ * 位置在固定集合之后、`requestEnv` 之前，因为代理是部署参数、请求里的 env 永远最大。
+ *
  * @param requestEnv 请求里带的额外变量，**可以覆盖**下面的固定值。
  *                     这不是漏洞：能传 env 的调用方本来就有执行权。
  */
@@ -478,6 +484,7 @@ export function buildEnv(requestEnv: Record<string, string>, config: Config): Re
     LANG: config.lang,
     TERM: config.term,
     PYTHONUNBUFFERED: "1",
+    ...config.proxyEnv,
     ...requestEnv,
   };
 }

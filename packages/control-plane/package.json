@@ -1,0 +1,10 @@
+{
+  "name": "@reuben-cloud/control-plane",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-timeout=60000 test/unit/*.test.ts",
+    "test:integration": "node --test --test-timeout=300000 test/integration/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  }
+}

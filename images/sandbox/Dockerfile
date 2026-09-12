@@ -77,6 +77,10 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 # exec 形式（不是 shell 形式）：node 直接吃 .ts，靠的是 tsconfig 的 erasableSyntaxOnly
 # 约束——没有构建步骤，`node src/index.ts` 就是全部。
+# **路径必须写绝对路径（/app/src/…）**：Phase 5 的 provider 会把容器的 WorkingDir 覆盖成
+# /workspace（spec 里就是这么写的，因为那是工作区的挂载点），而相对路径是按 WorkingDir
+# 解析的——`node src/index.ts` 会去找 `/workspace/src/index.ts` 然后 MODULE_NOT_FOUND。
+# 镜像的启动命令本来也不应该依赖当前目录。
 # **故意不设 SANDBOX_AGENT_TOKEN**：缺了就启动失败。镜像里给个默认 token 等于所有沙箱
 # 共用一个公开凭据，那是整个方案最严重的一类错误。
-CMD ["node", "src/index.ts"]
+CMD ["node", "/app/src/index.ts"]

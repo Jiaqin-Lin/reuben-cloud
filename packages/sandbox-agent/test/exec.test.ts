@@ -210,6 +210,31 @@ test("extra: 子进程环境里没有 agent token，也不继承宿主 env", asy
   }
 });
 
+test("extra: 代理变量（部署时由 provider 注入）会透传到子进程，请求里的 env 优先", async () => {
+  // Phase 5 写集成测试时发现的缺口：provider 在容器 env 里写 HTTP_PROXY，
+  // 而子进程环境是一份固定集合——不显式透传的话，internal 网络里 npm install 必定失败。
+  const proxyAgent = await startTestAgent({
+    env: { HTTP_PROXY: "http://reuben-cloud-proxy:3128", https_proxy: "http://reuben-cloud-proxy:3128" },
+  });
+  try {
+    const result = await runExec(proxyAgent, {
+      cmd: ["bash", "-lc", "printf '%s\\n' \"$HTTP_PROXY\"; printf '%s\\n' \"$https_proxy\""],
+    });
+    assert.equal(result.stdout, "http://reuben-cloud-proxy:3128\nhttp://reuben-cloud-proxy:3128\n");
+    // 透传代理不等于把整个 env 泄进来：token 依然不在子进程里。
+    const envDump = await runExec(proxyAgent, { cmd: ["bash", "-lc", "env"] });
+    assert.ok(!envDump.stdout.includes("SANDBOX_AGENT_TOKEN"));
+    // 请求里的同名变量覆盖部署值（工具层要能临时改代理）。
+    const overridden = await runExec(proxyAgent, {
+      cmd: ["bash", "-lc", "printf '%s\\n' \"$HTTP_PROXY\""],
+      env: { HTTP_PROXY: "http://other-proxy:1" },
+    });
+    assert.equal(overridden.stdout, "http://other-proxy:1\n");
+  } finally {
+    await proxyAgent.close();
+  }
+});
+
 test("extra: cwd 在 root 之内但不存在的路径 → failed 事件而不是 400", async () => {
   const result = await runExec(agent, { cmd: ["true"], cwd: path.join(agent.root, "nope") });
   assert.equal(result.terminal.event, "failed");

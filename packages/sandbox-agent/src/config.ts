@@ -126,6 +126,27 @@ export const DEFAULT_EXIT_DRAIN_MS = 250;
 
 /** 固定最小 PATH：裸跑与容器里都够用（/usr/local/bin 有 node，/usr/bin 有 python3/git）。 */
 export const DEFAULT_BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/**
+ * 会被透传给子进程的代理变量名。**只放这六个，不放别的**。
+ *
+ * 为什么需要这份名单：exec 的子进程环境是一份固定的最小集合（见 spawn.ts 的 buildEnv），
+ * 它**不继承** agent 自己的 process.env——这是为了确定性。但代理地址是**部署时注入**的
+ * （Phase 5 的 provider 往容器 env 里写 `HTTP_PROXY=http://reuben-cloud-proxy:3128`），
+ * 如果它到不了子进程，`npm install` 就不会走代理，而在 internal 网络里没有代理就等于联网失败。
+ * 换句话说：这一份透传是 Phase 6 能工作的前提，不是可选优化。
+ *
+ * 不变的是确定性：值仍然来自 Config（启动时从 env 读一次），spawn.ts 依旧不读 process.env。
+ */
+export const PROXY_ENV_KEYS = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+] as const;
+
 /** 子进程的 HOME。注意它和 request 里的 env 合并时，request 里的同名 key 会覆盖它。 */
 export const DEFAULT_HOME = "/tmp/agent";
 /** C.UTF-8 而不是 zh_CN.UTF-8：容器里没有 locale 数据，能被所有程序接受的通用值只有这个。 */
@@ -179,6 +200,11 @@ export interface Config {
   lang: string;
   /** 子进程的 TERM。 */
   term: string;
+  /**
+   * 要透传给子进程的代理变量（只含 PROXY_ENV_KEYS 里的那几个，值来自启动环境）。
+   * 单独一个字段而不是把整个 env 透传下去：代理是**部署参数**，而已知的部署参数只有它一个。
+   */
+  proxyEnv: Record<string, string>;
   /** 单个日志文件的上限。到顶就停写（但仍继续跑命令），见 logfile.ts。 */
   maxLogBytes: number;
   /** 事件环形缓冲的条数上限。 */
@@ -243,6 +269,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     basePath: env.SANDBOX_AGENT_BASE_PATH ?? DEFAULT_BASE_PATH,
     lang: env.SANDBOX_AGENT_LANG ?? DEFAULT_LANG,
     term: env.SANDBOX_AGENT_TERM ?? DEFAULT_TERM,
+    proxyEnv: pickProxyEnv(env),
     maxLogBytes: intEnv(env, "SANDBOX_AGENT_MAX_LOG_BYTES", DEFAULT_MAX_LOG_BYTES),
     eventBufferMaxEvents: intEnv(
       env,
@@ -276,6 +303,19 @@ function parseReadRoots(raw: string | undefined, alwaysInclude: string[]): strin
   const extra = parts.map((item) => item.trim()).filter((item) => item !== "");
   // 去重是为了让 config.readRoots 干净：调用方（和日志）会读它，重复项只会让人困惑。
   return [...new Set([...alwaysInclude, ...extra])];
+}
+
+/**
+ * 从启动环境里挑出代理变量。空字符串当作"没设"（容器 env 里出现 `HTTP_PROXY=` 时
+ * 应该表示"不走代理"，而不是塞一个空值给子进程——有些库看到空串会报错）。
+ */
+function pickProxyEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const picked: Record<string, string> = {};
+  for (const key of PROXY_ENV_KEYS) {
+    const value = env[key];
+    if (value !== undefined && value !== "") picked[key] = value;
+  }
+  return picked;
 }
 
 /**
