@@ -1,0 +1,24 @@
+# 构建上下文是仓库根，不是 images/sandbox/：
+#   docker build -f images/sandbox/Dockerfile -t reuben-cloud/sandbox-base:dev .
+# 这个文件决定「哪些东西根本不会出现在上下文里」。
+# 唯一必须进去的是 packages/sandbox-agent/src（Dockerfile 里 COPY 的就是它），
+# 别的都是白送的网络流量和构建缓存噪音。
+#
+# 注意：.dockerignore 只影响上下文，不影响 Dockerfile 本身——`-f` 是本地读的。
+
+# 依赖树是上下文里最大的一块，而且镜像里一个依赖都不需要（sandbox-agent 零依赖）。
+**/node_modules
+# 宿主仓库的历史：沙箱里的 /workspace 是 CP 灌进去的一份 clone，跟这个 .git 无关。
+.git
+# 设计文档和 README：镜像里没有它们的位置。
+docs
+*.md
+# CP 还不在这个阶段的交付里，而且它是最会长的那个包。
+packages/control-plane
+
+# 下面两条不在 spec 的清单里，理由：
+#   packages/*/test —— 测试不进镜像（镜像里只有 src），排掉它让「镜像里到底有什么」
+#                      一眼可见；CONTEXT 小一圈只是附带好处。
+#   .claude         —— 本地 agent 配置，属于宿主环境，不属于项目。
+packages/*/test
+.claude

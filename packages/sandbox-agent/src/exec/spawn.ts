@@ -462,6 +462,12 @@ function terminalData(record: ExecutionRecord, status: TerminalStatus): Terminal
  * 而是确定性——测试里环境变量不随宿主漂移。顺带保证 SANDBOX_AGENT_TOKEN
  * 不可能从环境里漏进被执行的命令。
  *
+ * 【为什么 PYTHONUNBUFFERED 在这里】镜像里那行 `ENV PYTHONUNBUFFERED=1` 到不了被执行的
+ * 命令——子进程环境是这份固定集合，agent 自己的环境不在其中。而 python 往管道写时默认
+ * 整块缓冲，表现为“命令跑完才一次性出结果”，被 timeout 杀掉时甚至什么都看不到。
+ * 写进固定集合是唯一既保住确定性（常量，不随宿主漂移）又让镜像那句承诺生效的位置。
+ * 注意它不是“把 agent 的环境透传进来”：这里只是恰好取了同一个值。
+ *
  * @param requestEnv 请求里带的额外变量，**可以覆盖**下面的固定值。
  *                     这不是漏洞：能传 env 的调用方本来就有执行权。
  */
@@ -471,6 +477,7 @@ export function buildEnv(requestEnv: Record<string, string>, config: Config): Re
     HOME: config.home,
     LANG: config.lang,
     TERM: config.term,
+    PYTHONUNBUFFERED: "1",
     ...requestEnv,
   };
 }

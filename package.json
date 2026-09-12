@@ -8,6 +8,11 @@
   "engines": {
     "node": ">=24"
   },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:image": "docker build -f images/sandbox/Dockerfile -t reuben-cloud/sandbox-base:dev .",
+    "check:image": "node scripts/sandbox-image-check.ts"
+  },
   "devDependencies": {
     "@types/node": "^22.20.2",
     "typescript": "^7.0.2"
