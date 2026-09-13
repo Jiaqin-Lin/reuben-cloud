@@ -12,9 +12,12 @@
  * **两步暂时做不到，标在这里而不是假装做了**：
  *  - 第 2 步的"仓库是 CP clone 来的"：Phase 9 才有 `repo/clone.ts`。现在用 fixture 仓库
  *    现造一个带 `.git` 的 tar（harness 的 buildFixtureRepo），形态与 Phase 9 灌进去的一致。
- *  - 第 5 步的"落对象存储"：Phase 10。现在断言的是归档流本身能解出被 `.gitignore`
- *    排除的构建产物——那是"归档有资格当 patch 的兜底"的唯一理由。
- *  - 第 7 步的"三张表状态正确"：Phase 8。现在断言容器与卷真的没了（对账/DB 是 CP 侧的事）。
+ *  - 第 5 步的"落对象存储"：对象存储是 CP 侧的事（Phase 10 已落地，但在
+ *    `packages/control-plane/test/integration/artifacts.integration.test.ts` 里验——本脚本
+ *    按设计不经过 CP 业务层）。这里断言的是归档流本身能解出被 `.gitignore` 排除的构建产物，
+ *    那是"归档有资格当 patch 的兜底"的唯一理由。
+ *  - 第 7 步的"三张表状态正确"：Phase 8 已落地，同样在 CP 侧的集成测试里验。现在这一组
+ *    断言的是容器与卷真的没了。
  *
  * 这一组在 macOS 上也跑：darwin 的端口转发链路（宿主 → 转发容器 → 沙箱 agent）是本地开发
  * 最容易坏的一条，而 flow 是唯一一条从 create 走到 destroy 的端到端路径。

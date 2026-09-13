@@ -610,7 +610,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 - [x] egress-proxy：全局常驻，静态白名单只开依赖源，**不含 github.com**（`deploy/egress-proxy/` + `packages/control-plane/src/provider/egress-proxy.ts`；起停：`npm run proxy:up|down|status`，集成测试 `npm run test:integration`；从沙箱里 `curl https://github.com` 确实 403）
 - [x] CP 持久层：三张表 + 状态机（唯一写入口）+ 审计轨迹 + 启动对账 + TTL 清扫（`packages/control-plane/src/db/`、`manager/`、`client/`；本地：`npm run db:up` → `DATABASE_URL=… npm run db:migrate`；集成测试 `npm run test:integration`，含真容器丢失/孤儿容器/kill -9 三条对账场景，见 spec Phase 8）
 - [x] CP 侧仓库进出：clone → tar → 灌入沙箱；diff → apply → push（**凭据只在 CP**）（`packages/control-plane/src/repo/`；clone/push 走 `-c http.extraHeader`，token 不进 URL、不进沙箱；patch 应用后重算 sha256 与沙箱那份逐字节比对，失败回退 archive；push 用显式 `--force-with-lease=<ref>:<sha>` 做 CAS；集成测试 `npm run test:integration` 用一个本地 smart-HTTP git 服务器证明 token 真的被用过、且哪里都没落盘，见 spec Phase 9）
-- [ ] `GET /diff` + `GET /archive` + 落对象存储
+- [x] `GET /diff` + `GET /archive`（沙箱侧 Phase 3/7）+ 落对象存储（CP 侧 Phase 10）：销毁前把 diff / `workspace-<sandboxId>.tar.gz` / 被截断的执行日志流式传进 S3/MinIO（边传边算 sha256，不预知 content-length）；失败重试 3 次 → `ERROR(archive_failed)` → 10 分钟宽限后强制销毁（有界）。配置：`S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`（一个都不给 = 不启用）；集成测试 `npm run test:integration` 用一次性 MinIO 容器，含真容器端到端那一条，见 spec Phase 10
 - [x] 冒烟脚本 + 隔离红线 CI：`packages/e2e/` + `.github/workflows/smoke.yml`（含一个反向验证 job：拿掉 CapDrop 之后红线必须变红；**只在 Linux 上算数**）
 
 **Agent 侧**（沙箱跑通之后再开始）：

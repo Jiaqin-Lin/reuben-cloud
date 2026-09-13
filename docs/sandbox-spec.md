@@ -1915,13 +1915,81 @@ git -c http.extraHeader="..." push origin HEAD:refs/heads/reuben-cloud/<taskId>
 
 ### 验收标准
 
-- [ ] 上表 8 项全绿
-- [ ] §J.6：archive 包含被 `.gitignore` 排除的构建产物
-- [ ] §J.7：归档落对象存储、沙箱销毁、DB 状态正确
-- [ ] MinIO 挂掉时销毁流程不会永远挂着
+- [x] 上表 8 项全绿 —— `packages/control-plane/test/integration/artifacts.integration.test.ts`，
+      8/8 通过（`npm run test:integration`，需要 Docker；用例 3 的指标按实现备注 7 调成
+      `arrayBuffers`/`heapUsed` + 256 MiB 载荷）；整套集成测试 74/74、`npm test` 118+101、
+      `tsc --noEmit` 干净
+- [x] §J.6：archive 包含被 `.gitignore` 排除的构建产物 —— 用例 1/2 的样本树里有 `dist/bundle.js`
+      且解包后逐字节一致；用例 8 在**真沙箱**里造 `.gitignore` + `dist/bundle.js` 再断言
+- [x] §J.7：归档落对象存储、沙箱销毁、DB 状态正确 —— 用例 8：真容器 → 归档可下载且能解包 →
+      容器/卷确实没了 → `sandboxes` 行 `DESTROYED`、`executions` 一条 `completed`、
+      `artifacts` 有 diff + workspace_archive、审计轨迹含 `CREATING→READY→BUSY→READY→DESTROYED`
+- [x] MinIO 挂掉时销毁流程不会永远挂着 —— 用例 4：连不上的存储 + 3 次尝试在 30s 内结束（实测 <50ms，
+      因为连接被拒是立即的）且不销毁容器；用例 5：宽限期后最后一次尝试仍失败 → 强制销毁，
+      容器真的被删、`state_reason=archive_failed` 留下
 
 **完成标记：**
-- [ ] **Phase 10 完成** — 产出在销毁前落到对象存储
+- [x] **Phase 10 完成** — 产出在销毁前落到对象存储（`SandboxManager.destroySandbox()` 的第一段，
+      Key 布局、流式上传与边传边算 sha256 都在 `src/artifacts/`；`transcript.jsonl` 的 key 留给 Phase 11）
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **销毁流程的第 5/6 步调了顺序**（正文写的是先 `transition(DESTROYED)` 再 `provider.destroy()`）。
+   先改状态再删容器的话，`docker rm` 失败时留下的是一行 **DESTROYED 但容器还活着**的记录——
+   而 DESTROYED 没有出边（§D）、对账又只扫非 DESTROYED 的行，那个容器会永远没人认领。
+   实际顺序：归档 → `provider.destroy()` → `transition(DESTROYED)`。崩在中间留下的是
+   "记录还在、容器已没"，那正是 TTL 重试与对账都能处理的状态。
+2. **宽限期不是定时器，是"下一次销毁请求先看一眼过了多久"**。第一次失败：重试 3 次 →
+   `{CREATING,READY,BUSY}→ERROR(archive_failed)` + 内存里的首次失败时刻；宽限期内再来的销毁
+   请求（sweeper 每 60s 一轮）**直接跳过重试**——同一份错误刷屏并不会提高成功率；
+   宽限过后 `offload()` 单次尝试（它本身就是"重试 3 次之后的那一次"），仍失败则强制销毁，
+   并把 `state_reason` 写成 `archive_failed`、返回值里 `archive.forced=true`。
+   内存时间戳意味着 CP 重启会把宽限重新计时：最多让一个存不上去的容器多活 10 分钟，
+   **不会**让任何产出被提前删掉（宽限没到就不会走强制销毁）。行已经是 ERROR 时没有
+   ERROR→ERROR 这条边，所以那种行不写新的审计，内存时间戳是它唯一的宽限依据——这也是
+   把时间戳放在内存里而不是 DB 列里的原因之一（不为一个计时器加一列）。
+3. **`artifacts` 的写入从 INSERT 变成 upsert（新增 `003_artifact_object_key.sql`）**。重试会把
+   同一份产出传第二遍，而 spec 的 `artifacts` 表没有任何唯一约束：纯 INSERT 会留下两行指向
+   同一个 key、却可能带着不同 sha256 的记录，"哪一行是真的"从此没有答案。003 加一个
+   `object_key` 唯一索引，`insertArtifact` 改用 `ON CONFLICT DO UPDATE`——语义变成
+   **"一行 = 这个对象现在是什么样子"**。这也顺带把 key 布局里"diff 没有 sandboxId"这条
+   钉死：同一次 Run 的 `diff.patch` 代表最新产出，后一次覆盖前一次是有意为之
+   （归档带 sandboxId，所以两台沙箱的归档互不影响）。
+4. **顺带修了 002 的一个真 bug（新增 `004_patch_column_dedup.sql`）**。`sandbox_transition()`
+   无条件追加 `ARRAY['state','state_reason']`，而调用方在 patch 里显式传 `state_reason` 时
+   列名就重复了：Postgres 直接报 `multiple assignments to same column state_reason`，整次
+   转换失败。Phase 10 的"强制销毁时写 archive_failed"是第一个这么用的调用方（`SandboxPatch`
+   一直声称支持，只是从没被走过）。004 只加一个 `NOT IN ('state','state_reason')`，函数体
+   整段照抄（plpgsql 只能整段替换；`CREATE OR REPLACE` 保留 OID 与 GRANT，所以 002 里的
+   `GRANT EXECUTE` 不用重写）。
+5. **失败分两类：diff / dryRun 只记警告，archive / exec_log 才阻断**。"这一份有没有第二份"
+   是唯一的标准：归档里本来就包含 diff 的同一份改动（它只是更小、更适合贴进 PR 的视图），
+   dryRun 只是个体积估计；而归档是产出的兜底载体、`truncated=true` 的日志的完整内容
+   事件流里没有——它们丢了就是丢了。例外只有一个：执行日志 404（日志本身已经不在沙箱里，
+   重试也变不出来）降级成警告。
+6. **`S3_REGION` / `S3_FORCE_PATH_STYLE` 两个可选 env**。四个必需项是 spec 写的；region 默认
+   `us-east-1`（MinIO 不校验），path-style 默认开（MinIO 需要）——都留了显式开关，因为把
+   MinIO 换成真 S3 时这两项是第一件要改的事。四个变量**一个都没给**时 `artifactStoreFromEnv()`
+   返回 `null`（合法的"这个部署没有对象存储"），给了一半则报 `config_missing`——半份配置只会在
+   第一次上传时炸，而那时沙箱已经在等销毁了。
+7. **用例 3 的指标与载荷改了**（正文："上传 1 GiB 归档，CP RSS 增量 < 100 MiB"）。沿用
+   Phase 3 备注 16 的结论：RSS 量的是分配器，不是流式处理，Linux 上必然抖；断言改成
+   `arrayBuffers` + `heapUsed`，门槛 = 载荷的一半，RSS 仍然打印。载荷 1 GiB → **256 MiB
+   不可压缩数据**：256 MiB 攒内存必然 ≥100%，门槛 128 MiB 两边都不贴边，耗时从 30s 降到 3s。
+   实测（macOS，MinIO 是本地容器）：`arrayBuffers=50.3MiB heapUsed=4.7MiB rss=44–61MiB`。
+8. **超时用 `socketTimeout` 而不是 `requestTimeout`**。新版 SDK 的 `requestTimeout` 默认只打警告
+   （要 `throwOnRequestTimeout: true` 才抛），拦不住"endpoint 活着但不回字节"；
+   `connectionTimeout: 5s` + `socketTimeout: 60s` 才是真会掐连接的那两个旋钮。这是
+   "MinIO 挂掉时销毁流程不会永远挂着"的第一道闸（第二道是重试与宽限期）。
+9. **测试脚手架补了三件东西**：`startMinio()`（一次性容器 + `/minio/health/ready` 等就绪 +
+   建桶）、`FakeSandboxAgent` 新增 `/diff`、`/archive`（含 `dryRun`）、`/files?raw=1` 三条路由
+   （默认拒绝、由 hooks 给响应）、`runBinary()` / `makeTarGz()` / `tarExtract()`（二进制宿主命令；
+   `run()` 把 stdout 解成 utf8，会把 tar.gz 弄坏）。用例 1–7 用假 agent 而不是真容器：被测的是
+   CP 的编排与存储，假 agent 仍然是**真 HTTP + 真字节流**（流式、sha256、解包都是真的），
+   而真容器那一条由用例 8 补。
+10. **e2e 的 flow 冒烟没有改去落 MinIO**：那组脚本按设计**不经过 CP 业务层**（Phase 7 §1），
+    对象存储是 CP 侧的事；它继续断言归档流本身能解出构建产物。"归档落对象存储"由
+    `artifacts.integration.test.ts` 的用例 8 用真容器 + 真 MinIO + 真 Postgres 一条链验完。
 
 ---
 ---

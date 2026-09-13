@@ -16,7 +16,9 @@
  * 【为什么不经过 CP 业务层】Phase 7 时 Phase 8–10 还没落地（没有 DB、没有 manager、
  * 没有 repo/artifacts）。script 直接拿 provider 造沙箱、直接打 agent HTTP——spec 原文
  * 就是这个意思（"这个阶段的冒烟脚本直接调 provider + agent HTTP，不经过 CP 业务层"）。
- * 链路里属于后面的两步（三张表的状态、归档落对象存储）在 flow 组里标了 TODO。
+ * 属于 CP 业务层的两件事（三张表的状态、归档落对象存储）已经在 Phase 8/10 落地，
+ * 但它们的验证在 `control-plane/test/integration/` 里（那里有真 Postgres 与真 MinIO）；
+ * 这一组仍然只断言"沙箱侧看得见"的那些事实（归档流本身合法、容器与卷真的没了）。
  *
  * 【为什么复用 CP 的测试脚手架】`dockerOrThrow` / `resolveImageRef` / `agentExec` /
  * `rawInspect` 这些已经在 Phase 5/6 的集成测试里跑熟了，再写第二份只会让"怎么解析 digest"、
