@@ -618,7 +618,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 - [x] Agent 主循环（tool-use，4 个内置工具：bash / read / write / list）（`packages/control-plane/src/agent/`：循环在 CP、模型 key 不进沙箱、每轮 system+tools+messages 落 JSONL transcript、三重硬上限 + 重复调用检测、单条 tool_result 硬顶 2000 行 / 50 KiB；`npm test` 覆盖循环与工具，`npm run test:live` 跑真模型，手工验收 `npm run agent:run`，见 spec Phase 11）
 - [x] 产出 unified diff（沙箱 `/diff` → `git apply --binary` 往返见 Phase 9；`npm run agent:run` 会把 patch 写到 `agent-patch.diff`）
 - [x] GitHub App：token 签发 + PR 创建（`packages/control-plane/src/repo/pr.ts` + `src/agent/run.ts` 的 `finishRun()`：验证 → 取改动 → commit → force-with-lease push → 幂等建/更新 **draft** PR；正文是模板 + 实数（文件数 / +− / 测试命令与退出码 / 模型与 run / transcript 链接）；限流按 `retry-after` 退避、权限/分支保护/分支被他人改动都是结构化错误；**真 GitHub 上已端到端跑通**（issue → patch → draft PR，重跑更新同一条），跑法 `npm run app:installations` + `RUN_LIVE_PR=1`，见 spec Phase 12）
-- [ ] 本地 Web UI：实时 transcript（Phase 13，可选；`onText` 回调已预留）
+- [x] 本地 Web UI：实时 transcript（`packages/web/` + CP 的 `GET /runs/{id}/stream`（SSE）：模型文字增量 / 工具调用与结果 / 沙箱命令输出汇到同一条流上，`Last-Event-ID` 重连不重不漏；`npm run agent:run -- --serve` 之后打开它打印的 `http://127.0.0.1:8787/runs/<runId>`，见 spec Phase 13）
 
 - [ ] **不做**：云端、多用户、权限、MCP、预热池、快照、密钥代理
 
@@ -742,7 +742,7 @@ export REUBEN_CLOUD_MODEL=claude-opus-4-8    # 可选；默认值按 provider �
 export REUBEN_CLOUD_EFFORT=high              # 可选；low|medium|high|xhigh|max
 ```
 
-### 跑一次 agent（Phase 11 + 12）
+### 跑一次 agent（Phase 11 + 12 + 13）
 
 ```bash
 npm run dev:up && export DATABASE_URL=$(npm run --silent db:url)
@@ -756,10 +756,17 @@ npm run agent:run -- --local ~/code/my-project \
 # ② GitHub 仓库：一条 draft PR（同一个 issue 重跑是更新同一条 PR）
 npm run agent:run -- --repo owner/name --issue-file issue.md \
   --verify "npm test" --pr
+
+# ③ 一边跑一边看：观察窗（只读、本地回环、无鉴权）
+npm run agent:run -- --local ~/code/my-project --issue "..." --serve
+# → 观察窗：http://127.0.0.1:8787/runs/run_01H...（跑完不退出，Ctrl-C 结束）
 ```
 
 看它到底看到了什么：`/tmp/reuben-cloud-cp/<runId>/transcript.jsonl`（每轮的 system / tools /
 完整 messages / usage 都在里面）；`--keep` 会留下沙箱，可以 `docker exec` 进去看工作区。
+`--serve` 起的是进程内的观察窗（`packages/web/`）：模型文字增量、工具调用与结果、沙箱命令输出
+在同一条 SSE 上；刷新页面是把缓冲重放一遍，断线重连靠 `Last-Event-ID` 接着读。
+
 `--pr` 需要 `GITHUB_APP_ID / GITHUB_APP_INSTALLATION_ID / GITHUB_APP_PRIVATE_KEY_PATH` 三个变量
 （或者 `GITHUB_APP_PRIVATE_KEY` 内联 PEM；相对路径按进程 cwd → 仓库根依次找）；`--no-draft` 可以关掉默认的 draft。
 建完 GitHub App 之后用 `npm run app:installations` 查 installation id 并核对三个权限（只读 API）；

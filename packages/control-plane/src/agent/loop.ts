@@ -22,8 +22,10 @@
 
 import type { LogFn } from "../log.ts";
 import { noopLog } from "../log.ts";
+import type { RunEvent, RunEventSink } from "./events.ts";
+import { emitEvent } from "./events.ts";
 import type { ContentBlock, Message, ModelClient, ToolResultBlock, Usage } from "./model.ts";
-import { buildSystemPrompt, initialMessages } from "./prompt.ts";
+import { REPO_DIR, buildSystemPrompt, initialMessages } from "./prompt.ts";
 import type { AgentToolkit } from "./tools/index.ts";
 import type { Transcript } from "./transcript.ts";
 
@@ -95,8 +97,19 @@ export interface AgentLoopOptions {
   /** 单轮输出上限，默认 `MAX_MODEL_OUTPUT_TOKENS`。 */
   maxTokens?: number;
   context?: { maxChars?: number; keepRecentToolResults?: number; enabled?: boolean };
-  /** 文字增量回调（Phase 13 的实时 transcript 用）。 */
+  /**
+   * 文字增量回调（Phase 13 的实时 transcript 用）。
+   *
+   * 【为什么不在这里顺手发一条 `text` 事件】文字是**唯一的高频通道**，而消费它的东西
+   * 不止观察窗（`agent-run` 脚本同时把它写到 stdout）。循环只负责把增量交出去；
+   * 要发给谁（sink / 终端 / 两个都要）由调用方决定，这样不会出现"同一个增量发了两遍"。
+   */
   onText?: (delta: string) => void;
+  /**
+   * 实时事件出口（Phase 13）。**只在旁路上**：它抛异常不影响 Run（见 `emitEvent`）。
+   * 与 `transcript` 不同的是，这里丢一条事件不会让这次 Run 无法回放。
+   */
+  events?: RunEventSink;
   signal?: AbortSignal;
   /** 可注入时钟（测试用它拨快墙钟）。 */
   now?: () => number;
@@ -141,6 +154,8 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
   };
   const system = options.system ?? buildSystemPrompt(options.repoDir === undefined ? {} : { repoDir: options.repoDir });
   const deadline = now() + wallClockMs;
+  /** 事件出口的快捷方式（`undefined` 时 `emitEvent` 直接返回）。 */
+  const emit = (event: RunEvent): void => emitEvent(options.events, event, log);
 
   const messages: Message[] = initialMessages(options.issue, options.repoDir === undefined ? {} : { repoDir: options.repoDir });
   const usage: Usage = {
@@ -164,6 +179,14 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     system,
     tools: options.tools.definitions.map((tool) => tool.name),
     limits: { maxTurns, wallClockMs, outputTokenBudget, maxTokens, context: contextOptions },
+  });
+  emit({
+    type: "run_start",
+    runId: options.transcript.runId,
+    model: options.model.model,
+    issue: options.issue,
+    repoDir: options.repoDir ?? REPO_DIR,
+    limits: { maxTurns, wallClockMs, outputTokenBudget, maxTokens },
   });
 
   while (turns < maxTurns) {
@@ -194,9 +217,16 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     if (trimmed > 0) {
       await options.transcript.append("context_trim", { removed: trimmed, messages: messages.length });
       log("info", `上下文裁剪：丢掉 ${trimmed} 条旧工具结果的内容`, { turn: turns + 1 });
+      emit({
+        type: "note",
+        turn: turns + 1,
+        kind: "context_trim",
+        message: `上下文太大，丢掉 ${trimmed} 条旧工具结果的内容（只丢结果，不丢对话文字）`,
+      });
     }
 
     turns += 1;
+    emit({ type: "turn", turn: turns });
     await options.transcript.append("request", {
       turn: turns,
       model: options.model.model,
@@ -225,6 +255,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
       const aborted = isAborted(options.signal);
       await options.transcript.append("model_error", { turn: turns, error: message, aborted, timedOut: gate.timedOut });
       log("error", `模型调用失败（第 ${turns} 轮）`, { error: message, timedOut: gate.timedOut });
+      emit({ type: "note", turn: turns, kind: "model_error", message: `模型调用失败：${message}` });
       stop = gate.timedOut
         ? {
             reason: "wall_clock",
@@ -276,21 +307,40 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
         detail: `第 ${turns} 轮以 ${response.stopReason} 结束，且没有工具调用可以执行`,
       };
       await options.transcript.append("note", { turn: turns, kind: "incomplete", stopReason: response.stopReason });
+      emit({
+        type: "note",
+        turn: turns,
+        kind: "incomplete",
+        message: `第 ${turns} 轮以 ${response.stopReason} 结束，没有工具调用可以执行`,
+      });
       break;
     }
 
     // ---- ③ 并行执行工具（沙箱的单执行闸会串行化 bash；读类工具真的并发）
     const results = await Promise.all(
       toolUses.map(async (use): Promise<ToolResultBlock> => {
+        // 事件分两次发（跑之前 tool_call、跑完 tool_result），transcript 仍然只记一条
+        // （它是证据，要的是结果；观察窗要的是"现在正在跑什么"）。
+        emit({ type: "tool_call", turn: turns, id: use.id, name: use.name, input: use.input });
         const result = await options.tools.run(use.name, use.input);
         toolCalls += 1;
+        const resultBytes = Buffer.byteLength(result.content);
+        emit({
+          type: "tool_result",
+          turn: turns,
+          id: use.id,
+          name: use.name,
+          isError: result.isError,
+          bytes: resultBytes,
+          content: result.content,
+        });
         await options.transcript.append("tool_call", {
           turn: turns,
           id: use.id,
           name: use.name,
           input: use.input,
           isError: result.isError,
-          resultBytes: Buffer.byteLength(result.content),
+          resultBytes,
         });
         return {
           type: "tool_result",
@@ -307,6 +357,12 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     if (repeat.count >= REPEAT_NOTICE_THRESHOLD) {
       if (repeatNoticeInjected || repeat.count >= REPEAT_STOP_THRESHOLD) {
         await options.transcript.append("note", { turn: turns, kind: "repeat_stop", signature: repeat.signature });
+        emit({
+          type: "note",
+          turn: turns,
+          kind: "repeat_stop",
+          message: `同一调用（${repeat.signature}）连续出现了 ${repeat.count} 次，停止`,
+        });
         // 结果仍然回填：返回给调用方的 `messages` 要是一段**合法**的对话
         // （tool_use 永远有配对的 tool_result），否则 Phase 12 拿它重发会 400。
         messages.push({ role: "user", content: userBlocks });
@@ -318,6 +374,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
       }
       repeatNoticeInjected = true;
       await options.transcript.append("note", { turn: turns, kind: "repeat_notice", signature: repeat.signature });
+      emit({ type: "note", turn: turns, kind: "repeat_notice", message: REPEAT_NOTICE });
       userBlocks.push({ type: "tool_result", tool_use_id: `repeat_notice_${turns}`, content: REPEAT_NOTICE });
       log("warn", `检测到重复调用，已向模型插入提示`, { signature: repeat.signature, turn: turns });
     }
@@ -338,6 +395,15 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     toolCalls,
     usage,
     transcriptFailure: options.transcript.failure?.message ?? null,
+  });
+  emit({
+    type: "run_end",
+    ok: stop.reason === "end_turn",
+    stopReason: stop.reason,
+    detail: stop.detail,
+    turns,
+    toolCalls,
+    usage,
   });
 
   return {

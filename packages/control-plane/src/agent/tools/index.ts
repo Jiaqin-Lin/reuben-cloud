@@ -13,6 +13,7 @@
  */
 
 import type { ToolDefinition } from "../model.ts";
+import type { RunEventSink } from "../events.ts";
 import type { ToolResult } from "./types.ts";
 import { bashTool, runBash } from "./bash.ts";
 import { listTool, runList } from "./list.ts";
@@ -43,6 +44,8 @@ export interface ToolkitOptions {
   /** 续读锚点表。缺省每个工具箱一个（一个 Run 一份，默认 8 个文件）。 */
   anchors?: ReadAnchors;
   signal?: AbortSignal;
+  /** 实时事件出口（Phase 13）。不接就是一个没有观察窗的 Run。 */
+  events?: RunEventSink;
   log?: LogFn;
 }
 
@@ -56,6 +59,7 @@ export function createToolkit(options: ToolkitOptions): AgentToolkit {
     repoDir: options.repoDir ?? REPO_DIR,
     anchors: options.anchors ?? createReadAnchors(),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.events === undefined ? {} : { events: options.events }),
     log: options.log ?? noopLog,
   };
 

@@ -22,6 +22,7 @@ import type { AgentFileList, AgentFileRead, AgentFileWrite, SandboxApiError } fr
 import type { SseEvent } from "../../client/sse.ts";
 import type { LogFn } from "../../log.ts";
 import type { SandboxTarget } from "../../repo/types.ts";
+import type { RunEventSink } from "../events.ts";
 
 // ---------------------------------------------------------------- 沙箱出口
 
@@ -32,6 +33,12 @@ export interface ToolExecRequest {
   env?: Record<string, string>;
   timeoutMs?: number;
   maxOutputBytes?: number;
+  /**
+   * 边收边转发（Phase 13 的实时事件用）。事件是**沙箱的原始词汇**（§Phase 1：
+   * started / stdout / stderr / truncated / 四种终态）；翻译成 RunEvent 的动作
+   * 统一在 `../events.ts` 的 `createExecEventMapper()` 里，不散到工具里。
+   */
+  onEvent?: (event: SseEvent) => void;
 }
 
 /**
@@ -161,6 +168,8 @@ export interface ToolContext {
   repoDir: string;
   anchors: ReadAnchors;
   signal?: AbortSignal;
+  /** 实时事件出口（Phase 13）。**可以不接**：没有观察者时工具照常工作。 */
+  events?: RunEventSink;
   log: LogFn;
 }
 

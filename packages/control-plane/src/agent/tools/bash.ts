@@ -26,6 +26,7 @@ import { MAX_TOOL_BYTES, MAX_TOOL_LINES, formatBytes, truncateTail } from "./tru
 import path from "node:path";
 import type { ToolContext, ToolExecResult, ToolResult } from "./types.ts";
 import { asRecord, fail, ok, optionalInteger, optionalString, requireStringArray, toolFailure } from "./types.ts";
+import { createExecEventMapper, emitEvent } from "../events.ts";
 import type { ToolDefinition } from "../model.ts";
 
 /** `bash` 的默认时限与沙箱侧一致（Phase 1 §4）。 */
@@ -84,6 +85,9 @@ export async function runBash(input: unknown, context: ToolContext): Promise<Too
       );
     }
 
+    // Phase 13 的实时观察：把沙箱的原始事件翻成 RunEvent 推给观察窗。
+    // 映射器**每次调用新建一个**：它记得这次执行的 executionId（见 events.ts）。
+    const mapExecEvent = createExecEventMapper();
     const result = await context.exec.execInSandbox(context.sandboxId, {
       cmd,
       // **cwd 一律显式给**：沙箱的默认 cwd 是 workspace 根（`/workspace`），而模型
@@ -91,6 +95,13 @@ export async function runBash(input: unknown, context: ToolContext): Promise<Too
       // `/workspace` 里找不到文件——报出来的 ENOENT 与真正的原因隔着一层。
       cwd: cwd === undefined ? context.repoDir : resolveCwd(cwd, context),
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      ...(context.events === undefined
+        ? {}
+        : {
+            onEvent: (event) => {
+              for (const runEvent of mapExecEvent(event)) emitEvent(context.events, runEvent, context.log);
+            },
+          }),
     });
     // bash 能改任何文件——续读锚点必须整表失效（见 `read.ts` 的文件头）。
     context.anchors.clear();

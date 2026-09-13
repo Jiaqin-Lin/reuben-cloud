@@ -1,0 +1,55 @@
+<!doctype html>
+<!--
+  Phase 13 的观察窗（`docs/sandbox-spec.md` §Phase 13）。
+
+  【为什么是静态 HTML + 一个 app.js，而不是 Next.js】正文的理由：`node --test` 之外再引
+  一套打包工具不划算。这里补一条实测的理由：这个页面对"打开就能看"的要求比"组件化"高得多，
+  而它的全部状态就是一条事件流。没有构建 = 没有构建失败、没有 node_modules 进浏览器、
+  没有版本漂移；改完刷新就是新的。
+
+  【为什么一条外部资源都没有】没有字体 CDN、没有图标库、没有分析脚本。它跑在本机回环上、
+  给一个开发者看：任何外部请求都只是新的失败面与新的供应链面。字体用系统栈（见 style.css）。
+
+  【theme 属性由 app.js 在首帧之前写】默认给 light，JS 一加载就按 localStorage /
+  系统偏好改成 light 或 dark（"跟随系统"是第三个状态，会被解析成前两个之一）。
+-->
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>reuben-cloud · 实时 transcript</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="bar">
+      <div class="bar__inner">
+        <div class="bar__left">
+          <span class="brand">reuben-cloud</span>
+          <span class="bar__run" id="run-id" title="这次 Run 的 id">…</span>
+        </div>
+        <div class="bar__right">
+          <span class="state" id="state" data-state="connecting" role="status">
+            <span class="state__dot" aria-hidden="true"></span>
+            <span class="state__text" id="state-text">连接中</span>
+          </span>
+          <button class="button" type="button" id="theme">跟随系统</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- 事件流渲染在这里。aria-live 刻意不加：一次 Run 有上千条增量，
+         逐条播报对屏幕阅读器是噪音而不是帮助（状态行本身是 role="status"）。 -->
+    <main class="page" id="log"></main>
+    <div class="sentinel" id="sentinel" aria-hidden="true"></div>
+
+    <div class="jump" id="jump" hidden>
+      <button class="button button--solid" type="button" id="jump-button">回到最新</button>
+    </div>
+
+    <noscript>
+      <p class="page page--plain">这个页面靠 JavaScript 读 SSE 事件流。请打开 JavaScript 再刷新。</p>
+    </noscript>
+  </body>
+</html>

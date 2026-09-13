@@ -1,5 +1,6 @@
 /**
  * Phase 11/12 · 手工验收：给一个真实 issue，跑完产出一个 patch（或一条 PR）。
+ * Phase 13 · 加上 `--serve` 之后，同一个进程里起一个观察窗：浏览器能看到这次 Run 的实时流。
  *
  * 这不是产品代码，是把已经存在的零件按生产顺序串起来的一次性驱动：
  *   建沙箱 → clone → 灌入 → 跑 agent 循环 → 验证 → 取改动 → （可选）commit + push + PR → 销毁沙箱
@@ -27,6 +28,9 @@
  *
  *   # 看它到底干了什么：--keep 留着沙箱（可以 docker exec 进去看），
  *   # transcript 在 /tmp/reuben-cloud-cp/<runId>/transcript.jsonl
+ *
+ *   # ③ 一边跑一边看（Phase 13）：打开它打印的地址，刷新页面能看到到目前为止的全部事件
+ *   node scripts/agent-run.ts --local ~/code/my-project --issue "..." --serve
  */
 
 import { readFileSync } from "node:fs";
@@ -50,6 +54,9 @@ import { finishRun, taskIdForIssue } from "../packages/control-plane/src/agent/r
 import { Transcript } from "../packages/control-plane/src/agent/transcript.ts";
 import { REPO_DIR, buildSystemPrompt } from "../packages/control-plane/src/agent/prompt.ts";
 import { createToolkit } from "../packages/control-plane/src/agent/tools/index.ts";
+import { RunHub } from "../packages/control-plane/src/web/hub.ts";
+import type { WebServer } from "../packages/control-plane/src/web/server.ts";
+import { startWebServer } from "../packages/control-plane/src/web/server.ts";
 import { consoleLog } from "../packages/control-plane/src/log.ts";
 import { prefixedId } from "../packages/control-plane/src/ulid.ts";
 import { resolveImageRef } from "../packages/control-plane/test/support.ts";
@@ -69,6 +76,8 @@ interface Args {
   pr: boolean;
   draft: boolean;
   keep: boolean;
+  serve: boolean;
+  port: number | null;
   maxTurns: number;
 }
 
@@ -86,6 +95,8 @@ function parseArgs(argv: string[]): Args {
     pr: false,
     draft: true,
     keep: false,
+    serve: false,
+    port: null,
     maxTurns: 40,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -139,6 +150,12 @@ function parseArgs(argv: string[]): Args {
       case "--max-turns":
         args.maxTurns = parsePositiveInt(current, next());
         break;
+      case "--serve":
+        args.serve = true;
+        break;
+      case "--port":
+        args.port = parsePositiveInt(current, next());
+        break;
       case "--keep":
         args.keep = true;
         break;
@@ -178,6 +195,8 @@ function printUsage(): void {
   --base-branch <名>    PR 的 base（默认问 GitHub / 本地取当前分支）
   --no-draft            PR 不用 draft（默认 draft）
   --max-turns <n>       轮数上限（默认 40）
+  --serve               同时起本地观察窗（SSE 实时 transcript，默认 127.0.0.1:8787）
+  --port <n>            观察窗端口（默认 8787；--serve 才有意义）
   --keep                跑完不销毁沙箱（排障用）
 
 环境：
@@ -224,6 +243,23 @@ async function main(): Promise<void> {
   const runId = prefixedId("run");
   // `--task-id` 的缺省规则在 `agent/run.ts`（脚本 import 即执行，放这里测不了）。
   const taskId = args.taskId ?? taskIdForIssue(args.issue);
+
+  // ---- Phase 13 的观察窗。**在跑任何东西之前先起来**：这样 clone / 沙箱 / 循环
+  // 任何一段出问题，浏览器里都能看到（`run_error` 事件就是给这条路径的）。
+  // 起不来的话只警告（端口被占不该阻断一次 Run）。
+  const hub = args.serve ? new RunHub({ log }) : null;
+  let web: WebServer | null = null;
+  if (hub !== null) {
+    try {
+      web = await startWebServer({ hub, ...(args.port === null ? {} : { port: args.port }), log });
+      log("info", `观察窗：${web.url}/runs/${runId}（跑完仍然保留，Ctrl-C 退出）`);
+    } catch (error) {
+      log("warn", `观察窗没起来（端口被占？），这次 Run 没有实时 transcript`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  const events = hub?.ensure(runId);
   const image = await resolveImageRef(process.env["SANDBOX_IMAGE"] ?? "reuben-cloud/sandbox-base:dev");
   const store = artifactStoreFromEnv();
   const db = new Db({ connectionString: databaseUrl });
@@ -296,10 +332,17 @@ async function main(): Promise<void> {
     const injected = await injectRepo({ api: new SandboxApiClient(), target, clone, workspaceDir: REPO_DIR, log });
     log("info", `仓库已灌入沙箱（${injected.bytes} 字节，HEAD ${injected.headSha.slice(0, 12)}）`);
 
-    // ---- 跑循环
+    // ---- 跑循环。带观察窗时，文字增量同时进 stdout 与事件流（Phase 13）。
     const api = new SandboxApiClient();
     const transcript = await Transcript.create({ runId, log });
-    const toolkit = createToolkit({ sandboxId: sandbox.sandboxId, exec: manager, api, target, log });
+    const toolkit = createToolkit({
+      sandboxId: sandbox.sandboxId,
+      exec: manager,
+      api,
+      target,
+      ...(events === undefined ? {} : { events }),
+      log,
+    });
     const model = modelFromEnv();
     log("info", `agent 开始（model=${model.model}，maxTurns=${args.maxTurns}）`);
 
@@ -311,7 +354,11 @@ async function main(): Promise<void> {
       system: buildSystemPrompt(),
       maxTurns: args.maxTurns,
       maxTokens: maxTokensFromEnv(),
-      onText: (delta) => process.stdout.write(delta),
+      ...(events === undefined ? {} : { events }),
+      onText: (delta) => {
+        process.stdout.write(delta);
+        events?.emit({ type: "text", delta });
+      },
       log,
     });
     if (result.usage.outputTokens > 0) process.stdout.write("\n");
@@ -382,6 +429,14 @@ async function main(): Promise<void> {
       `沙箱           ${args.keep ? `保留着：${sandbox.sandboxId}（用完自己 destroy）` : "即将销毁"}`,
       "──────────────────────────────",
     ].join("\n");
+  } catch (error) {
+    // 循环之外的失败（clone / 沙箱 / GitHub）也要让观察窗看到一句人话，
+    // 否则页面会一直停在“等第一个事件”（Phase 13 的失败模式）。
+    events?.emit({
+      type: "run_error",
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
   } finally {
     if (!args.keep) {
       try {
@@ -400,6 +455,15 @@ async function main(): Promise<void> {
 
   if (summary !== null) console.log(summary);
   if (patchPath === null) process.exitCode = 1;
+
+  // ---- 留着观察窗（Phase 13）：Run 结束了，但页面还能把整段过程读完。
+  // 不 --serve 的话脚本的行为与以前完全一样（跑完就退）。
+  if (web !== null) {
+    console.log(`\n观察窗仍然在 ${web.url}/runs/${runId}（Ctrl-C 退出）`);
+    await new Promise<void>((resolve) => process.once("SIGINT", () => resolve()));
+    await web.close();
+    hub?.close();
+  }
 }
 
 /** issue 的第一行当题面（PR 标题 / commit message 用）。太长就截断。 */
