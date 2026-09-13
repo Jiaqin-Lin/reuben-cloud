@@ -3,6 +3,11 @@
 > 输入：`docs/sandbox.md`（v3 设计文档）。那份回答**为什么这样设计**，这份回答**先写哪个文件、函数长什么样、怎么测、什么算完成**。
 >
 > **权威顺序**：设计文档 > 本文档。本文与设计冲突时以设计为准；但本文附录 A 列出的偏差是**有意的**，每条都写了理由，改回来之前先读那条理由。
+>
+> **M2 的规格是另一份文档**：[`agent-runtime-spec.md`](agent-runtime-spec.md)（环境与上下文；
+> 其中 P1–P4 会把本文 Phase 11 的循环 / 工具 / transcript 重写成与 pi 同构的
+> `packages/agent-runtime`）。本文仍然有效：**沙箱侧的契约一个字不变**，Phase 11 的行为
+> （工具结果截断、重复调用检测、三重上限、可回放）在 M2 里全部保留，只是换了落点。
 
 **怎么用这份文档**
 
@@ -2002,6 +2007,13 @@ git -c http.extraHeader="..." push origin HEAD:refs/heads/reuben-cloud/<taskId>
 ---
 
 ## Phase 11 · Agent 循环 + 4 个工具
+
+> **M2 重写提示（2026-09-13）**：本 Phase 的实现将在
+> [`agent-runtime-spec.md`](agent-runtime-spec.md) 的 P1–P4 中重构为 `packages/agent-runtime`
+> （循环/工具/事件契约对齐 pi，transcript 升级为 entries 表）。
+> **行为契约不变**：结果截断（2000 行 / 50 KiB）、同一条消息回填多个 tool_result、
+> 失败也是结果、三重上限、重复调用检测、每轮可回放——这些都在 M2 的新实现里有对应测试。
+> 本 Phase 的**验收标准仍是 M2 的回归基线**：`agent:run` 必须一直能产出 patch。
 
 **目标**：给一个真实 issue，模型能自己探索仓库、跑测试、改代码，最后产出一个 patch。
 

@@ -49,6 +49,10 @@ Control Plane (Node/TS)
 
 反过来说：如果 Agent Runtime 跑在沙箱里，沙箱一断网或一被攻破，模型调用、凭据、决策逻辑会同时失守。
 
+> **M2 的位置不变，只是包的边界变了**：循环 / 会话 / 上下文 / 工具收进独立 workspace 包
+> `packages/agent-runtime/`（纯决策层，不依赖 pg / octokit / S3），CP 是它的宿主。
+> 见 [`agent-runtime.md`](agent-runtime.md) §B.6。
+
 ---
 
 ## B. 职责边界
@@ -161,6 +165,11 @@ interface SandboxSpec {
 ```
 
 **`cmd` 是 argv 数组，没有隐式 shell。** 需要管道/通配符就自己写 `["bash","-lc","npm test | tee out.txt"]` —— 让"要 shell"成为 agent 的显式选择，而不是接口的默认行为。这一条直接消灭了命令拼接注入这一整类问题。
+
+> **M2 的 `bash` 工具与这里不冲突**：模型的入参是 shell 字符串（跟它见过的所有 coding agent 一样），
+> 由**工具层**包成 `["bash","-lc",command]` 再发下来。沙箱这一侧的契约一个字不变；
+> "要 shell" 仍然是显式的（现在是工具显式选的），而能否用管道/重定向本来就不是安全边界（§F.5）。
+> 见 [`agent-runtime.md`](agent-runtime.md) §F.2。
 
 `env` 只用于非敏感配置（`CI=1`、`HOME` 之类）。**沙箱里没有任何凭据可传**（§F.3）。
 

@@ -4,7 +4,9 @@
 >
 > 沙箱子系统的**实施规格**（Phase 拆分、测试要点、验收标准）见 [`docs/sandbox-spec.md`](docs/sandbox-spec.md)；**设计文档与取舍理由**见 [`docs/sandbox.md`](docs/sandbox.md)。
 >
-> **第一次读代码？** 从 `packages/sandbox-agent/src/index.ts`（沙箱内的执行服务入口）和 `packages/control-plane/src/provider/local-docker.ts`（CP 侧创建沙箱的那层）读起。
+> M2（环境与上下文：Agent 运行时对齐 pi · Environment 构建管线 · 仓库索引与 Repo Map · ContextCompiler · Tool Registry / Skill / MCP）的**设计文档**见 [`docs/agent-runtime.md`](docs/agent-runtime.md)，**实施规格（14 个 Phase + 工作量）**见 [`docs/agent-runtime-spec.md`](docs/agent-runtime-spec.md)。
+>
+> **第一次读代码？** 从 `packages/sandbox-agent/src/index.ts`（沙箱内的执行服务入口）和 `packages/control-plane/src/provider/local-docker.ts`（CP 侧创建沙箱的那层）读起；agent 相关从 `packages/control-plane/src/agent/loop.ts`（M0）与 `packages/agent-runtime/`（M2 起）读起。
 
 ---
 
@@ -274,13 +276,15 @@ Environment 有版本号，可 diff、可回滚。用户手动在会话里装了
 
 #### 仓库索引层（离线，增量更新）
 
-| 索引 | 技术 | 用途 |
-|---|---|---|
-| 符号索引 | tree-sitter AST | 提取函数/类/引用关系，精确跳转 |
-| 全文索引 | ripgrep + trigram | 精确字符串/正则搜索 |
-| 向量索引 | pgvector + code embedding | 语义检索（"错误处理在哪"） |
-| 依赖图 | import/call graph | 影响面分析（改了 A 会影响谁） |
-| **仓库地图** | 符号图 + PageRank | **最重要：压缩成几 K token 常驻上下文** |
+> **M2 的落地口径见 [`docs/agent-runtime.md`](docs/agent-runtime.md) §D。** 这里的分类有一处修正：**ripgrep 是工具（`grep`），不是索引**。
+
+| 索引 | 技术 | 用途 | M2 |
+|---|---|---|---|
+| 符号索引 | tree-sitter AST | 提取函数/类/引用关系，精确跳转 | ✅ |
+| 全文检索 | ripgrep（`grep` 工具，无需预建索引） | 精确字符串/正则搜索 | ✅ |
+| 依赖图 | import/call graph | 影响面分析（改了 A 会影响谁） | ⚠️ 只做文件级引用图 |
+| **仓库地图** | 符号图 + PageRank | **最重要：压缩成几 K token 常驻上下文** | ✅ 核心 |
+| 向量索引 | pgvector + code embedding | 语义检索（"错误处理在哪"） | ❌ 触发式（要先有评估集） |
 
 **仓库地图（Repo Map）是被验证过最有效的一招**（Aider 的做法）：在符号引用图上跑 PageRank，取排名最高的 N 个符号，连同它们的签名，生成一份"这个仓库长什么样"的骨架，几 K token 就能让模型有全局感。这比向量检索 RAG 更稳定，因为它给的是**结构**而不是**相关片段**。
 
@@ -290,15 +294,18 @@ Environment 有版本号，可 diff、可回滚。用户手动在会话里装了
 
 ```
 总预算 100%
-├── 系统提示 + 工具定义        15%   (固定，可缓存)
-├── 仓库地图                  15%   (半固定)
-├── 任务描述 + Plan           20%   (结构化状态)
-├── 近期对话历史              25%   (最近 N 轮，完整)
-├── 相关文件片段              15%   (按需检索 + 按需回读)
-└── 工具结果摘要              10%   (大结果外置)
+├── 工具定义 + 系统提示        ≤15%  (稳定前缀，可缓存)
+├── 仓库地图                  ≤5%   (半固定)
+├── 任务描述 + 验收要求        ≤10%  (结构化状态)
+├── 检索线索（路径 + 符号名）   ≤3%   (不做每轮自动注入)
+└── 近期对话历史              剩余   (由 compaction 管理，不做逐块驱逐)
 ```
 
-超出预算时按优先级**驱逐**，而不是报错。
+**M2 修正**：超出预算时**不驱逐**，只做两件事——**分区预算**（每块在自己的上限内截断，
+`repo_map` / `seed` 是硬上限，`system` / `task` 超了直接报错：提示词写太长是工程问题）
+和 **compaction**（整体超窗口时压缩最老的部分）。理由：驱逐的"相关性"判据不可靠，
+而每轮变化的上下文会让**提示词缓存前缀失效**、回放不再可比。
+详见 [`docs/agent-runtime.md`](docs/agent-runtime.md) §E。
 
 #### 三个关键技巧
 
@@ -306,9 +313,11 @@ Environment 有版本号，可 diff、可回滚。用户手动在会话里装了
 
 大结果永远不进上下文。工具执行结果超过阈值 → 写到沙箱文件 → 上下文里只放**摘要 + 路径 + 行数**，模型需要细节时自己 `read` 指定行范围。这一招能省掉大量 token。
 
-**② 编辑用 diff，不用全文**
+**② 编辑用片段替换，不用整文件回写**
 
-模型改文件输出 patch（unified diff）而不是整个文件重写。省 token、更准确、天然产生变更记录。
+模型给 `oldString → newString` 的**精确片段**（`edit` 工具），由工具做精确匹配替换并**生成 diff** 放进结果详情——
+而不是让模型输出 unified diff 原文（算行号与上下文太容易错，错一处整个 patch 报废），
+也不是整文件重写（费 token、容易顺手改坏别的地方）。
 
 **③ 历史压缩**
 
@@ -338,21 +347,31 @@ Environment 有版本号，可 diff、可回滚。用户手动在会话里装了
 **单一事实来源原则：内置工具、Skill、MCP 工具全部注册到同一个 Tool Registry，agent 只从这里取。** 权限、审计、UI 展示、成本归因全部统一在注册表上。
 
 ```ts
-interface ToolDef {
+// 契约形状对齐 pi 的 AgentTool（见 docs/agent-runtime.md §B.3）
+interface AgentTool<TParams, TDetails> {
   name: string
+  label: string
   description: string          // 直接影响模型调用准确率，值得反复打磨
-  schema: ZodSchema            // → JSON Schema 给模型
+  parameters: TParams          // TypeBox → JSON Schema 给模型 + 运行时校验
+  execute(id, params, signal?, onUpdate?): Promise<AgentToolResult<TDetails>>
+  replay?: 'never' | 'safe'    // 崩溃后允许不允许重放（默认 never）
+  executionMode?: 'sequential' | 'parallel'
+}
+interface ToolMeta {
   category: 'read' | 'write' | 'execute' | 'network' | 'vcs' | 'external'
   risk: 'safe' | 'caution' | 'destructive'
-  requiresApproval: PolicyRule
-  handler: (input, ctx: ToolCtx) => Promise<ToolResult>
+  requiresApproval: PolicyRule  // M2 只登记，M3 接审批流
   budget: { maxOutputBytes: number; timeoutMs: number }  // 与上下文外置联动
 }
 ```
 
+> `schema` 用 **TypeBox**（与 pi 同版本）：一份声明同时给出 TS 类型、JSON Schema（发给模型）和运行时校验。
+> M0 是手写 JSON Schema + 手写校验（两处会漂），M2 换掉。
+
 #### 工具的三个来源
 
-1. **内置工具**：文件读写、bash 执行、代码搜索、git 操作、测试执行、浏览器（Playwright）
+1. **内置工具（M2 固定 7 个，对齐 pi）**：`read` / `write` / `edit` / `grep` / `find` / `ls` / `bash`
+   （浏览器、LSP、HTTP fetch 都不在 M2；git 与测试执行走 `bash`）
 2. **Skill**：一组工具 + 提示词 + 约束的打包，粒度比工具粗（如"写单测"skill、"依赖升级"skill）
 3. **MCP 工具**：通过 Model Context Protocol 接入外部能力，动态发现
 
@@ -584,8 +603,9 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 | 沙箱（接外部用户前） | Docker + gVisor | 共享内核 → 用户态内核，性价比最高的一步 |
 | 沙箱（规模化） | K8s + gVisor | 多节点调度；CP 不再需要持有 docker socket |
 | 沙箱（需要快照时） | Firecracker | 毫秒级冷启动、跨节点恢复 |
-| 代码索引 | tree-sitter + ripgrep + pgvector | 符号 + 全文 + 语义 |
-| Agent 循环 | **自己写**（~500 行） | 循环本身很简单；框架的价值在 DAG 编排，而我们已经砍掉它 |
+| 代码索引 | tree-sitter（WASM）+ ripgrep；pgvector 触发式 | 符号 + 全文；语义检索没有评估集就不上线 |
+| 工具参数 schema | TypeBox | 一份声明给 TS 类型 / JSON Schema / 运行时校验（与 pi 同版本） |
+| Agent 循环 | **自己写**（契约对齐 pi） | 循环本身很简单；框架的价值在 DAG 编排，而我们已经砍掉它 |
 | MCP | 官方 TS SDK | 生态最全 |
 | 模型 | 多provider 抽象 | 别绑死一家；按任务类型路由（便宜模型做检索，强模型做规划） |
 
@@ -622,29 +642,45 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 
 - [ ] **不做**：云端、多用户、权限、MCP、预热池、快照、密钥代理
 
-### M1 · 云端化
+### M1 · 云端化（**已部分在 M0 完成**）
 > 目标：关掉电脑它还在跑，产出变成 PR
 
+- [x] ~~状态机 + 持久化 + 崩溃恢复 + 孤儿容器对账~~ → **M0 Phase 8 已完成**
+- [x] ~~GitHub App 集成（安装授权 + PR 创建）~~ → **M0 Phase 12 已完成**
+- [x] ~~产出 PR 而非 patch~~ → **M0 Phase 12 已完成**
 - [ ] **gVisor —— 硬门槛，接第一个外部用户之前必须完成**
 - [ ] 远程沙箱（K8s + NetworkPolicy），CP 不再持有 docker socket
-- [ ] 状态机 + 持久化 + 崩溃恢复 + 孤儿容器对账
-- [ ] GitHub App 集成（安装授权 + PR 创建）
 - [ ] 基础权限（仓库/分支范围）
-- [ ] 产出 PR 而非 patch
 - [ ] **不做**：预热池（推迟到 M3，冷启动真的成为瓶颈才做）
 
-### M2 · 环境与上下文
-> 目标：任意仓库能自动跑起来；agent 真正"懂"仓库
+> M1 真正剩下的只有**隔离强度**与**远程化**两件事。M2 可以在它之前做（两者互不依赖），
+> 但排期约束不变：**接入第一个不受信任的用户代码之前，gVisor 必须先完成。**
 
-- [ ] Environment 构建管线（三层结构）
-- [ ] devcontainer / Dockerfile 复用
-- [ ] LLM 生成 Dockerfile + 自愈循环
-- [ ] 环境缓存 + 版本化 + 健康检查
-- [ ] 仓库索引（tree-sitter + ripgrep + pgvector）
-- [ ] **仓库地图（Repo Map）**
-- [ ] ContextCompiler（预算分配 + 结果外置 + diff 编辑）
-- [ ] Tool Registry + Skill
-- [ ] MCP 接入 + 管理界面
+### M2 · 环境与上下文 ← **当前在做**
+> 目标：任意仓库能自动跑起来；agent 真正"懂"仓库
+> 设计文档：[`docs/agent-runtime.md`](docs/agent-runtime.md) · 实施规格（14 个 Phase、44–59 人日、依赖图）：[`docs/agent-runtime-spec.md`](docs/agent-runtime-spec.md)
+
+**第一部分 · Agent Runtime（对齐 pi：`/Users/reuben/Documents/pi`）**
+- [ ] P1 运行时契约与包拆分（独立 workspace `packages/agent-runtime`）
+- [ ] P2 会话持久化（entries 树 + 工具意图/结算 + usage ledger + model_requests）
+- [ ] P3 compaction（阈值 / 切点 / split turn / 结构化摘要 / 累积文件清单）
+- [ ] P4 事件统一（`AgentEvent` 唯一事件源，观察窗加上下文面板）
+
+**第二部分 · Environment**
+- [ ] P5 环境定义与推断（三层结构；devcontainer 子集 > Dockerfile > 信号）
+- [ ] P6 LLM 生成 Dockerfile + 自愈循环（≤3 轮、错误分类、成本记账）
+- [ ] P7 缓存 + 版本化 + 健康检查（ready / degraded / failed）+ promote
+
+**第三部分 · 索引与上下文**
+- [ ] P8 仓库符号索引（tree-sitter WASM + 文件级引用图 + 增量）
+- [ ] P9 **仓库地图（Repo Map）**（PageRank + 个性化 + token 预算 + 确定性）
+- [ ] P10 ContextCompiler（分区预算 + 缓存前缀 + 可回放）
+- [ ] P11 向量索引（**触发式**：先有评估报告，指标达标才上线）
+
+**第四部分 · 工具面**
+- [ ] P12 Tool Registry + 7 个内置工具（`read`/`write`/`edit`/`grep`/`find`/`ls`/`bash`）
+- [ ] P13 Skills（agentskills.io 标准 + progressive disclosure + 项目信任门）
+- [ ] P14 MCP（CP 侧客户端 + 工具白名单 + 管理界面）
 
 ### M3 · 编排与规模化
 > 目标：多任务、定时、可观测、可授权
@@ -688,7 +724,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 1. **异步优先**：一切设计服务于"用户不在时把事办成"
 2. **验证先于能力**：宁可在窄场景 90% 成功，不要宽场景 40% 成功
 3. **环境是一等公民**：不是配置项，是有生命周期的实体
-4. **上下文是编译出来的**：不是拼接出来的，有预算、有优先级、有驱逐
+4. **上下文是编译出来的**：不是拼接出来的，有分区预算、有压缩（不做逐块驱逐）
 5. **默认最小权限**：默认不出网、不给 secret、不 push
 6. **一切可回放**：模型看到了什么，必须能事后原样重现
 7. **进化必须可回滚**：没有评估集的自进化是随机游走
