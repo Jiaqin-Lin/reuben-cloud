@@ -1,28 +1,23 @@
 /**
- * `read.ts` —— 按**行**读文件（Phase 11 §3.5 的核心）。
+ * `read.ts` —— 按**行**读文件（Phase 11 §3.5 的核心；Phase 1 迁入并 Operations 化）。
  *
- * 【为什么这一层在 CP，不在沙箱】沙箱的 `GET /files` 是**字节**语义（它还要服务
- * `raw=1` 的 patch/tar/二进制），"行"只对模型有意义。所以"字节 ↔ 行"的翻译只发生在
- * 这里；沙箱不需要知道"行"是什么。
+ * 【为什么这一层在 runtime，不在执行后端】沙箱的 `GET /files` 是**字节**语义（它还要
+ * 服务 `raw=1` 的 patch/tar/二进制），"行"只对模型有意义。所以"字节 ↔ 行"的翻译只发生在
+ * 这里；沙箱不需要知道"行"是什么。Phase 1 把"文件从哪来"抽成 `ReadOperations`：
+ * 换执行后端（远程沙箱 M1、本地裸跑测试）时这一层一个字不用改。
  *
  * 【两条路径】
- *  ① 小文件（≤ 1 MiB，沙箱内联上限）：一次普通 JSON 读拿全文，本地切。
- *     它顺带是"这个文件是不是合法 UTF-8"的权威判断——二进制文件在这里拿到 400
+ *  ① 小文件（不超过后端内联上限）：一次普通读拿全文，本地切。
+ *     它顺带是"这个文件是不是合法 UTF-8"的权威判断——二进制文件在这里拿到
  *     `invalid_utf8`，而不是被解码成一片 U+FFFD 给模型看。
- *  ② 大文件：`raw=1` 的**字节窗口**（1 MiB 一个），CP 侧用 `TextDecoder(stream)` 增量
- *     解码（跨窗口的半个字符由它兜住，和 Phase 1 的输出合并器同一个套路）。
- *     为什么不走默认的 JSON 读：字节窗口会随机切在多字节字符中间，而沙箱的 utf8 读是
- *     **严格校验**的——直接 400。
+ *  ② 大文件：`readBytes` 的**字节窗口**（1 MiB 一个），本地用 `TextDecoder(stream)` 增量
+ *     解码（跨窗口的半个字符由它兜住，和沙箱的输出合并器同一个套路）。
+ *     为什么不走 ①：字节窗口会随机切在多字节字符中间，而严格校验的读会直接报错。
  *
  * 【续读锚点】大文件的第二次读（`offset=2001`）不该从字节 0 重新扫。锚点记下"这次返回的
  * **最后一行**是第几行、它的起始字节偏移是多少"，下一次 `offset=` 命中就直接从那里接着扫。
- * 没有它，读完一个 10 MB 文件是 O(n²)。
- * （§3.5 写的是"记第一行"；这里记最后一行是同一个契约下的严格改进：同样是行首，
- * 但第一次续读就能跳过整个前缀，而不是把 O(n²) 推迟一轮。见实现备注 3。）
- *
- * 【锚点什么时候失效】沙箱不返回 mtime（`GET /files` 没有这个字段），所以不用时间戳
- * 猜测，而是**穷尽失效时机**：能改文件内容的只有 `write`（失效那一个路径）与 `bash`
- * （清空整张表）。模型的全部写入口就是这两个工具。
+ * 没有它，读完一个 10 MB 文件是 O(n²)。（§3.5 写的是"记第一行"；这里记最后一行是同一个
+ * 契约下的严格改进：同样是行首，但第一次续读就能跳过整个前缀。见 `anchors.ts`。）
  *
  * 【四种收尾形态】（§3.5，测试要点 12–16 逐条验）
  *  1. 行数先到：`[Showing lines 1-2000. Use offset=2001 to continue.]`
@@ -31,10 +26,25 @@
  *  4. 第一行本身就超 50 KiB：不返回半行，返回一条能直接跑的命令。
  */
 
-import type { ToolDefinition } from "../model.ts";
+import { Type, type Static } from "typebox";
+import type { AgentTool, Content } from "../types.ts";
+import type { ReadAnchors } from "./anchors.ts";
+import { FileOperationError, ToolInputError } from "./errors.ts";
+import { resolveToolPath } from "./paths.ts";
 import { MAX_TOOL_BYTES, MAX_TOOL_LINES, formatBytes, splitLines, truncateHead } from "./truncate.ts";
-import type { ReadAnchor, ToolContext, ToolResult } from "./types.ts";
-import { asRecord, fail, ok, optionalInteger, resolveToolPath, toolFailure } from "./types.ts";
+
+/**
+ * 文件读取出口。**窄接口**：只有这两个方法，换后端不动工具逻辑。
+ *
+ * `readFile` 读不出（不存在 / 越界 / 二进制 / 太大）时抛 `FileOperationError`；
+ * `readBytes` 只按偏移取字节，不做任何解码。
+ */
+export interface ReadOperations {
+  /** 读整个文件（UTF-8）。 */
+  readFile(path: string, options?: { signal?: AbortSignal }): Promise<string>;
+  /** 读一个字节窗口。返回的字节数 < limit = 读到了文件尾。 */
+  readBytes(path: string, offset: number, limit: number, options?: { signal?: AbortSignal }): Promise<Buffer>;
+}
 
 /** 大文件的字节窗口（§3.5：一个窗口 1 MiB）。 */
 export const READ_WINDOW_BYTES = 1024 * 1024;
@@ -44,70 +54,80 @@ export const READ_WINDOW_BYTES = 1024 * 1024;
  * （minified 的 JS 就是一行几十 MB——这不是假想的情况）。
  * 到顶时抛 `LineTooLongError`：调用方要么给出那条 `sed -n` 提示，
  * 要么把这一行当成"放不下"从而停在它前面。
- *
- * 【实际的内存上界是 `MAX_LINE_BYTES + READ_WINDOW_BYTES`】检查在每个窗口之后做一次，
- * 所以一个窗口里的字节会先被吃进来。为了几 MiB 把检查拆到每个 chunk 上不值得——
- * 这个常量的作用是"别把 500 MB 的单行读进内存"，不是精确计量。
  */
 export const MAX_LINE_BYTES = 1024 * 1024;
 
-export const readTool: ToolDefinition = {
-  name: "read",
-  description:
-    "Read a text file. Output is truncated to 2000 lines or 50KB, whichever comes first. " +
-    "Use offset (1-indexed line number) and limit (max lines) for large files; " +
-    "continue with the offset printed in the truncation notice until the file is complete. " +
-    "path is relative to the repository root unless it starts with /. " +
-    "Do not use read on binary files — use bash for those.",
-  input_schema: {
-    type: "object",
-    properties: {
-      path: { type: "string", description: "File path, relative to the repository root (or absolute)." },
-      offset: { type: "integer", minimum: 1, description: "Line number to start from, 1-indexed (default 1)." },
-      limit: { type: "integer", minimum: 1, description: "Maximum number of lines to return (capped at 2000)." },
-    },
-    required: ["path"],
+const readSchema = Type.Object(
+  {
+    path: Type.String({ description: "File path, relative to the repository root (or absolute)." }),
+    offset: Type.Optional(Type.Integer({ minimum: 1, description: "Line number to start from, 1-indexed (default 1)." })),
+    limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines to return (capped at 2000)." })),
   },
-};
+  { additionalProperties: false },
+);
 
-export async function runRead(input: unknown, context: ToolContext): Promise<ToolResult> {
-  try {
-    const record = asRecord(input);
-    const absPath = resolveToolPath(record, context);
-    const offset = optionalInteger(record, "offset", { min: 1 }) ?? 1;
-    // `limit` 只能往小了调：截断发生在行数上，offset 不是解锁开关（§3.5）。
-    const rawLimit = optionalInteger(record, "limit", { min: 1 });
-    const limit = Math.min(rawLimit ?? MAX_TOOL_LINES, MAX_TOOL_LINES);
-    // 只有"模型自己传的 limit 就是天花板"时，提示才用形态 3（"还有 N 行"）。
-    const requestedLimit = rawLimit !== undefined && rawLimit <= MAX_TOOL_LINES ? rawLimit : null;
+export type ReadToolInput = Static<typeof readSchema>;
 
-    const inline = await tryInlineRead(absPath, context);
-    if (inline.kind === "error") return fail(inline.message);
-    if (inline.kind === "text") return readFromText(absPath, inline.text, offset, limit, requestedLimit);
+export interface ReadToolOptions {
+  /** 模型心里的工作目录（相对路径按它解析）。 */
+  cwd: string;
+  operations: ReadOperations;
+  /** 续读锚点表。缺省每个工具一个（一个 Run 一份）。 */
+  anchors?: ReadAnchors;
+}
 
-    return await readPaged(absPath, offset, limit, requestedLimit, context);
-  } catch (error) {
-    return toolFailure(error);
-  }
+export function createReadTool(options: ReadToolOptions): AgentTool<typeof readSchema, undefined> {
+  return {
+    name: "read",
+    label: "read",
+    description:
+      "Read a text file. Output is truncated to 2000 lines or 50KB, whichever comes first. " +
+      "Use offset (1-indexed line number) and limit (max lines) for large files; " +
+      "continue with the offset printed in the truncation notice until the file is complete. " +
+      "path is relative to the repository root unless it starts with /. " +
+      "Do not use read on binary files — use bash for those.",
+    parameters: readSchema,
+    executionMode: "parallel",
+    async execute(_toolCallId, params, signal): Promise<{ content: Content[]; details: undefined }> {
+      // 失败**抛异常**：循环把它转成 isError 结果（工具不自己编码错误，见 `AgentTool.execute`）。
+      const text = await runRead(params, options, signal);
+      return { content: [{ type: "text", text }], details: undefined };
+    },
+  };
+}
+
+/** 读的实现（从 M0 的 `runRead` 迁入；返回给模型的文本，失败抛异常）。 */
+export async function runRead(
+  input: ReadToolInput,
+  options: ReadToolOptions,
+  signal?: AbortSignal,
+): Promise<string> {
+  const absPath = resolveToolPath(input.path, options.cwd);
+  const offset = input.offset ?? 1;
+  // `limit` 只能往小了调：截断发生在行数上，offset 不是解锁开关（§3.5）。
+  const rawLimit = input.limit;
+  const limit = Math.min(rawLimit ?? MAX_TOOL_LINES, MAX_TOOL_LINES);
+  // 只有"模型自己传的 limit 就是天花板"时，提示才用形态 3（"还有 N 行"）。
+  const requestedLimit = rawLimit !== undefined && rawLimit <= MAX_TOOL_LINES ? rawLimit : null;
+
+  const inline = await readInline(absPath, options.operations, signal);
+  if (inline !== null) return readFromText(absPath, inline, offset, limit, requestedLimit);
+  return await readPaged(absPath, offset, limit, requestedLimit, options, signal);
 }
 
 // ---------------------------------------------------------------- 路径 ①：全文
 
-type InlineRead = { kind: "text"; text: string } | { kind: "too_large" } | { kind: "error"; message: string };
-
-/** 一次内联读。`too_large` 是**唯一**会走分片路径的结果（沙箱的 413）。 */
-async function tryInlineRead(absPath: string, context: ToolContext): Promise<InlineRead> {
-  const { endpoint, authToken } = context.target;
+/** 返回 null = 文件太大（走分片路径）；其余错误原样抛给调用方翻译。 */
+async function readInline(
+  absPath: string,
+  operations: ReadOperations,
+  signal: AbortSignal | undefined,
+): Promise<string | null> {
   try {
-    const file = await context.api.readFile(endpoint, authToken, absPath, { signal: context.signal });
-    return { kind: "text", text: file.content };
+    return await operations.readFile(absPath, signal === undefined ? {} : { signal });
   } catch (error) {
-    const typed = error as { agentError?: string | null };
-    if (typed.agentError === "too_large") return { kind: "too_large" };
-    if (typed.agentError === "not_found") return { kind: "error", message: `文件不存在：${absPath}` };
-    // 其余错误交给统一的翻译（越界 / 目录 / 二进制 / …）。
-    const translated = toolFailure(error);
-    return { kind: "error", message: translated.content };
+    if (error instanceof FileOperationError && error.code === "too_large") return null;
+    throw error;
   }
 }
 
@@ -118,62 +138,58 @@ function readFromText(
   offset: number,
   limit: number,
   requestedLimit: number | null,
-): ToolResult {
+): string {
   const lines = splitLines(text);
   const total = lines.length;
   if (total === 0) {
-    return offset === 1 ? ok(`(empty file: ${absPath})`) : fail(offsetBeyondMessage(offset, 0));
+    if (offset === 1) return `(empty file: ${absPath})`;
+    throw new ToolInputError(offsetBeyondMessage(offset, 0));
   }
-  if (offset > total) return fail(offsetBeyondMessage(offset, total));
+  if (offset > total) throw new ToolInputError(offsetBeyondMessage(offset, total));
 
   const slice = lines.slice(offset - 1).join("\n");
   const trimmed = truncateHead(slice, { maxLines: limit, maxBytes: MAX_TOOL_BYTES });
   if (trimmed.firstLineExceedsLimit) {
     // 全文在手：这一行的长度是**准确**的（分片路径只能给"超过多少"）。
-    return ok(firstLineTooBigNotice(offset, Buffer.byteLength(lines[offset - 1]!), absPath, "exact"));
+    return firstLineTooBigNotice(offset, Buffer.byteLength(lines[offset - 1]!), absPath, "exact");
   }
 
   const content = trimmed.content;
-  if (!trimmed.truncated) return ok(content);
+  if (!trimmed.truncated) return content;
 
   const from = offset;
   const to = offset + trimmed.outputLines - 1;
-  const notice = buildNotice({
-    from,
-    to,
-    truncatedBy: trimmed.truncatedBy,
-    requestedLimit,
-    totalLines: total,
-    absPath,
-  });
-  if (notice === null) return ok(content);
-  return ok(content === "" ? notice : `${content}\n\n${notice}`);
+  const notice = buildNotice({ from, to, truncatedBy: trimmed.truncatedBy, requestedLimit, totalLines: total, absPath });
+  if (notice === null) return content;
+  return content === "" ? notice : `${content}\n\n${notice}`;
 }
 
 // ---------------------------------------------------------------- 路径 ②：分片
+
+interface PagedOptions {
+  cwd: string;
+  operations: ReadOperations;
+  anchors?: ReadAnchors;
+}
 
 async function readPaged(
   absPath: string,
   offset: number,
   limit: number,
   requestedLimit: number | null,
-  context: ToolContext,
-): Promise<ToolResult> {
-  const anchor = context.anchors.get(absPath);
+  options: PagedOptions,
+  signal: AbortSignal | undefined,
+): Promise<string> {
+  const anchor = options.anchors?.get(absPath) ?? null;
   const usable = anchor !== null && anchor.lineNumber <= offset ? anchor : null;
   const startOffset = usable?.byteOffset ?? 0;
   const startLine = usable?.lineNumber ?? 1;
 
-  const iterator = scanLines(
-    windowReader(absPath, context),
-    startOffset,
-    startLine,
-    READ_WINDOW_BYTES,
-  );
+  const iterator = scanLines(windowReader(absPath, options.operations, signal), startOffset, startLine, READ_WINDOW_BYTES);
 
   const lines: string[] = [];
   let bytes = 0;
-  let last: ReadAnchor | null = null;
+  let last: { lineNumber: number; byteOffset: number } | null = null;
   let stoppedByBudget = false;
   let firstLineTooBig: number | null = null;
   let tooLongLine: number | null = null;
@@ -195,9 +211,7 @@ async function readPaged(
         break;
       }
       // 锚点记**最后一行**：下一次 offset 续读（最典型的读法）直接跳到那里，
-      // 不用把前面的行再扫一遍。记第一行的话，第一次续读仍然要从字节 0 走完整个前缀
-      // （spec §3.5 写的是第一行；这里选最后一行是同一个契约下的严格改进，理由见
-      // 本文件头“续读锚点”那一段）。
+      // 不用把前面的行再扫一遍。
       last = { lineNumber: scanned.number, byteOffset: scanned.byteOffset };
       lines.push(scanned.line);
       bytes += lineBytes;
@@ -205,7 +219,8 @@ async function readPaged(
     reachedEnd = !stoppedByBudget;
   } catch (error) {
     if (isDecodeError(error)) {
-      return fail(
+      throw new FileOperationError(
+        "invalid_utf8",
         `这个文件不是合法 UTF-8（二进制文件？）：${absPath}。二进制内容请用 bash 处理（head -c / xxd），不要用 read。`,
       );
     }
@@ -214,9 +229,8 @@ async function readPaged(
       //  · 它就是我们要的第一行 → 给那条能直接跑的 `sed -n` 命令；
       //  · 前面已经有内容 → 把它当成"这一行放不下"（它确实不可能装进 50 KiB），
       //    于是提示里的 `offset=N` 正好指向它，下一次读就会走到上面那个分支。
-      if (lines.length === 0) {
-        firstLineTooBig = error.bytes;
-      } else {
+      if (lines.length === 0) firstLineTooBig = error.bytes;
+      else {
         stoppedByBudget = true;
         tooLongLine = error.lineNumber;
       }
@@ -227,16 +241,16 @@ async function readPaged(
   }
 
   if (firstLineTooBig !== null) {
-    // 分片路径：长度是扫描器攒到上限时的字节数，行可能长得多——所以措辞是"over"。
-    return ok(firstLineTooBigNotice(offset, firstLineTooBig, absPath, "at-least"));
+    return firstLineTooBigNotice(offset, firstLineTooBig, absPath, "at-least");
   }
 
   // 一行都没读到 = 这次扫描一路走到了文件尾：要么 offset 超出行数，要么文件是空的。
   if (lines.length === 0) {
-    return offset === 1 ? ok(`(empty file: ${absPath})`) : fail(offsetBeyondMessage(offset, lastLineNumber));
+    if (offset === 1) return `(empty file: ${absPath})`;
+    throw new ToolInputError(offsetBeyondMessage(offset, lastLineNumber));
   }
 
-  if (last !== null) context.anchors.set(absPath, last);
+  if (last !== null) options.anchors?.set(absPath, last);
 
   const content = lines.join("\n");
   const from = offset;
@@ -246,14 +260,14 @@ async function readPaged(
   const notice = buildNotice({
     from,
     to,
-    // 行数上限、或者"下一行本身就长到装不下"→ 形态 1（措辞是中性的）；
+    // 行数上限、或者"下一行本身就长到装不下" → 形态 1（措辞是中性的）；
     // 只有真的撞上 50 KiB 预算时才用形态 2 的 `(50KB limit)`。
     truncatedBy: reachedEnd ? null : lines.length >= limit || tooLongLine !== null ? "lines" : "bytes",
     requestedLimit,
     totalLines,
     absPath,
   });
-  return ok(notice === null ? content : `${content}\n\n${notice}`);
+  return notice === null ? content : `${content}\n\n${notice}`;
 }
 
 // ---------------------------------------------------------------- 逐行扫描
@@ -267,7 +281,7 @@ export interface ScannedLine {
   byteOffset: number;
 }
 
-/** 读一个字节窗口。`eof` = 这个窗口就是文件的结尾（HTTP 分片读的短读即 EOF）。 */
+/** 读一个字节窗口。`eof` = 这个窗口就是文件的结尾（短读即 EOF）。 */
 export type WindowReader = (offset: number, limit: number) => Promise<{ bytes: Buffer; eof: boolean }>;
 
 /**
@@ -319,23 +333,11 @@ export async function* scanLines(
   if (carry !== "") yield { line: carry, number: lineNumber, byteOffset: lineStart };
 }
 
-/** 沙箱的 raw 读 → `WindowReader`。短读（返回字节数 < 请求的）就是 EOF。 */
-function windowReader(absPath: string, context: ToolContext): WindowReader {
+/** `ReadOperations.readBytes` → `WindowReader`。短读（返回字节数 < 请求的）就是 EOF。 */
+function windowReader(absPath: string, operations: ReadOperations, signal: AbortSignal | undefined): WindowReader {
   return async (offset, limit) => {
-    const { endpoint, authToken } = context.target;
-    const stream = await context.api.readRaw(endpoint, authToken, absPath, {
-      offset,
-      limit,
-      signal: context.signal,
-    });
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of stream) {
-      const buffer = chunk as Buffer;
-      chunks.push(buffer);
-      total += buffer.length;
-    }
-    return { bytes: Buffer.concat(chunks), eof: total < limit };
+    const bytes = await operations.readBytes(absPath, offset, limit, signal === undefined ? {} : { signal });
+    return { bytes, eof: bytes.length < limit };
   };
 }
 

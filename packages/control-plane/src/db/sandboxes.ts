@@ -40,6 +40,8 @@ export interface SandboxRow {
   id: string;
   task_id: string | null;
   run_id: string | null;
+  /** 归属的会话（Phase 2 起；Phase 8/9 建的行是 NULL）。 */
+  session_id: string | null;
   provider: string;
   provider_ref: string | null;
   endpoint: string | null;
@@ -119,6 +121,8 @@ export interface InsertSandboxInput {
   id: string;
   taskId?: string | null;
   runId?: string | null;
+  /** 沙箱归属的会话（Phase 2 的 `sandboxes.session_id`）。旧调用方不传 = NULL（Phase 8/9 的用法）。 */
+  sessionId?: string | null;
   provider: string;
   image: string;
   imageDigest: string;
@@ -139,13 +143,14 @@ export async function insertSandbox(db: Db, input: InsertSandboxInput): Promise<
     const row = await one<SandboxRow>(
       tx,
       `INSERT INTO sandboxes
-         (id, task_id, run_id, provider, image, image_digest, state, state_reason, limits, workspace_volume)
-       VALUES ($1, $2, $3, $4, $5, $6, 'CREATING', 'created', $7::jsonb, $8)
+         (id, task_id, run_id, session_id, provider, image, image_digest, state, state_reason, limits, workspace_volume)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'CREATING', 'created', $8::jsonb, $9)
        RETURNING *`,
       [
         input.id,
         input.taskId ?? null,
         input.runId ?? null,
+        input.sessionId ?? null,
         input.provider,
         input.image,
         input.imageDigest,

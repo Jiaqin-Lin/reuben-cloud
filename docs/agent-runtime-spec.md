@@ -1799,9 +1799,16 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 
 | # | 位置 | 原文 | 实际 | 理由 |
 |---|---|---|---|---|
-| A-1 | （初始留空，实施时追加） | | | |
-| A-2 | | | | |
-| A-3 | | | | |
+| A-1 | Phase 1 · `bash` 工具入参 | 工具收 argv 数组（`cmd`），**P11** 才改成 shell 字符串 | **P1 就改了**：工具入参是 `{command: string, cwd?, timeoutMs?}`，由 CP 适配器包成 `["bash","-lc",command]` 再发下去 | ① P1 的 spec §5 已经把 `BashOperations.exec` 定义成字符串形状（端口在 P1 落地）；② 提示词在 P1 就要重写成分区组装，顺手删掉那条"跟模型先验对抗"的规矩（设计文档 §F.2 第 1 条）比留到 P11 少一次全量迁移；③ 沙箱红线一个字没变（`POST /exec` 仍然只收 argv，注入类问题仍然不存在） | `sandbox-operations.ts` 的 `cmd: ["bash","-lc",command]`；`prompt/system.ts` 规则 1；`agent-tools` / `web-stream` 集成测试与 live 测试的调用形式；工具描述里的 argv 措辞 |
+| A-2 | Phase 1 · `list` → `ls` | **P11** 把 `list` 改名 `ls`，旧名保留一个版本作别名 | **P1 就改了**：文件 `src/tools/ls.ts`、工具名 `ls`；旧名通过 `AgentTool.aliases` 解析（模型看不到别名，只有拿旧名字调用时才命中） | ① P1 的交付物清单里写的就是 `read/write/ls/bash`；② 改名与 Operations 化是同一次搬迁，拆成两次要再动一遍所有调用点与测试 | `aliases` 是过渡期字段（下个版本删）；工具清单里只有 `ls`；`agent-runtime/test/loop.test.ts` 有一条别名用例 |
+| A-3 | Phase 1 · 重复调用守卫的提示方式 | "第 3 次注入提示"（M0 是先执行、再往同一条消息里塞一条提示块） | 第 3 次**不执行**该工具，把提示作为 `isError` 结果返回（pi 的 `beforeToolCall` → `{block:true}` 语义）；第 4 次 block + `terminate` | 已经知道它是重复，就没有理由再跑一遍（对 `bash` 这种有副作用的工具尤其明显）；提示仍然进同一条消息，模型看到的东西不变 | 阈值与"连续"语义没变；`REPEAT_NOTICE` 文案没变；守卫仍然挂在 `beforeToolCall`（测试要点 10 的原话） |
+| A-4 | Phase 2 · `sessions` 表 | 只有 `sandbox_id` / `sandbox_last_used_at` | 多加两列：`sandbox_flush_failures` / `sandbox_flush_failed_at` | 规则 3（"落地失败 → 不销毁，标 flush_failed，下个周期重试"）需要一个"不销毁沙箱、又能被下一轮看见"的标记。放 `sandboxes.state = ERROR` 不行：§D 里 ERROR 没有出边，标了它这个沙箱就再也回不到 READY——一次网络抖动会被升级成"必须人工处理"。放在会话上是诚实的：失败的是"这次会话的落地" | 005 迁移；租约的两个计数读写；不影响既有四张表 |
+| A-5 | Phase 2 · `SessionStore` 接口 | 14 个方法，`settleToolInvocation` 返回 `void` | 多 5 个方法（`setSessionSandbox` / `touchSession` / `acquireSessionLock` / `releaseSessionLock` / `interruptInvocation` / `listRequests`——具体见 `store.ts`），`settleToolInvocation` 返回结果 entry id | ① 租约要写 `sessions` 的沙箱字段，续轮要抢锁——这些是 P2 §5/§6 明文要求的动作，没有对应端口就只能让编排直接拼 SQL（那就破了"纯决策层"的边界）；② 结果 entry 的 id 是 leaf 的下一跳，`void` 会让编排只能先猜一个 id 再传进去（等于把预留机制废掉） | `store.ts`、`memory.ts`、`postgres.ts`、契约测试；PG 实现仍然是唯一的 SQL 出处 |
+| A-6 | Phase 2 · `model_requests` 的对象 key | `requests/{session_id}/{turn}.json.gz` | `requests/{session_id}/{run_id}/{turn}.json.gz` | `turn` 只在**一次执行内**唯一；同一个会话的第二轮 Run 会覆写第一轮的输入，P10 的回放会直接拿到错的上下文。多一段 `run_id` 之后 key 与"entries 挂会话、run 标段落"是同一套结构 | `requests.ts` 的 `requestObjectKey`；导出读取器；测试 5 |
+| A-7 | Phase 2 · JSONL 导出的字段 | 与 M0 `transcript.jsonl` 逐字段兼容 | 记录类型与字段名逐条对齐，但 M0 独有的字段（`run_start.limits`、`request.tools` / `maxTokens`、`run_end.detail`）**如实为 `null`** | 这些值在 P2 的表里没有列（`tools` 只有 hash，`detail` 只在实时 transcript 里有）。拿一个相近的值蒙混会让排查脚本读到一个"看起来有但是错的"字段——那比 `null` 贵得多。P10 的 ContextCompiler 会把 `tools` / 分区补齐，届时这些字段自然有值 | `export.ts`；测试要点 6 的断言方式（断言字段名在、**不**断言值非空） |
+| A-8 | Phase 2 · `sandboxes` 表 | 设计文档 §G.1："既有三张表一行不改" | 加一列 `session_id`（spec P2 §1 就是这么写的），并加了 `(session_id, last_active_at)` 索引 | 沙箱从"某次执行的附属品"变成"某个会话的工作区"（设计文档 §A.1 的第 2 条规则）。既有行 `session_id` 为 NULL，对账/状态机/sweeper 的语义一个字没变——这是**加列**，不是改结构 | 005 迁移；`SandboxRow`；`manager.createSandbox` 多一个可选 `sessionId`；持久层"列清单"测试同步加了这一列 |
+| A-9 | Phase 2 · 目标目录 | `session/{store,memory,entries,export}` + CP 的 `session/{postgres,requests,sandbox-lease}` | 多三个文件：`session/entry-recorder.ts`、`session/session-run.ts`、`session/provision.ts` | ① "事件 → entries / intent / usage"必须只有一份实现：会话编排（多轮）与 `agent:run`（单轮手工验收）都要它；② `sandbox-lease.ts` 要能在没有 Docker / git / 网络时被完整测到（测试要点 11–20 全是这一类），所以"建沙箱 / 落地"这两个真动作拆到 `provision.ts`（端口注入），租约只留策略 | 纯新增，不影响既有文件；集成测试只跑 `provision.ts` 的真路径 |
+| A-10 | Phase 2 · `AgentLoopOptions` | P1 的兼容入口只有 `onText` / `events` | 多四个口：`onAgentEvent` / `onRequest` / `history` / `prompts` | ① 会话层要**原生事件**（`events` 是 M0 的观察窗词汇，P4 才统一）才能写 entries 与结算 intent；② `model_requests` 要"真的发给模型的东西"，它只存在于 `transformContext` 里；③ 多轮必须有"这一轮之前的历史"与"本次注入的消息"两个独立的口——否则续轮要么丢历史、要么把任务书重复注入每轮 | `run.ts`（兼容层，P4 删）；`session-run.ts`；`agent:run` 脚本；P1 的测试没受影响（都是可选项） |
 
 **已经预知的两条偏差**（实施时必须确认并回填）：
 
@@ -1809,6 +1816,10 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
   实施时把 prompt / `sandbox.md` / README 的措辞一起改掉，并在 A 表里记一条；
 - **`list` 改名 `ls`**：模型对 `ls` 的先验更强，旧名保留一个版本作为别名（`dispatch` 层兼容），
   下个版本删掉。
+
+> **两条都在 P1 落地并回填（见 A-1 / A-2）**，而不是留到 P11：Operations 化与提示词重写
+> 都在 P1，改名与缩写形态是同一批改动的一部分；拆成两批只会让每个调用点被改两遍。
+> 沙箱侧契约（`POST /exec` 只收 argv）**一个字没改**，两条偏差都只发生在工具层。
 
 ---
 

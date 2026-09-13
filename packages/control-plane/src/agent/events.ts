@@ -26,7 +26,7 @@
 import type { SseEvent } from "../client/sse.ts";
 import type { LogFn } from "../log.ts";
 import { noopLog } from "../log.ts";
-import type { Usage } from "./model.ts";
+import type { Usage } from "@reuben-cloud/agent-runtime";
 
 // ---------------------------------------------------------------- 事件
 

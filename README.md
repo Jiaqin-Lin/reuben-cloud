@@ -679,8 +679,8 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 > 设计文档：[`docs/agent-runtime.md`](docs/agent-runtime.md) · 实施规格（13 个 Phase、43–58 人日、依赖图）：[`docs/agent-runtime-spec.md`](docs/agent-runtime-spec.md)
 
 **第一部分 · Agent Runtime（对齐 pi：`/Users/reuben/Documents/pi`）**
-- [ ] P1 运行时契约与包拆分（独立 workspace `packages/agent-runtime`；`handleUserMessage` 与 `steer` 两个入口）
-- [ ] P2 会话持久化 + **沙箱租约**（20 句讨论 0 个容器；干活后同一会话只建 1 个；按需建 / 热着复用 / 空闲回收 / 回收前落地）
+- [x] P1 运行时契约与包拆分（独立 workspace `packages/agent-runtime`：契约 `types.ts` / `EventStream` / **双层循环**（逐条对齐 pi 的 `agent-loop.ts`：steering、follow-up、`executionMode`、`length` 截断保护、`before/afterToolCall`）/ 预算与重复检测搬进钩子（`limits.ts`）/ 流式模型客户端（Anthropic + DeepSeek 兼容端点）/ 工具 **Operations 化**（窄口注入 + TypeBox 参数）/ 提示词分区组装；CP 侧 `agent/` 只剩编排与兼容层——`runAgentLoop(options)` 签名不变，新增 `handleUserMessage` / `steer` 两个入口（P1 内存锁）与沙箱适配器 `sandbox-operations.ts`；`agent-runtime/test/` 68 个用例覆盖 spec 的 13 条测试要点，真沙箱集成测试全绿）
+- [x] P2 会话持久化 + **沙箱租约**（`005_agent_runtime.sql` 六张表：`sessions`（长期）/ `runs`（一次执行）/ `session_entries`（只追加的对话树）/ `tool_invocations`（intent→结算）/ `usage_ledger` / `model_requests`；`SessionStore` 抽象 + 内存与 Postgres 两个实现跑**同一份契约测试**；会话级沙箱租约（按需建 / 热着复用 / 30 分钟沉默回收 / 6h 换容器 / 回收前落地、失败不销毁）；`handleUserMessage` 编排（PG 条件更新抢锁 → 读 entries 重建历史 → 懒建沙箱 → 跑 → 释放锁）与 `agent:run --session/--export` 接线；`agent-runtime/test/session-store.test.ts` + CP 的 `sandbox-lease` / `session-run` / `session-export` 单测，Postgres 契约（含 kill -9 停在 intent）进 `npm run test:integration`）
 - [ ] P3 compaction（阈值 / 切点 / split turn / 结构化摘要 / 累积文件清单）
 - [ ] P4 事件统一（`AgentEvent` 唯一事件源，观察窗改成会话视图 + 上下文面板）
 
@@ -827,6 +827,35 @@ npm run agent:run -- --local ~/code/my-project --issue "..." --serve
 （或者 `GITHUB_APP_PRIVATE_KEY` 内联 PEM；相对路径按进程 cwd → 仓库根依次找）；`--no-draft` 可以关掉默认的 draft。
 建完 GitHub App 之后用 `npm run app:installations` 查 installation id 并核对三个权限（只读 API）；
 把私钥放在仓库根时记得别改 `.env` 里的路径——它已经被 `.gitignore` 拦住了（`*.pem`）。
+
+### 会话与沙箱租约（Phase 2）
+
+M0 的 `agent:run` 是"一句话 = 一个沙箱"。Phase 2 起沙箱是**会话的工作区**：
+
+- **会话**（`sessions`）是长期实体，用户的对话历史（`session_entries`）挂在它下面；
+  **一次执行**（`runs`）只是"这一句话的处理过程"。同一个会话可以连续跑很多次。
+- 沙箱**用到才建**：只讨论不碰代码的一句，一个容器都不会起；碰了之后热着复用，
+  沉默 30 分钟才回收（回收前先把改动推上任务分支，推不上去就不销毁）。
+- 同一个会话同时只有一次执行在跑，第二个请求直接拒（`session_busy`，不是排队）。
+
+```bash
+# 新建一个会话（脚本默认）：跑完会打印 session id
+npm run agent:run -- --local ~/code/my-project --issue "先看看登录是怎么实现的"
+# 续用同一个会话（从任务分支 head 接上，历史也接上）
+npm run agent:run -- --session ses_01H... --local ~/code/my-project --issue "按你说的改掉"
+# 导出整个会话的 JSONL（跨 Run；兼容原来那份 transcript 的记录类型）
+npm run agent:run -- --session ses_01H... --export /tmp/session.jsonl --issue "..."
+```
+
+手工脚本仍是**单轮**的（它跑完会销毁沙箱）；多轮 + 热复用走的是 `handleUserMessage`
+（`packages/control-plane/src/session/session-run.ts`），它才是产品路径的入口。
+表结构见 `packages/control-plane/src/db/migrations/005_agent_runtime.sql`。
+
+两道时间闸都有缺省值，需要时用环境变量改（`packages/control-plane/src/session/sandbox-lease.ts`）：
+`REUBEN_CLOUD_SESSION_IDLE_TTL_MS`（默认 30 分钟：连续多久没动作才回收）、
+`REUBEN_CLOUD_SANDBOX_MAX_LIFETIME_MS`（默认 6 小时：容器最多活多久，到点换容器不砍任务）、
+`REUBEN_CLOUD_SANDBOX_MAX_LIFETIME_GRACE_MS`（默认 30 分钟：寿命到点还在跑时等它干完的宽限）、
+`REUBEN_CLOUD_SESSION_FLUSH_RETRIES`（默认 3：回收前落地连续失败几次后走归档兜底）。
 
 所有变量都有合理缺省（不配也能跑）：`REUBEN_CLOUD_DB_IMAGE / _NAME / _PORT / _PASSWORD`、`REUBEN_CLOUD_MINIO_IMAGE / _PORT / _CONSOLE_PORT / _USER / _PASSWORD / _BUCKET`、`REUBEN_CLOUD_MC_IMAGE`。
 

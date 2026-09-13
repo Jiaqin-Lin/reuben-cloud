@@ -36,7 +36,7 @@ export const DEFAULT_TAR_PATH = "/workspace/repo.tar.gz";
 
 /**
  * 解包目标。**缺省是 workspace 根**（Phase 9 的口径）；Phase 11 起 agent 流程传
- * `/workspace/repo`（`agent/prompt.ts` 的 `REPO_DIR`），工具层与提示词都按那个路径说话。
+ * `/workspace/repo`（agent-runtime 的 `prompt/system.ts` 的 `REPO_DIR`），工具层与提示词都按那个路径说话。
  */
 export const DEFAULT_WORKSPACE_DIR = "/workspace";
 

@@ -24,12 +24,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
-import type { ContentBlock, ModelClient, ModelResponse } from "../../src/agent/model.ts";
+import type { AssistantMessageEventStream, Content, ModelClient } from "@reuben-cloud/agent-runtime";
+import { createAssistantMessageEventStream } from "@reuben-cloud/agent-runtime";
 import type { RunEvent, RunEventSink } from "../../src/agent/events.ts";
-import { runAgentLoop } from "../../src/agent/loop.ts";
+import { runAgentLoop } from "../../src/agent/run.ts";
 import { Transcript } from "../../src/agent/transcript.ts";
-import { REPO_DIR } from "../../src/agent/prompt.ts";
-import { createToolkit } from "../../src/agent/tools/index.ts";
+import { REPO_DIR } from "@reuben-cloud/agent-runtime";
+import { createSandboxToolkit } from "../../src/agent/sandbox-operations.ts";
 import { SandboxApiClient } from "../../src/client/sandbox-api.ts";
 import { Db } from "../../src/db/client.ts";
 import { runMigrations } from "../../src/db/migrate.ts";
@@ -202,19 +203,41 @@ function markerOf(event: RunEvent): string {
 }
 
 /** 脚本化模型：第一轮跑一条会失败的命令，第二轮收工。 */
+/** 两轮脚本：先跑一次 bash（shell 字符串），再收工。 */
 class ScriptedModel implements ModelClient {
+  readonly provider = "scripted";
   readonly model = "scripted-integration";
   #calls = 0;
 
-  async create(): Promise<ModelResponse> {
+  stream(): AssistantMessageEventStream {
     this.#calls += 1;
+    const stream = createAssistantMessageEventStream();
     const usage = { inputTokens: 10, outputTokens: 5, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
-    if (this.#calls === 1) {
-      const toolUse: ContentBlock = { type: "tool_use", id: "tu_1", name: "bash", input: { cmd: ["node", "test.js"] } };
-      return { content: [{ type: "text", text: "先跑测试看看" }, toolUse], stopReason: "tool_use", usage, refusalReason: null };
-    }
-    return { content: [{ type: "text", text: "跑完了" }], stopReason: "end_turn", usage, refusalReason: null };
+    void Promise.resolve().then(() => {
+      if (this.#calls === 1) {
+        const call = { type: "toolCall" as const, id: "tu_1", name: "bash", arguments: { command: "node test.js" } };
+        const message = { role: "assistant" as const, content: [textBlock("先跑测试看看"), call], usage, stopReason: "toolUse" as const };
+        stream.push({ type: "start", partial: { ...message, stopReason: undefined } });
+        stream.push({ type: "text_start", contentIndex: 0, partial: { ...message } });
+        stream.push({ type: "text_delta", contentIndex: 0, delta: "先跑测试看看", partial: { ...message } });
+        stream.push({ type: "text_end", contentIndex: 0, content: "先跑测试看看", partial: { ...message } });
+        stream.push({ type: "toolcall_end", contentIndex: 1, toolCall: call, partial: { ...message } });
+        stream.push({ type: "done", reason: "toolUse", message });
+        return;
+      }
+      const message = { role: "assistant" as const, content: [textBlock("跑完了")], usage, stopReason: "stop" as const };
+      stream.push({ type: "start", partial: { ...message, stopReason: undefined } });
+      stream.push({ type: "text_start", contentIndex: 0, partial: { ...message } });
+      stream.push({ type: "text_delta", contentIndex: 0, delta: "跑完了", partial: { ...message } });
+      stream.push({ type: "text_end", contentIndex: 0, content: "跑完了", partial: { ...message } });
+      stream.push({ type: "done", reason: "stop", message });
+    });
+    return stream;
   }
+}
+
+function textBlock(value: string): Content {
+  return { type: "text", text: value };
 }
 
 // ---------------------------------------------------------------- 用例
@@ -258,17 +281,18 @@ describe("Phase 13 · 真沙箱里的一次 Run 实时流", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       const transcript = await Transcript.create({ runId });
-      const toolkit = createToolkit({
+      const toolkit = createSandboxToolkit({
         sandboxId: sandbox.sandboxId,
         exec: manager,
         api,
         target,
+        repoDir: REPO_DIR,
         events: sink,
         log: () => undefined,
       });
       const result = await runAgentLoop({
         model: new ScriptedModel(),
-        tools: toolkit,
+        tools: toolkit.tools,
         transcript,
         issue: "跑一遍测试",
         events: sink,

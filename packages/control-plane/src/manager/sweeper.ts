@@ -18,6 +18,10 @@
  *
  * 【只扫候选状态】DESTROYED 不在候选里（已经不需要销毁了）。ERROR 在：
  * 一个反复销毁失败的沙箱要靠下一轮 TTL 重试（这也是自愈的一部分）。
+ *
+ * 【Phase 2 起多了一步：先跑会话租约】会话持有的沙箱由租约回收（它会先落地再销毁），
+ * 通用 TTL 这一轮看到的"会话沙箱"直接跳过。两者共用一个 60 秒定时器——
+ * 两个定时器只会让"谁先跑"变成一个偶发的竞态。
  */
 
 import type { Db } from "../db/client.ts";
@@ -26,6 +30,7 @@ import type { SandboxRow } from "../db/sandboxes.ts";
 import type { LogFn } from "../log.ts";
 import { noopLog } from "../log.ts";
 import type { SandboxManager } from "./sandbox-manager.ts";
+import type { LeaseReport } from "../session/sandbox-lease.ts";
 
 /** 扫描间隔（§Phase 8 §4：每 60 秒扫一次）。 */
 export const SWEEP_INTERVAL_MS = 60_000;
@@ -44,6 +49,12 @@ export interface SandboxSweeperOptions {
   batchSize?: number;
   /** TTL 到点、销毁之前调用的钩子（可选）。抛异常 = 这一轮不销毁。生产归档见文件头。 */
   archive?: (sandbox: SandboxRow) => Promise<void>;
+  /**
+   * 会话级的沙箱租约（Phase 2）。**先跑它、再跑通用 TTL**：租约回收会先落地
+   * （取 diff → apply → push）再销毁，而通用 TTL 不会。会话持有的沙箱在租约这一轮
+   * 被看到时不进 TTL 的候选——否则就是把"先落地"这条规则绕过去。
+   */
+  sessionLease?: { reapIdle(): Promise<LeaseReport> };
   /** 可注入的时钟（测试用）。 */
   now?: () => Date;
   log?: LogFn;
@@ -55,6 +66,10 @@ export interface SweepReport {
   archived: string[];
   destroyed: string[];
   failures: Array<{ sandboxId: string; message: string }>;
+  /** 这一轮跳过的、由会话租约持有的沙箱（见 `sessionLease`）。 */
+  skippedSessionOwned: string[];
+  /** 租约那一轮的回收报告（配了才非空）。 */
+  sessionLease: LeaseReport | null;
 }
 
 export class SandboxSweeper {
@@ -64,6 +79,7 @@ export class SandboxSweeper {
   readonly #intervalMs: number;
   readonly #batchSize: number;
   readonly #archive: ((sandbox: SandboxRow) => Promise<void>) | undefined;
+  readonly #sessionLease: { reapIdle(): Promise<LeaseReport> } | undefined;
   readonly #now: () => Date;
   readonly #log: LogFn;
 
@@ -76,6 +92,7 @@ export class SandboxSweeper {
     this.#intervalMs = options.intervalMs ?? SWEEP_INTERVAL_MS;
     this.#batchSize = options.batchSize ?? 50;
     this.#archive = options.archive;
+    this.#sessionLease = options.sessionLease;
     this.#now = options.now ?? (() => new Date());
     this.#log = options.log ?? noopLog;
   }
@@ -86,7 +103,32 @@ export class SandboxSweeper {
    * 单个沙箱的失败只记进报告：一轮里有一个归档失败，不该让其余过期的沙箱继续占着资源。
    */
   async sweepOnce(): Promise<SweepReport> {
-    const report: SweepReport = { scanned: 0, archived: [], destroyed: [], failures: [] };
+    const report: SweepReport = {
+      scanned: 0,
+      archived: [],
+      destroyed: [],
+      failures: [],
+      skippedSessionOwned: [],
+      sessionLease: null,
+    };
+
+    // ① 会话租约先跑：它会把"真闲着的会话沙箱"落地 + 销毁，并交回本轮它看到的
+    //    所有会话沙箱 id。这些 id 不进制 TTL 的候选（规则 3：必须先落地再销毁）。
+    const held = new Set<string>();
+    if (this.#sessionLease !== undefined) {
+      try {
+        const leaseReport = await this.#sessionLease.reapIdle();
+        report.sessionLease = leaseReport;
+        for (const sandboxId of leaseReport.heldSandboxIds) held.add(sandboxId);
+      } catch (error) {
+        // 租约那一轮整体失败不该弄死通用 TTL（它是安全兜底）。
+        report.failures.push({ sandboxId: "-", message: `会话租约回收失败：${error instanceof Error ? error.message : String(error)}` });
+        this.#log("error", "会话租约回收这一轮失败", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     const expired = await listExpiredSandboxes(this.#db, {
       defaultTtlSec: this.#defaultTtlSec,
       now: this.#now(),
@@ -95,7 +137,11 @@ export class SandboxSweeper {
     report.scanned = expired.length;
 
     for (const sandbox of expired) {
-      // ① 归档（Phase 10 才有实现）。失败 → 这一轮不销毁。
+      if (held.has(sandbox.id)) {
+        report.skippedSessionOwned.push(sandbox.id);
+        continue;
+      }
+      // ② 归档（Phase 10 才有实现）。失败 → 这一轮不销毁。
       if (this.#archive !== undefined) {
         try {
           await this.#archive(sandbox);
@@ -107,7 +153,7 @@ export class SandboxSweeper {
           continue;
         }
       }
-      // ② 销毁 + 转 DESTROYED。manager 负责审计与幂等。
+      // ③ 销毁 + 转 DESTROYED。manager 负责审计与幂等。
       try {
         await this.#manager.destroySandbox(sandbox.id, "ttl_expired");
         report.destroyed.push(sandbox.id);

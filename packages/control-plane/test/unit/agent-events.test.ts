@@ -1,30 +1,32 @@
 /**
- * Phase 13 · 事件词汇与埋点（不需要网络、模型、Docker）。
+ * Phase 13 · 事件词汇与埋点（不需要网络、模型、Docker）；Phase 1 迁到新契约上。
  *
  * 两件事在这里被验到：
  *  ① 沙箱事件 → RunEvent 的映射（`createExecEventMapper`）：字段名从 snake_case 翻过来、
  *     `executionId` 靠 `started` 事件补上、认不出的事件变成 note 而不是异常。
- *  ② 循环与工具真的在发事件：脚本化模型跑一次 → 事件序列与顺序（`tool_call` 必须在
- *     `tool_result` 之前、`text` 必须在它后面的 `tool_call` 之前）；真 `bash` 工具配一个
- *     假 exec 出口 → `exec_start` / `exec_output` / `exec_end` 真的发得出来。
+ *  ② **兼容层真的在发事件**：脚本化模型跑一次 → 事件序列与顺序（`tool_call` 必须在
+ *     `tool_result` 之前）；真 `bash` 工具配一个假 exec 出口 → `exec_start` /
+ *     `exec_output` / `exec_end` 真的发得出来。
  *
- * 这两条合起来才是"打开页面能看到一次 Run 的实时流"在**没有浏览器**时的可断言形式。
+ * 【Phase 1 的变化】模型侧从"返回一条完整响应"变成"流式事件"（`AgentEvent` 是唯一真相）；
+ * CP 的 `runAgentLoop(options)` 仍然是入口，它把循环事件翻成 M0 的 `RunEvent`（P4 会把这个
+ * 映射表变成正式协议）。所以这里的断言基本没变——变的是**假模型**与**工具装配**的写法。
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { after, before, describe, test } from "node:test";
+import type { AgentTool, AssistantMessageEventStream, Content, ModelClient, ModelRequest } from "@reuben-cloud/agent-runtime";
+import { createAssistantMessageEventStream, emptyUsage } from "@reuben-cloud/agent-runtime";
 import type { RunEvent, RunEventSink } from "../../src/agent/events.ts";
 import { createExecEventMapper, mapExecEvent } from "../../src/agent/events.ts";
-import { runAgentLoop } from "../../src/agent/loop.ts";
-import type { ContentBlock, ModelClient, ModelRequest, ModelResponse } from "../../src/agent/model.ts";
-import { ModelError } from "../../src/agent/model.ts";
+import { runAgentLoop } from "../../src/agent/run.ts";
+import type { ExecPort, SandboxFilesPort, ToolExecResult } from "../../src/agent/sandbox-operations.ts";
+import { createSandboxToolkit } from "../../src/agent/sandbox-operations.ts";
 import { Transcript } from "../../src/agent/transcript.ts";
-import { createToolkit } from "../../src/agent/tools/index.ts";
-import type { ExecPort, SandboxFilesPort, ToolExecResult } from "../../src/agent/tools/types.ts";
 import type { SseEvent } from "../../src/client/sse.ts";
 import { noopLog } from "../../src/log.ts";
 
@@ -56,45 +58,81 @@ function sse(event: string, data: unknown): SseEvent {
   return { id: "1", event, data: JSON.stringify(data) };
 }
 
-function text(value: string): ContentBlock {
+function typesOf(events: readonly RunEvent[]): string[] {
+  return events.map((event) => event.type);
+}
+
+function textBlock(value: string): Content {
   return { type: "text", text: value };
 }
 
-function toolUse(id: string, name: string, input: unknown): ContentBlock {
-  return { type: "tool_use", id, name, input };
-}
-
-function usage(): ModelResponse["usage"] {
-  return { inputTokens: 100, outputTokens: 10, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
-}
-
-/** 按脚本回答的模型；脚本用完之后一直 end_turn（免得忘了写终止条件）。 */
-class ScriptedModel implements ModelClient {
-  readonly model = "scripted-test";
-  readonly #script: Array<ModelResponse | ((request: ModelRequest) => ModelResponse)>;
-  #calls = 0;
-
-  constructor(script: Array<ModelResponse | ((request: ModelRequest) => ModelResponse)>) {
-    this.#script = script;
-  }
-
-  async create(request: ModelRequest): Promise<ModelResponse> {
-    this.#calls += 1;
-    const step = this.#script[this.#calls - 1];
-    if (step === undefined) {
-      return { content: [text("（脚本用完了）")], stopReason: "end_turn", usage: usage(), refusalReason: null };
+/** 一步脚本：文本（含增量）。 */
+function say(value: string, stopReason: "stop" | "toolUse" = "stop") {
+  return (stream: AssistantMessageEventStream): void => {
+    const message = { role: "assistant" as const, content: [textBlock("")], usage: emptyUsage() };
+    stream.push({ type: "start", partial: { ...message } });
+    stream.push({ type: "text_start", contentIndex: 0, partial: { ...message } });
+    for (const chunk of [value.slice(0, 2), value.slice(2)]) {
+      message.content = [textBlock((message.content[0] as { text: string }).text + chunk)];
+      stream.push({ type: "text_delta", contentIndex: 0, delta: chunk, partial: { ...message } });
     }
-    return typeof step === "function" ? step(request) : step;
-  }
+    message.content = [textBlock(value)];
+    stream.push({ type: "text_end", contentIndex: 0, content: value, partial: { ...message } });
+    const final = { ...message, stopReason };
+    stream.push({ type: "done", reason: stopReason, message: final });
+  };
 }
+
+/** 一步脚本：一个工具调用。 */
+function callTool(id: string, name: string, args: Record<string, unknown>) {
+  return (stream: AssistantMessageEventStream): void => {
+    const call = { type: "toolCall" as const, id, name, arguments: args };
+    const message = { role: "assistant" as const, content: [call], usage: emptyUsage() };
+    stream.push({ type: "start", partial: { ...message } });
+    stream.push({ type: "toolcall_start", contentIndex: 0, id, name, partial: { ...message } });
+    stream.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(args), partial: { ...message } });
+    stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: call, partial: { ...message } });
+    const final = { ...message, stopReason: "toolUse" as const };
+    stream.push({ type: "done", reason: "toolUse", message: final });
+  };
+}
+
+/** 按脚本回答的模型。脚本用完之后的请求返回一条 stop。 */
+function scriptedModel(steps: Array<(stream: AssistantMessageEventStream) => void>): ModelClient {
+  let calls = 0;
+  return {
+    provider: "scripted",
+    model: "scripted-test",
+    stream(_request: ModelRequest): AssistantMessageEventStream {
+      const stream = createAssistantMessageEventStream();
+      const step = steps[calls] ?? say("（脚本用完了）");
+      calls += 1;
+      void Promise.resolve().then(() => step(stream));
+      return stream;
+    },
+  };
+}
+
+const UNUSED = (): never => {
+  throw new Error("这个用例不该走这条出口");
+};
 
 async function newTranscript(): Promise<Transcript> {
   seq += 1;
   return Transcript.create({ runId: `run_evt_${seq}`, path: path.join(workDir, `t-${seq}.jsonl`) });
 }
 
-function typesOf(events: readonly RunEvent[]): string[] {
-  return events.map((event) => event.type);
+/** 一个只会返回固定结果的假工具（循环的埋点测试用）。 */
+function stubTool(name: string, content = "ok"): AgentTool {
+  return {
+    name,
+    label: name,
+    description: name,
+    parameters: { type: "object" },
+    async execute() {
+      return { content: [textBlock(content)], details: {} };
+    },
+  };
 }
 
 // ---------------------------------------------------------------- 映射
@@ -102,7 +140,9 @@ function typesOf(events: readonly RunEvent[]): string[] {
 describe("Phase 13 · 沙箱事件 → RunEvent", () => {
   test("started 带来 executionId 与命令，后面的输出事件借用它", () => {
     const map = createExecEventMapper();
-    const started = map(sse("started", { execution_id: "exe_1", pid: 42, cwd: "/workspace/repo", cmd: ["npm", "test"] }));
+    const started = map(
+      sse("started", { execution_id: "exe_1", pid: 42, cwd: "/workspace/repo", cmd: ["npm", "test"] }),
+    );
     assert.deepEqual(started, [
       { type: "exec_start", executionId: "exe_1", cmd: ["npm", "test"], cwd: "/workspace/repo" },
     ]);
@@ -146,7 +186,6 @@ describe("Phase 13 · 沙箱事件 → RunEvent", () => {
       sse("truncated", { reason: "output_limit", limit: 1024, log_path: "/tmp/reuben-cloud/exec/exe_1.log" }),
       { executionId: "exe_1" },
     );
-    assert.equal(events.length, 1);
     const event = events[0]!;
     assert.equal(event.type, "note");
     assert.equal(event.type === "note" ? event.kind : null, "exec_truncated");
@@ -182,35 +221,32 @@ describe("Phase 13 · 沙箱事件 → RunEvent", () => {
 
 // ---------------------------------------------------------------- 循环埋点
 
-describe("Phase 13 · 循环发出来的事件", () => {
+describe("Phase 13 · 兼容层发出来的事件", () => {
   test("一次带工具调用的 Run：run_start → turn → tool_call → tool_result → turn → run_end", async () => {
     const sink = collectingSink();
     const transcript = await newTranscript();
-    const model = new ScriptedModel([
-      { content: [text("先跑一下命令"), toolUse("tu_1", "bash", { cmd: ["echo", "hi"] })], stopReason: "tool_use", usage: usage(), refusalReason: null },
-      { content: [text("好了")], stopReason: "end_turn", usage: usage(), refusalReason: null },
-    ]);
-    const toolkit = {
-      definitions: [],
-      async run(name: string) {
-        return { content: `ok:${name}`, isError: false };
-      },
-    };
+    const model = scriptedModel([callTool("tu_1", "bash", { command: "echo hi" }), say("好了")]);
 
     const result = await runAgentLoop({
       model,
-      tools: toolkit,
+      tools: [stubTool("bash")],
       transcript,
       issue: "跑一条命令",
       events: sink,
-      // 调用方把 onText 接到 sink 上（`scripts/agent-run.ts` 就是这么接的）：
-      // 循环本身不碰文字通道，免得同一个增量被发两遍。
       onText: (delta) => sink.emit({ type: "text", delta }),
-      // 脚本化模型不调 onText，这里手动模拟两段增量。
-      ...{},
+      log: noopLog,
     });
 
-    assert.deepEqual(typesOf(sink.events), ["run_start", "turn", "tool_call", "tool_result", "turn", "run_end"]);
+    assert.deepEqual(typesOf(sink.events), [
+      "run_start",
+      "turn",
+      "tool_call",
+      "tool_result",
+      "turn",
+      "text",
+      "text",
+      "run_end",
+    ]);
     const runStart = sink.events[0]!;
     assert.equal(runStart.type === "run_start" ? runStart.model : null, "scripted-test");
     assert.equal(runStart.type === "run_start" ? runStart.issue : null, "跑一条命令");
@@ -220,55 +256,31 @@ describe("Phase 13 · 循环发出来的事件", () => {
       { turn: 1, name: "bash" },
     );
     const toolResult = sink.events[3]!;
-    assert.equal(toolResult.type === "tool_result" ? toolResult.content : null, "ok:bash");
+    assert.equal(toolResult.type === "tool_result" ? toolResult.content : null, "ok");
     assert.equal(toolResult.type === "tool_result" ? toolResult.isError : null, false);
-    const runEnd = sink.events[5]!;
+    const runEnd = sink.events.at(-1)!;
     assert.equal(runEnd.type === "run_end" ? runEnd.ok : null, true);
     assert.equal(runEnd.type === "run_end" ? runEnd.turns : null, 2);
     assert.equal(runEnd.type === "run_end" ? runEnd.toolCalls : null, 1);
     assert.equal(result.ok, true);
+
+    // transcript 的三条记录用的是同一个轮次号（曾经因为 turn_start 已经加过而错位）。
+    const records = (await readFile(transcript.path, "utf8"))
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const turnsOf = (type: string): unknown[] => records.filter((record) => record["type"] === type).map((record) => record["turn"]);
+    assert.deepEqual(turnsOf("request"), [1, 2]);
+    assert.deepEqual(turnsOf("response"), [1, 2]);
+    assert.deepEqual(turnsOf("tool_call"), [1]);
   });
 
-  test("文字增量与工具调用之间的顺序由调用方决定，且事件里不带 turn（归组靠 turn 事件）", async () => {
+  test("文字增量通过 onText 接到事件流上（唯一的高频通道）", async () => {
     const sink = collectingSink();
     const transcript = await newTranscript();
-    const model = new ScriptedModel([
-      {
-        content: [text("我先说一句")],
-        stopReason: "tool_use",
-        usage: usage(),
-        refusalReason: null,
-      },
-    ]);
-    // 上面这一轮 stopReason=tool_use 但没有 tool_use 块 → incomplete_response 终态。
     await runAgentLoop({
-      model,
-      tools: { definitions: [], async run() { return { content: "ok", isError: false }; } },
-      transcript,
-      issue: "x",
-      events: sink,
-      onText: (delta) => sink.emit({ type: "text", delta }),
-    });
-    assert.deepEqual(typesOf(sink.events), ["run_start", "turn", "note", "run_end"]);
-    const end = sink.events.at(-1)!;
-    assert.equal(end.type === "run_end" ? end.stopReason : null, "incomplete_response");
-  });
-
-  test("模型吐文字时，调用方的 onText 是真的接到事件流上的（Phase 13 复用 Phase 11 的那条回调）", async () => {
-    const sink = collectingSink();
-    const transcript = await newTranscript();
-    // 模型**主动调** onText（真模型是 SDK 的流回调让它响的，这里手动模拟）。
-    const model: ModelClient = {
-      model: "chatty",
-      async create(request: ModelRequest) {
-        request.onText?.("你好");
-        request.onText?.("，世界");
-        return { content: [text("你好，世界")], stopReason: "end_turn", usage: usage(), refusalReason: null };
-      },
-    };
-    await runAgentLoop({
-      model,
-      tools: { definitions: [], async run() { return { content: "ok", isError: false }; } },
+      model: scriptedModel([say("你好，世界")]),
+      tools: [],
       transcript,
       issue: "x",
       events: sink,
@@ -281,22 +293,50 @@ describe("Phase 13 · 循环发出来的事件", () => {
     );
   });
 
-  test("模型报错：一条 note（kind=model_error）+ run_end（stopReason=model_error）", async () => {
+  test("stopReason=tool_use 但没有工具调用 → incomplete_response（注意 model_error 也一样如实报）", async () => {
     const sink = collectingSink();
     const transcript = await newTranscript();
-    const failing: ModelClient = {
-      model: "broken",
-      async create() {
-        throw new ModelError("unreachable", "连不上模型服务");
-      },
-    };
     await runAgentLoop({
-      model: failing,
-      tools: { definitions: [], async run() { return { content: "ok", isError: false }; } },
+      model: scriptedModel([
+        (stream) => {
+          // 一轮"说了话但没有工具调用、也不是正常收尾"。
+          const message = { role: "assistant" as const, content: [textBlock("我说了话")], usage: emptyUsage(), stopReason: "length" as const };
+          stream.push({ type: "start", partial: { ...message } });
+          stream.push({ type: "done", reason: "length", message });
+        },
+      ]),
+      tools: [],
       transcript,
       issue: "x",
       events: sink,
     });
+    const end = sink.events.at(-1)!;
+    assert.equal(end.type === "run_end" ? end.stopReason : null, "incomplete_response");
+  });
+
+  test("模型报错：一条 note（kind=model_error）+ run_end（stopReason=model_error）", async () => {
+    const sink = collectingSink();
+    const transcript = await newTranscript();
+    const failing: ModelClient = {
+      provider: "scripted",
+      model: "broken",
+      stream(): AssistantMessageEventStream {
+        const stream = createAssistantMessageEventStream();
+        const message = {
+          role: "assistant" as const,
+          content: [],
+          usage: emptyUsage(),
+          stopReason: "error" as const,
+          errorMessage: "连不上模型服务",
+        };
+        void Promise.resolve().then(() => {
+          stream.push({ type: "start", partial: { ...message, stopReason: undefined } });
+          stream.push({ type: "error", reason: "error", error: message });
+        });
+        return stream;
+      },
+    };
+    await runAgentLoop({ model: failing, tools: [], transcript, issue: "x", events: sink });
     const note = sink.events.find((event) => event.type === "note");
     assert.equal(note?.type === "note" ? note.kind : null, "model_error");
     const end = sink.events.at(-1)!;
@@ -307,20 +347,26 @@ describe("Phase 13 · 循环发出来的事件", () => {
     const sink = collectingSink();
     const transcript = await newTranscript();
     // 永远返回同一个工具调用 → 撞上 REPEAT_NOTICE_THRESHOLD / STOP_THRESHOLD。
-    const model: ModelClient = {
+    let calls = 0;
+    const loopy: ModelClient = {
+      provider: "scripted",
       model: "loopy",
-      async create() {
-        return {
-          content: [toolUse("tu_same", "bash", { cmd: ["ls"] })],
-          stopReason: "tool_use",
-          usage: usage(),
-          refusalReason: null,
-        };
+      stream(): AssistantMessageEventStream {
+        const stream = createAssistantMessageEventStream();
+        const call = { type: "toolCall" as const, id: `tu_${calls}`, name: "bash", arguments: { command: "ls" } };
+        calls += 1;
+        const message = { role: "assistant" as const, content: [call], usage: emptyUsage(), stopReason: "toolUse" as const };
+        void Promise.resolve().then(() => {
+          stream.push({ type: "start", partial: { ...message } });
+          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: call, partial: { ...message } });
+          stream.push({ type: "done", reason: "toolUse", message });
+        });
+        return stream;
       },
     };
     const result = await runAgentLoop({
-      model,
-      tools: { definitions: [], async run() { return { content: "ok", isError: false }; } },
+      model: loopy,
+      tools: [stubTool("bash")],
       transcript,
       issue: "x",
       events: sink,
@@ -335,8 +381,8 @@ describe("Phase 13 · 循环发出来的事件", () => {
   test("观察者抛异常不会弄死 Run（旁路就是旁路）", async () => {
     const transcript = await newTranscript();
     const result = await runAgentLoop({
-      model: new ScriptedModel([{ content: [text("完事")], stopReason: "end_turn", usage: usage(), refusalReason: null }]),
-      tools: { definitions: [], async run() { return { content: "ok", isError: false }; } },
+      model: scriptedModel([say("完事")]),
+      tools: [],
       transcript,
       issue: "x",
       events: {
@@ -356,18 +402,11 @@ describe("Phase 13 · bash 把沙箱事件转发出去", () => {
     const sink = collectingSink();
     const exec: ExecPort = {
       async execInSandbox(_sandboxId, request) {
-        request.onEvent?.(sse("started", { execution_id: "exe_9", pid: 7, cwd: "/workspace/repo", cmd: ["echo", "hi"] }));
+        request.onEvent?.(sse("started", { execution_id: "exe_9", pid: 7, cwd: "/workspace/repo", cmd: ["bash", "-lc", "echo hi"] }));
         request.onEvent?.(sse("stdout", { chunk: "hi\n" }));
         request.onEvent?.(sse("stderr", { chunk: "warn\n" }));
         request.onEvent?.(
-          sse("completed", {
-            exit_code: 0,
-            duration_ms: 8,
-            stdout_bytes: 3,
-            stderr_bytes: 5,
-            truncated: false,
-            log_path: null,
-          }),
+          sse("completed", { exit_code: 0, duration_ms: 8, stdout_bytes: 3, stderr_bytes: 5, truncated: false, log_path: null }),
         );
         return {
           executionId: "exe_9",
@@ -383,26 +422,25 @@ describe("Phase 13 · bash 把沙箱事件转发出去", () => {
         } satisfies ToolExecResult;
       },
     };
-    const unused = (): never => {
-      throw new Error("这个用例不该走文件 API");
-    };
     const api = {
-      readFile: unused,
-      listFiles: unused,
-      putFile: unused,
+      readFile: UNUSED,
+      listFiles: UNUSED,
+      putFile: UNUSED,
       readRaw: () => Promise.resolve(Readable.from([])),
+      kill: UNUSED,
     } as unknown as SandboxFilesPort;
 
-    const toolkit = createToolkit({
+    const toolkit = createSandboxToolkit({
       sandboxId: "sbx_test",
       exec,
       api,
       target: { endpoint: "http://x", authToken: "t", sandboxId: "sbx_test" },
+      repoDir: "/workspace/repo",
       events: sink,
       log: noopLog,
     });
-    const result = await toolkit.run("bash", { cmd: ["echo", "hi"] });
-    assert.equal(result.isError, false);
+    const bash = toolkit.tools.find((tool) => tool.name === "bash")!;
+    const result = await bash.execute("call_1", { command: "echo hi" } as never);
 
     assert.deepEqual(typesOf(sink.events), ["exec_start", "exec_output", "exec_output", "exec_end"]);
     const start = sink.events[0]!;
@@ -412,12 +450,14 @@ describe("Phase 13 · bash 把沙箱事件转发出去", () => {
     const end = sink.events[3]!;
     assert.equal(end.type === "exec_end" ? end.exitCode : null, 0);
     assert.equal(end.type === "exec_end" ? end.state : null, "completed");
+    // 命令原文被包成 `bash -lc` 发下去（偏差 A-1）。
+    assert.deepEqual((result.content[0] as { text: string }).text.includes("hi"), true);
   });
 
   test("没有 sink 时工具照常工作（观察窗不是必需品）", async () => {
     const exec: ExecPort = {
       async execInSandbox(_sandboxId, request) {
-        request.onEvent?.(sse("started", { execution_id: "exe_1", cmd: ["echo"], cwd: "/workspace" }));
+        request.onEvent?.(sse("started", { execution_id: "exe_1", cmd: ["bash", "-lc", "echo"], cwd: "/workspace" }));
         return {
           executionId: "exe_1",
           state: "completed",
@@ -432,14 +472,16 @@ describe("Phase 13 · bash 把沙箱事件转发出去", () => {
         } satisfies ToolExecResult;
       },
     };
-    const toolkit = createToolkit({
+    const toolkit = createSandboxToolkit({
       sandboxId: "sbx_test",
       exec,
       api: {} as unknown as SandboxFilesPort,
       target: { endpoint: "http://x", authToken: "t", sandboxId: "sbx_test" },
+      repoDir: "/workspace/repo",
       log: noopLog,
     });
-    const result = await toolkit.run("bash", { cmd: ["echo"] });
-    assert.equal(result.isError, false);
+    const bash = toolkit.tools.find((tool) => tool.name === "bash")!;
+    const result = await bash.execute("call_1", { command: "echo" } as never);
+    assert.equal((result.content[0] as { text: string }).text.includes("no output"), true);
   });
 });

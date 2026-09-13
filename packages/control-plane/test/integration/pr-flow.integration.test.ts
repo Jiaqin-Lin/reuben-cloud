@@ -31,9 +31,9 @@ import type { RepoClone } from "../../src/repo/clone.ts";
 import { injectRepo } from "../../src/repo/inject.ts";
 import { branchNameForTask } from "../../src/repo/push.ts";
 import type { SandboxTarget } from "../../src/repo/types.ts";
-import { REPO_DIR } from "../../src/agent/prompt.ts";
+import { REPO_DIR } from "@reuben-cloud/agent-runtime";
 import { finishRun } from "../../src/agent/run.ts";
-import type { AgentLoopResult } from "../../src/agent/loop.ts";
+import type { AgentLoopResult } from "../../src/agent/run.ts";
 import {
   CleanupRegistry,
   createGitFixtureRepo,

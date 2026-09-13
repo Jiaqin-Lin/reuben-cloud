@@ -35,17 +35,10 @@ import { LocalDockerProvider } from "../../src/provider/local-docker.ts";
 import { forwardContainerName, sandboxContainerName } from "../../src/provider/types.ts";
 import { cloneRepo, removeRunDir } from "../../src/repo/clone.ts";
 import { injectRepo } from "../../src/repo/inject.ts";
-import { modelFromEnv, selectProvider } from "../../src/agent/model.ts";
-import { runAgentLoop } from "../../src/agent/loop.ts";
+import { modelFromEnv, selectProvider, toolErrorMessage, REPO_DIR, buildSystemPrompt } from "@reuben-cloud/agent-runtime";
+import { runAgentLoop } from "../../src/agent/run.ts";
 import { Transcript } from "../../src/agent/transcript.ts";
-import { REPO_DIR, buildSystemPrompt } from "../../src/agent/prompt.ts";
-import { createToolkit } from "../../src/agent/tools/index.ts";
-import { createReadAnchors } from "../../src/agent/tools/types.ts";
-import type { ToolContext } from "../../src/agent/tools/types.ts";
-import { runBash } from "../../src/agent/tools/bash.ts";
-import { runList } from "../../src/agent/tools/list.ts";
-import { runRead } from "../../src/agent/tools/read.ts";
-import { runWrite } from "../../src/agent/tools/write.ts";
+import { createSandboxToolkit } from "../../src/agent/sandbox-operations.ts";
 import {
   CleanupRegistry,
   deleteSandboxRows,
@@ -143,7 +136,31 @@ let runId = "";
 let sandboxId = "";
 let endpoint = "";
 let authToken = "";
-let context: ToolContext;
+let toolkit: ReturnType<typeof createSandboxToolkit>;
+
+/**
+ * 调一个工具并归一成 M0 的 `{content, isError}` 形状。
+ * 【为什么在测试里做这一层】工具契约变了：`execute()` 失败要**抛异常**（循环负责转成
+ * isError 结果），而这份测试想直接断言"工具在这一步失败了吗"。包一层比在 20 个断言里
+ * 各写一次 try/catch 清楚。
+ */
+async function callTool(name: string, input: unknown): Promise<{ content: string; isError: boolean }> {
+  const tool = toolkit.tools.find((candidate) => candidate.name === name);
+  assert.ok(tool !== undefined, `没有 ${name} 工具`);
+  try {
+    const result = await tool.execute(`test_${name}`, input as never);
+    return {
+      content: result.content
+        .filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
+        .map((block) => block.text)
+        .join(""),
+      isError: false,
+    };
+  } catch (error) {
+    // 与循环同一条翻译（越界 → "路径越界：…"），否则这里会比生产路径更"原始"。
+    return { content: toolErrorMessage(error), isError: true };
+  }
+}
 
 before(async () => {
   if (!(await dockerAvailable())) {
@@ -185,15 +202,14 @@ before(async () => {
   });
   assert.equal(injected.headSha, fixture.baseSha);
 
-  context = {
+  toolkit = createSandboxToolkit({
     sandboxId,
     exec: manager,
     api,
     target: { endpoint, authToken, sandboxId },
     repoDir: REPO_DIR,
-    anchors: createReadAnchors(),
     log: () => undefined,
-  };
+  });
 });
 
 after(async () => {
@@ -208,30 +224,30 @@ after(async () => {
 
 describe("Phase 11 · 工具在真沙箱里", () => {
   test("list → read → write → bash：修好一个失败的测试", async () => {
-    const listing = await runList({ path: "." }, context);
+    const listing = await callTool("ls", { path: "." });
     assert.equal(listing.isError, false, listing.content);
     assert.equal(listing.content.includes("package.json"), true, listing.content);
     assert.equal(listing.content.includes("src/"), true, listing.content);
 
-    const before = await runRead({ path: "src/math.js" }, context);
+    const before = await callTool("read", { path: "src/math.js" });
     assert.equal(before.isError, false);
     // 行式读的返回值不带末尾换行（行被 join 起来），所以比对 trimEnd 之后的内容。
     assert.equal(before.content, BUGGY_MATH.trimEnd());
 
     // 先跑一次失败的命令：非 0 退出不是 is_error，但模型能看到 [exit 1] 与错误正文。
-    const failing = await runBash({ cmd: ["node", "test.js"], cwd: "src/.." }, context);
+    const failing = await callTool("bash", { command: "node test.js", cwd: "src/.." });
     assert.equal(failing.isError, false, failing.content);
     assert.equal(failing.content.includes("FAIL: add(2, 3) = -1"), true, failing.content);
     assert.equal(failing.content.includes("[exit 1]"), true, failing.content);
 
-    const written = await runWrite({ path: "src/math.js", content: FIXED_MATH }, context);
+    const written = await callTool("write", { path: "src/math.js", content: FIXED_MATH });
     assert.equal(written.isError, false, written.content);
     assert.match(written.content, /^Wrote 31 bytes \(1 line\) to \/workspace\/repo\/src\/math\.js/);
 
-    const after = await runRead({ path: "src/math.js" }, context);
+    const after = await callTool("read", { path: "src/math.js" });
     assert.equal(after.content, FIXED_MATH.trimEnd());
 
-    const passing = await runBash({ cmd: ["node", "test.js"] }, context);
+    const passing = await callTool("bash", { command: "node test.js" });
     assert.equal(passing.isError, false, passing.content);
     assert.equal(passing.content.includes("ok"), true, passing.content);
     assert.equal(passing.content.includes("[exit"), false, passing.content);
@@ -243,7 +259,7 @@ describe("Phase 11 · 工具在真沙箱里", () => {
   });
 
   test("bash 大输出：tail + 从 exec 日志按 offset 续读", async () => {
-    const result = await runBash({ cmd: ["seq", "1", "3000"] }, context);
+    const result = await callTool("bash", { command: "seq 1 3000" });
     assert.equal(result.isError, false, result.content);
     const noticeAt = result.content.indexOf("\n\n[");
     assert.ok(noticeAt > 0, "3000 行应当被截断");
@@ -256,17 +272,17 @@ describe("Phase 11 · 工具在真沙箱里", () => {
 
     // 从日志里读回开头——`Full output` 那条路径在真沙箱里真的能走通。
     const logPath = /Full output: (\S+)\]/.exec(notice)![1]!;
-    const head = await runRead({ path: logPath, offset: 1, limit: 3 }, context);
+    const head = await callTool("read", { path: logPath, offset: 1, limit: 3 });
     assert.equal(head.isError, false, head.content);
     assert.equal(head.content.startsWith("1\n2\n3"), true, head.content);
   });
 
   test("越界路径在真沙箱里被拒，错误翻译成人话", async () => {
-    const outside = await runRead({ path: "/etc/passwd" }, context);
+    const outside = await callTool("read", { path: "/etc/passwd" });
     assert.equal(outside.isError, true);
     assert.match(outside.content, /越界/);
 
-    const writeOutside = await runWrite({ path: "/tmp/pwn.txt", content: "x" }, context);
+    const writeOutside = await callTool("write", { path: "/tmp/pwn.txt", content: "x" });
     assert.equal(writeOutside.isError, true);
     assert.match(writeOutside.content, /越界/);
   });
@@ -325,17 +341,16 @@ describe("Phase 11 · 真模型跑一遍（RUN_LIVE_AGENT=1 才跑）", () => {
       // 把前面红线用例换掉的哨兵换回真 key（见 liveRealKey 的注释）。
       process.env[liveKeyEnv] = liveRealKey;
       // 把 fixture 恢复到"测试失败"的状态，让模型有活可干。
-      const reset = await runWrite({ path: "src/math.js", content: BUGGY_MATH }, context);
+      const reset = await callTool("write", { path: "src/math.js", content: BUGGY_MATH });
       assert.equal(reset.isError, false, reset.content);
 
       const transcript = await Transcript.create({
         runId: "run_live_agent",
         path: path.join(tempRoot, "transcript-live.jsonl"),
       });
-      const toolkit = createToolkit({ sandboxId, exec: manager, api, target: { endpoint, authToken, sandboxId } });
       const result = await runAgentLoop({
         model: modelFromEnv(),
-        tools: toolkit,
+        tools: toolkit.tools,
         transcript,
         system: buildSystemPrompt(),
         issue:
@@ -346,7 +361,7 @@ describe("Phase 11 · 真模型跑一遍（RUN_LIVE_AGENT=1 才跑）", () => {
       });
 
       assert.equal(result.ok, true, `${result.stopReason}: ${result.detail}`);
-      const fixed = await runBash({ cmd: ["node", "test.js"] }, context);
+      const fixed = await callTool("bash", { command: "node test.js" });
       assert.equal(fixed.content.includes("ok"), true, fixed.content);
 
       const diff = await api.diff(endpoint, authToken, { base: "HEAD", path: REPO_DIR });

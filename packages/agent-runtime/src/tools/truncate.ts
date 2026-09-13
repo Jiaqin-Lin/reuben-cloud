@@ -1,8 +1,8 @@
 /**
- * `truncate.ts` —— 工具输出的硬预算（Phase 11 §3.5）。
+ * `truncate.ts` —— 工具输出的硬预算（Phase 11 §3.5，Phase 1 原样迁入 agent-runtime）。
  *
  * 【为什么单独一个文件、而不是每个工具各切各的】"任何 tool_result 都不会超过
- * 2000 行 / 50 KiB"是一条**全局**性质：四个工具、以及将来加的工具都必须满足它。
+ * 2000 行 / 50 KiB"是一条**全局**性质：每个工具、以及将来加的工具都必须满足它。
  * 各写一份的结果是某天 `write` 的返回值里多了一行没被切掉的 diff，而那条性质
  * 只有在某个模型的上下文爆掉时才有人察觉。
  *
@@ -51,9 +51,7 @@ export interface TruncateResult {
   firstLineExceedsLimit: boolean;
 }
 
-/**
- * 数行数。空串是 0 行，末尾的换行不额外算一行（见文件头的行号契约）。
- */
+/** 数行数。空串是 0 行，末尾的换行不额外算一行（见文件头的行号契约）。 */
 export function countLines(text: string): number {
   return splitLines(text).length;
 }
@@ -66,7 +64,7 @@ export function splitLines(text: string): string[] {
   return lines;
 }
 
-/** 保开头：`read` 与 `list` 用。模型要的就是"从这一行往后"的内容。 */
+/** 保开头：`read` 与 `ls` 用。模型要的就是"从这一行往后"的内容。 */
 export function truncateHead(text: string, options: TruncateOptions = {}): TruncateResult {
   const maxLines = options.maxLines ?? MAX_TOOL_LINES;
   const maxBytes = options.maxBytes ?? MAX_TOOL_BYTES;
@@ -90,8 +88,7 @@ export function truncateHead(text: string, options: TruncateOptions = {}): Trunc
     bytes += lineBytes;
   }
 
-  const firstLineExceedsLimit =
-    kept.length === 0 && lines.length > 0 && Buffer.byteLength(lines[0]!) > maxBytes;
+  const firstLineExceedsLimit = kept.length === 0 && lines.length > 0 && Buffer.byteLength(lines[0]!) > maxBytes;
 
   return {
     content: kept.join("\n"),

@@ -31,11 +31,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, describe, test } from "node:test";
-import { modelFromEnv, selectProvider } from "../../src/agent/model.ts";
-import { runAgentLoop } from "../../src/agent/loop.ts";
+import { modelFromEnv, selectProvider } from "@reuben-cloud/agent-runtime";
+import type { AgentTool } from "@reuben-cloud/agent-runtime";
+import { Type } from "@reuben-cloud/agent-runtime";
+import { runAgentLoop } from "../../src/agent/run.ts";
 import { Transcript } from "../../src/agent/transcript.ts";
-import type { AgentToolkit } from "../../src/agent/tools/index.ts";
-import type { ToolResult } from "../../src/agent/tools/types.ts";
 
 /** 环境里有哪套凭据。`null` = 一处都没说，这一层整层跳过。 */
 const selection = selectProvider(process.env);
@@ -47,54 +47,44 @@ after(async () => {
 });
 
 /**
- * 一个只有两个工具的假工具箱：`read` 固定返回一段内容，`bash` 固定返回一行结果。
+ * 一个只有两个工具的假工具集：`read` 固定返回一段内容，`bash` 固定返回一行结果。
  * 它不模拟沙箱，只让模型有一次真实的 tool_use 往返。
  */
-function stubToolkit(): AgentToolkit & { calls: string[] } {
+function stubTools(): { tools: AgentTool[]; calls: string[] } {
   const calls: string[] = [];
-  return {
-    calls,
-    definitions: [
-      {
-        name: "read",
-        description: "Read a file from the repository. Output is truncated to 2000 lines or 50KB.",
-        input_schema: {
-          type: "object",
-          properties: { path: { type: "string" } },
-          required: ["path"],
-        },
-      },
-      {
-        name: "bash",
-        description: 'Run an argv command (array, not a shell string), e.g. ["npm","test"].',
-        input_schema: {
-          type: "object",
-          properties: { cmd: { type: "array", items: { type: "string" } } },
-          required: ["cmd"],
-        },
-      },
-    ],
-    async run(name, input): Promise<ToolResult> {
-      calls.push(name);
-      if (name === "read") {
-        return { content: "export const MAGIC = 41;\n", isError: false };
-      }
-      void input;
-      return { content: "MAGIC + 1 = 42\n[exit 0]", isError: false };
+  const read: AgentTool = {
+    name: "read",
+    label: "read",
+    description: "Read a file from the repository. Output is truncated to 2000 lines or 50KB.",
+    parameters: Type.Object({ path: Type.String() }, { additionalProperties: false }),
+    async execute() {
+      calls.push("read");
+      return { content: [{ type: "text", text: "export const MAGIC = 41;\n" }], details: {} };
     },
   };
+  const bash: AgentTool = {
+    name: "bash",
+    label: "bash",
+    description: "Run a shell command, e.g. `npm test 2>&1 | tail -5`.",
+    parameters: Type.Object({ command: Type.String() }, { additionalProperties: false }),
+    async execute() {
+      calls.push("bash");
+      return { content: [{ type: "text", text: "MAGIC + 1 = 42\n[exit 0]" }], details: {} };
+    },
+  };
+  return { tools: [bash, read], calls };
 }
 
 describe("Phase 11 · live（@live，默认跳过）", () => {
   test("真模型：工具往返 + 多轮缓存命中 + transcript 完整", { skip: live ? false : "没有模型凭据（DEEPSEEK_API_KEY 或 ANTHROPIC_API_KEY）" }, async () => {
     workDir = await mkdtemp(path.join(os.tmpdir(), "rc-live-"));
     const transcript = await Transcript.create({ runId: "run_live_1", path: path.join(workDir, "transcript.jsonl") });
-    const toolkit = stubToolkit();
+    const toolkit = stubTools();
     const model = modelFromEnv();
     const modelName = model.model;
     const result = await runAgentLoop({
       model,
-      tools: toolkit,
+      tools: toolkit.tools,
       transcript,
       issue:
         "请读一遍 src/magic.ts（用 read 工具），然后用 bash 跑一条命令算一下 MAGIC + 1 是多少，" +

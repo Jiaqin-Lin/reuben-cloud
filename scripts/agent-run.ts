@@ -34,6 +34,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
@@ -48,12 +49,18 @@ import { cloneRepo, removeRunDir } from "../packages/control-plane/src/repo/clon
 import { githubCloneUrl, GithubAppCredentials, parseRepoRef } from "../packages/control-plane/src/repo/github-app.ts";
 import { injectRepo } from "../packages/control-plane/src/repo/inject.ts";
 import { OctokitPullRequestApi } from "../packages/control-plane/src/repo/pr.ts";
-import { maxTokensFromEnv, modelFromEnv } from "../packages/control-plane/src/agent/model.ts";
-import { runAgentLoop } from "../packages/control-plane/src/agent/loop.ts";
+import { maxTokensFromEnv, modelFromEnv, buildContextEntries, exportSession } from "@reuben-cloud/agent-runtime";
+import type { AgentMessage, StoredSession } from "@reuben-cloud/agent-runtime";
+import { runAgentLoop } from "../packages/control-plane/src/agent/run.ts";
 import { finishRun, taskIdForIssue } from "../packages/control-plane/src/agent/run.ts";
 import { Transcript } from "../packages/control-plane/src/agent/transcript.ts";
-import { REPO_DIR, buildSystemPrompt } from "../packages/control-plane/src/agent/prompt.ts";
-import { createToolkit } from "../packages/control-plane/src/agent/tools/index.ts";
+import { PostgresSessionStore } from "../packages/control-plane/src/session/postgres.ts";
+import { RequestRecorder } from "../packages/control-plane/src/session/requests.ts";
+import { EntryRecorder } from "../packages/control-plane/src/session/entry-recorder.ts";
+import { runStatusFor } from "../packages/control-plane/src/session/session-run.ts";
+import { branchNameForTask } from "../packages/control-plane/src/repo/push.ts";
+import { REPO_DIR, buildSystemPrompt } from "@reuben-cloud/agent-runtime";
+import { createSandboxToolkit } from "../packages/control-plane/src/agent/sandbox-operations.ts";
 import { RunHub } from "../packages/control-plane/src/web/hub.ts";
 import type { WebServer } from "../packages/control-plane/src/web/server.ts";
 import { startWebServer } from "../packages/control-plane/src/web/server.ts";
@@ -79,6 +86,10 @@ interface Args {
   serve: boolean;
   port: number | null;
   maxTurns: number;
+  /** 续用已有会话（Phase 2 的会话是长期实体；不给就新建一个）。 */
+  session: string | null;
+  /** 导出整个会话的 JSONL（跨 Run，兼容 M0 的 transcript 记录类型）。 */
+  exportPath: string | null;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -98,6 +109,8 @@ function parseArgs(argv: string[]): Args {
     serve: false,
     port: null,
     maxTurns: 40,
+    session: null,
+    exportPath: null,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const current = argv[index]!;
@@ -159,6 +172,12 @@ function parseArgs(argv: string[]): Args {
       case "--keep":
         args.keep = true;
         break;
+      case "--session":
+        args.session = next();
+        break;
+      case "--export":
+        args.exportPath = next();
+        break;
       case "--help":
       case "-h":
         printUsage();
@@ -195,6 +214,8 @@ function printUsage(): void {
   --base-branch <名>    PR 的 base（默认问 GitHub / 本地取当前分支）
   --no-draft            PR 不用 draft（默认 draft）
   --max-turns <n>       轮数上限（默认 40）
+  --session <id>        续用已有会话（默认新建；续用会从会话的分支 head 接上）
+  --export <文件>       把整个会话导出成 JSONL（跨 Run；--keep 时默认导出一份）
   --serve               同时起本地观察窗（SSE 实时 transcript，默认 127.0.0.1:8787）
   --port <n>            观察窗端口（默认 8787；--serve 才有意义）
   --keep                跑完不销毁沙箱（排障用）
@@ -298,70 +319,160 @@ async function main(): Promise<void> {
     log,
   });
 
-  const sandbox = await manager.createSandbox({ runId });
+  // ---- Phase 2：会话存储。脚本是**单轮的手工验收驱动**，但它落的账与产品路径
+  // （`handleUserMessage`）是同一套表——不然"手工跑能落库"就只是一句空话。
+  const sessionStore = new PostgresSessionStore(db);
+  const requests = new RequestRecorder({ store: sessionStore, artifactStore: store, log });
+  const api = new SandboxApiClient();
+
+  // ---- clone（**先于沙箱**：会话需要一个起点 commit，沙箱要从它灌）
+  const remote =
+    args.local === null
+      ? { url: githubCloneUrl(ref!), token: await freshToken() }
+      : { url: path.resolve(args.local), token: null };
+  const branch = branchNameForTask(taskId);
+
+  // 续用已有会话：从它当前的分支 head 接上（不是原始 base——这正是热复用/重建的语义）。
+  const resumed = args.session === null ? null : await requireSession(sessionStore, args.session);
+  const baseCommit =
+    resumed !== null
+      ? (resumed.headCommit ?? resumed.baseCommit)
+      : args.base ??
+        (args.local === null
+          ? "HEAD"
+          : (await hostGit(["rev-parse", "HEAD"], path.resolve(args.local))).trim());
+  const clone = await cloneRepo({
+    runId,
+    url: remote.url,
+    commit: baseCommit,
+    token: remote.token,
+    log: (level, message, details) => log(level, message, details),
+  });
+  log("info", `仓库已 clone（base ${clone.baseSha.slice(0, 12)}）`, { dir: clone.dir });
+
+  const session =
+    resumed !== null
+      ? resumed
+      : await requireSession(
+          sessionStore,
+          (
+            await sessionStore.createSession({
+              repoKey:
+                ref === null ? `local/${path.basename(path.resolve(args.local!))}` : `${ref.owner}/${ref.repo}`,
+              baseCommit: clone.baseSha,
+              cwd: REPO_DIR,
+              taskId,
+              headRef: branch,
+              headCommit: clone.baseSha,
+              title: firstLine(args.issue),
+            })
+          ).id,
+        );
+  log("info", `会话就绪：${session.id}${resumed === null ? "（新建）" : "（续用）"}`, {
+    baseCommit: clone.baseSha,
+    headCommit: session.headCommit,
+  });
+
+  // ---- 沙箱。归属**会话**（`sandboxes.session_id`）。
+  const sandbox = await manager.createSandbox({
+    runId,
+    sessionId: session.id,
+    ...(session.taskId === null ? {} : { taskId: session.taskId }),
+  });
+  await sessionStore.setSessionSandbox(session.id, { sandboxId: sandbox.sandboxId, at: new Date() });
   log("info", `沙箱就绪：${sandbox.sandboxId}`, { endpoint: sandbox.endpoint });
   const target = { endpoint: sandbox.endpoint!, authToken: sandbox.authToken!, sandboxId: sandbox.sandboxId };
 
   let patchPath: string | null = null;
   let summary: string | null = null;
+  let exportPath: string | null = null;
+  let writtenLeaf: string | null = session.leafEntryId;
   try {
-    // ---- clone
-    const remote =
-      args.local === null
-        ? { url: githubCloneUrl(ref!), token: await freshToken() }
-        : { url: path.resolve(args.local), token: null };
-    const base =
-      args.base ??
-      (args.local === null
-        ? "HEAD"
-        : (await hostGit(["rev-parse", "HEAD"], path.resolve(args.local))).trim());
-    const clone = await cloneRepo({
-      runId,
-      url: remote.url,
-      commit: base,
-      token: remote.token,
-      log: (level, message, details) => log(level, message, details),
-    });
-    log("info", `仓库已 clone（base ${clone.baseSha.slice(0, 12)}）`, { dir: clone.dir });
-
     // ---- 灌进沙箱（仓库落在 /workspace/repo：工具层与提示词都按这个路径说话）
     // 【workspaceDir 必须显式传】它缺省是 workspace 根，而 Phase 11 起工具层的相对路径
     // 按 `REPO_DIR`（/workspace/repo）解析、`GET /diff?path=` 也只看那里。不传的话仓库被解到
     // `/workspace`，模型只能靠绝对路径"绕"过去，而最后取 diff 会以 `spawn_failed` 失败——
     // 这条是 §K 第 9 步手工验收第一次真跑时抓到的。
-    const injected = await injectRepo({ api: new SandboxApiClient(), target, clone, workspaceDir: REPO_DIR, log });
+    const injected = await injectRepo({ api, target, clone, workspaceDir: REPO_DIR, log });
     log("info", `仓库已灌入沙箱（${injected.bytes} 字节，HEAD ${injected.headSha.slice(0, 12)}）`);
 
     // ---- 跑循环。带观察窗时，文字增量同时进 stdout 与事件流（Phase 13）。
-    const api = new SandboxApiClient();
     const transcript = await Transcript.create({ runId, log });
-    const toolkit = createToolkit({
+    const toolkit = createSandboxToolkit({
       sandboxId: sandbox.sandboxId,
       exec: manager,
       api,
       target,
+      repoDir: REPO_DIR,
       ...(events === undefined ? {} : { events }),
       log,
     });
     const model = modelFromEnv();
     log("info", `agent 开始（model=${model.model}，maxTurns=${args.maxTurns}）`);
 
+    // ---- 会话记账（Phase 2）：一次执行 + 每条消息/用量/工具调用。
+    await sessionStore.startRun({
+      id: runId,
+      sessionId: session.id,
+      sandboxId: sandbox.sandboxId,
+      startEntryId: session.leafEntryId,
+      provider: model.provider,
+      model: model.model,
+    });
+    const history = buildContextEntries(await sessionStore.listEntries(session.id));
+    const prompts: AgentMessage[] | null =
+      history.length === 0 ? null : [{ role: "user", content: args.issue }];
+    const recorder = new EntryRecorder({
+      store: sessionStore,
+      sessionId: session.id,
+      runId,
+      provider: model.provider,
+      model: model.model,
+      leafEntryId: session.leafEntryId,
+      onActivity: () => sessionStore.touchSession(session.id),
+      log,
+    });
+
     const result = await runAgentLoop({
       model,
-      tools: toolkit,
+      tools: recorder.wrapTools(toolkit.tools),
       transcript,
       issue: args.issue,
+      history,
+      ...(prompts === null ? {} : { prompts }),
       system: buildSystemPrompt(),
       maxTurns: args.maxTurns,
-      maxTokens: maxTokensFromEnv(),
+      maxTokens: maxTokensFromEnv(model.model),
       ...(events === undefined ? {} : { events }),
       onText: (delta) => {
         process.stdout.write(delta);
         events?.emit({ type: "text", delta });
       },
+      onAgentEvent: (event) => recorder.onAgentEvent(event),
+      onRequest: async (info) => {
+        await sessionStore.touchSession(session.id);
+        await requests.record({
+          sessionId: session.id,
+          runId,
+          turn: info.turn,
+          system: info.system,
+          messages: info.messages,
+          tools: info.tools,
+        });
+      },
       log,
     });
     if (result.usage.outputTokens > 0) process.stdout.write("\n");
+
+    writtenLeaf = recorder.leafEntryId;
+    await sessionStore.endRun(runId, {
+      status: runStatusFor(result.stopReason),
+      stopReason: result.stopReason,
+      endEntryId: writtenLeaf,
+      sandboxId: sandbox.sandboxId,
+    });
+    await sessionStore.updateSessionHead(session.id, { leafEntryId: writtenLeaf });
+    await recorder.interruptRemaining();
 
     // ---- transcript 上传（配了对象存储才做；PR 正文里要放它的位置）
     let transcriptUrl: string | null = null;
@@ -405,11 +516,21 @@ async function main(): Promise<void> {
     });
     patchPath = finished.patchFile;
 
+    // 推上去了才更新会话的 head（没有 PR/patch 以外的情况：head_commit 只在"冷启动重建"时用）。
+    if (finished.published !== null) {
+      await sessionStore.updateSessionHead(session.id, {
+        leafEntryId: writtenLeaf,
+        headRef: finished.published.push.branch,
+        headCommit: finished.published.push.commitSha,
+      });
+    }
+
     const published = finished.published;
     summary = [
       "",
       "──────────── 结果 ────────────",
       `Run            ${runId}`,
+      `Session        ${session.id}${resumed === null ? "（新建）" : "（续用）"}`,
       `Task           ${taskId}`,
       `挂起原因       ${result.stopReason}（${result.detail}）`,
       `轮数 / 工具调用 ${result.turns} / ${result.toolCalls}`,
@@ -438,6 +559,10 @@ async function main(): Promise<void> {
     });
     throw error;
   } finally {
+    // 会话的沙箱引用先清掉：脚本是单轮的，销毁之后会话不该还指着一个不存在的沙箱。
+    await sessionStore
+      .setSessionSandbox(session.id, { sandboxId: null, flushFailures: 0, flushFailedAt: null })
+      .catch(() => undefined);
     if (!args.keep) {
       try {
         const report = await manager.destroySandbox(sandbox.sandboxId, "agent_run_finished");
@@ -448,12 +573,29 @@ async function main(): Promise<void> {
         });
       }
     }
+    // 导出整个会话的 JSONL（Phase 2 §7）。`--keep` 时自动导一份：
+    // 留着沙箱排障的人，几乎总是也想看一眼这一轮的完整轨迹。
+    const exportTarget = args.exportPath ?? (args.keep ? `session-${session.id}.jsonl` : null);
+    if (exportTarget !== null) {
+      try {
+        const jsonl = await exportSession(sessionStore, session.id, {
+          readSpilled: (objectKey) => requests.readSpilled(objectKey),
+          log: (level, message, details) => log(level, message, details),
+        });
+        await writeFile(path.resolve(exportTarget), jsonl, "utf8");
+        exportPath = path.resolve(exportTarget);
+        log("info", `会话已导出：${exportPath}（${Buffer.byteLength(jsonl)} 字节）`);
+      } catch (error) {
+        log("error", `导出会话失败`, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     await removeRunDir(runId).catch(() => undefined);
     await db.close();
     store?.close();
   }
 
   if (summary !== null) console.log(summary);
+  if (exportPath !== null) console.log(`导出的会话 JSONL：${exportPath}`);
   if (patchPath === null) process.exitCode = 1;
 
   // ---- 留着观察窗（Phase 13）：Run 结束了，但页面还能把整段过程读完。
@@ -464,6 +606,13 @@ async function main(): Promise<void> {
     await web.close();
     hub?.close();
   }
+}
+
+/** 续用会话时先确认它真的存在（`--session` 写错要早报，而不是跑一半才发现）。 */
+async function requireSession(store: PostgresSessionStore, sessionId: string): Promise<StoredSession> {
+  const session = await store.getSession(sessionId);
+  if (session === null) throw new Error(`没有这个会话：${sessionId}`);
+  return session;
 }
 
 /** issue 的第一行当题面（PR 标题 / commit message 用）。太长就截断。 */

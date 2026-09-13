@@ -79,6 +79,9 @@ describe("Phase 8 · 表结构与迁移", () => {
       "id", "task_id", "run_id", "provider", "provider_ref", "endpoint", "auth_token",
       "image", "image_digest", "state", "state_reason", "limits", "workspace_volume",
       "last_active_at", "created_at", "ready_at", "destroyed_at",
+      // Phase 2（005 迁移）加的一列：沙箱归属**会话**（会话级租约）。
+      // 既有行是 NULL，对账/状态机/sweeper 的语义一个字没变。
+      "session_id",
     ]);
     assert.deepEqual(columns.get("executions"), [
       "id", "sandbox_id", "run_id", "cmd", "cwd", "env_keys", "state", "reason", "exit_code",

@@ -187,6 +187,8 @@ export interface SandboxManagerOptions {
 export interface CreateSandboxInput {
   runId: string;
   taskId?: string;
+  /** 归属的会话（Phase 2 的会话级租约用它）；不传 = NULL（Phase 8/9 的单次用法）。 */
+  sessionId?: string;
   /** 覆盖 options.image（例如同一个 run 里换一个镜像）。 */
   image?: string;
   /** 覆盖默认配额。 */
@@ -345,6 +347,7 @@ export class SandboxManager {
       id: sandboxId,
       taskId: input.taskId ?? null,
       runId: input.runId,
+      sessionId: input.sessionId ?? null,
       provider: this.#provider.kind,
       image,
       imageDigest: imageDigestOf(image),
