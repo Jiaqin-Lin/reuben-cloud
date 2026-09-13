@@ -1752,13 +1752,91 @@ git -c http.extraHeader="..." push origin HEAD:refs/heads/reuben-cloud/<taskId>
 
 ### 验收标准
 
-- [ ] 上表 10 项全绿
-- [ ] §K 第 5 步的验证：仓库进得去、patch 出得来并能应用
-- [ ] **token 泄漏测试通过**（第 4、5 条）
-- [ ] archive 回退路径被真实触发过一次（不是只有代码）
+- [x] 上表 10 项全绿（第 7 条的 403 在单元测试里用假 GitHub 响应覆盖，见备注 2）
+- [x] §K 第 5 步的验证：仓库进得去、patch 出得来并能应用
+      （`test/integration/repo-flow.integration.test.ts` 的用例 1–6：clone → 灌入 →
+      改五类文件 → `/diff` → `git apply --binary` → 两边 sha256 相等 → push →
+      从远端拉回来逐字节核对内容。）
+- [x] **token 泄漏测试通过**（第 4、5 条）
+      （用例 1 断言 `.git/config` 与整个 `/tmp/reuben-cloud-cp` 里都搜不到 token，
+      同时断言远端**真的收到了带正确 Authorization 的请求**；用例 2 在真沙箱里 grep
+      `/workspace`、`git config --local --list`、`env`。）
+- [x] archive 回退路径被真实触发过一次（不是只有代码）
+      （用例 6 用一个被改脏的 clone 让 `git apply` 失败，回退后断言树与沙箱一致、
+      且重新生成的 patch 与沙箱那份逐字节相同；`repo-apply.test.ts` 另外覆盖
+      `/diff` 413、外置 patch、忠实度不一致三个入口。）
 
 **完成标记：**
-- [ ] **Phase 9 完成** — 仓库能进能出，patch 忠实且可应用，凭据零泄漏
+- [x] **Phase 9 完成** — 仓库能进能出，patch 忠实且可应用，凭据零泄漏
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **多两个文件**：`src/repo/types.ts`（`RepoError` + `RepoRef` / `SandboxTarget` +
+   `RepoApi` 端口）与 `src/repo/git.ts`（git 调用层）。六个模块互相引用这些类型；
+   更重要的是，**token → argv 的转换、argv 的打码、"URL 不许带 userinfo"的检查**
+   只出现在 `git.ts` 一个地方。clone 与 push 各写一遍参数拼装，就一定会出现第二种
+   凭据传递方式——而最容易滑进去的那一种会把凭据写进 `.git/config`，再跟着 tar 进沙箱。
+2. **测试的"远端"是本地 smart-HTTP git 服务器**（`git http-backend` CGI + Authorization
+   校验）加一个裸仓库 fixture，不是 GitHub 上的私有测试仓库。CI 里没有 GitHub App 私钥，
+   而"token 只走 `extraHeader`、绝不落盘"这条红线只有在一个**会检查 Authorization 头的
+   真 HTTP 远端**上才有牙齿：file:// 的 fixture 根本没用到 token，断言等于空转。
+   第 7 条（403 权限不足）用注入 `request` 的假 GitHub 覆盖（并用 `crypto.verify`
+   验了 JWT 的 RS256 签名）；真实的 403 需要一个真 installation。
+3. **force-with-lease 用显式 `<ref>:<expect>`**，不是裸 `--force-with-lease`。
+   裸形式拿本地 remote-tracking ref 当预期值，而我们的 clone 是 checkout 到某个
+   commit 的、从没 fetch 过要推的那条分支。做法：push 之前 `ls-remote` 现问一次当前值，
+   当作 CAS 的参照；分支不存在时 expect 是**空串**（git 文档：空 expect = 该 ref 必须
+   不存在），于是"两个人同时创建同一条分支"里输的那一个会被拒，而不是被覆盖。
+   被拒时再问一次远端，把"我们以为是什么 / 实际是什么"都写进错误。
+4. **push 必须显式 `-C <cloneDir>`**（探针抓到的真 bug）。`HEAD:refs/heads/…` 左边的
+   `HEAD` 是在**本地仓库**里解析的，不指定目录就会把 CP 当前工作目录那个仓库的 HEAD
+   推上远端。第一版探针推出去的 sha 是 CP 自己仓库的 HEAD——这条漏到线上就是
+   "把我们的 monorepo 推到用户的临时分支上，而沙箱里验证过的代码根本没被推"。
+5. **回退覆盖 `/diff` 自己失败的情况**：`http_error`（413 `patch_too_large`、`git_error`…）
+   → archive 回退；**`unreachable` / `invalid_response` 不回退**——回退走的是同一条链路、
+   同一种协议，只会把真正的错误（沙箱没了）换成一个更难读的错误。
+   这正是 Phase 3 备注 4 说的"超限回 413，正好接上 Phase 9 本来就有的 archive 回退"。
+6. **回退时保留 CP 自己的 `.git`**：归档请求带 `exclude=.git`，替换工作区时也只跳过 `.git`。
+   沙箱那份 `.git` 带着 `git add -A -N` 的 intent-to-add index，而且生成 commit 的
+   是 CP 这一份——两份 `.git` 混在一起只会让"patch 的 base 到底是什么"变得不可知。
+7. **确定性 diff 与干净的 git 环境**：所有 git 调用带 `--no-pager` 与
+   `-c credential.helper=`（不跑宿主凭据助手：没有它，macOS 的 osxkeychain 会在 token
+   过期时"神奇地"用另一份凭据成功，401 用例在某些机器上根本不成立）；产出 diff 的命令
+   另外钉死 autocrlf / safecrlf / noprefix / mnemonicPrefix / renames / algorithm /
+   context / interHunkContext。忠实效验比较的是两份**字节**，两边配置不同就没有意义。
+   `gitEnv()` 从零构造环境（不继承 `process.env`：`GIT_DIR` / `GIT_INDEX_FILE` /
+   `GIT_EXTERNAL_DIFF` 这类变量会把一次调用指到别处），并把 `LC_ALL` 钉成 `C`——
+   我们会解析 git 的 stderr 与 `--shortstat` 的措辞。
+8. **`COPYFILE_DISABLE=1`**：macOS 的 bsdtar 默认把扩展属性写成 `._*` 的 AppleDouble
+   条目，那些条目到 Linux 会变成**真实文件**，灌进去的仓库立刻不干净
+   （Phase 7 的 fixture 踩过同一个坑，这里只花了一个环境变量）。
+9. **内部命令走 `client.execAndWait`，不经过 manager 的 BUSY 闸**：`tar xzf` / `rm` /
+   `git rev-parse` 是 CP 搬仓库用的，调用时机在工具循环之前（Phase 11）或之后。
+   manager 那条路（READY→BUSY→READY + `executions` 表）留给**业务命令**；沙箱侧的单执行闸
+   仍然在拦并发。`execAndWait` 放在客户端，因为它只需要"HTTP + SSE 跑到终态"，
+   不需要 DB 记账，也不需要看门狗（时限由请求的 `timeoutMs` 兜）。
+10. **commit / push 一律 `--no-verify`**，并显式 `-c commit.gpgsign=false`：
+    仓库内容不可信，`core.hooksPath`（或用户自己的全局 hook）不该在 CP 的身份下执行
+    任意命令。commit 身份用 `-c user.name/user.email` 传，不写任何配置文件。
+11. **分支保护是产品语义，但便宜**：`branchNameForTask()` 把 taskId 归一成
+    `reuben-cloud/<taskId>`（附录 A-12：一个 Task 固定一条分支）；`assertPushableBranch()`
+    拒绝 main / master 与畸形 ref。工作区没有改动时抛 `nothing_to_commit`，**不造空 commit**
+    （Phase 12 把这条当成"这次 Run 没有产出"）。
+12. **`github-app.ts` 只让 `@octokit/auth-app` 负责"签"**：缓存、提前 5 分钟续签、
+    按仓库分键都是自己的（auth-app 内置的缓存是"过期前 1 分钟"，那 4 分钟的差别正好是
+    "push 的时候 token 刚过期"的概率来源）。`installationId` 从 env 来，不做 installation
+    查找（MVP 单安装）。私钥在启动时用 `createPrivateKey` 验一遍，缺/坏分别给
+    `config_missing` / `config_invalid`——"启动时检查"这条在 Phase 9 就有落点了。
+13. **`sweepStaleRunDirs()` 只导出，不自动跑**：CP 还没有主入口（Phase 11/12 才有）。
+    它按 mtime 删超过 6h 的 run 目录——按年龄而不是无条件全删，为的是不误伤同一台机器上
+    另一个正在跑的 CP；`runId` 进路径之前先过 `^[A-Za-z0-9._-]{1,64}$`，这是路径穿越的第一道门。
+14. **测试脚手架新增三件东西**（都在 `test/support.ts`）：`startGitHttpServer()`
+    （`git http-backend` 的 CGI 外壳 + Authorization 校验）、`createGitFixtureRepo()`
+    （裸仓库 + 初始提交，含一个二进制文件与一个待删除文件）、`pushCommitToFixture()`
+    （站在"第三方"的位置改远端分支）。两个坑值得记下来：CGI 的 `QUERY_STRING`
+    **不能带前导 `?`**（带上之后 http-backend 认不出 `service=git-receive-pack`，
+    于是退回 dumb HTTP——clone 还能跑、push 直接死，而 git 只回一句
+    `Cannot access URL … return code 22`）；裸仓库要显式 `http.receivepack=true`。
 
 ---
 
