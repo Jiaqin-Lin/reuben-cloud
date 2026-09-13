@@ -13,7 +13,11 @@
 
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import http from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import net from "node:net";
+import path from "node:path";
 import type { SandboxSpec } from "../src/provider/types.ts";
 
 // ---------------------------------------------------------------- 数据工厂
@@ -181,6 +185,54 @@ function isMissing(stderr: string, kind: string): boolean {
   return new RegExp(`no such ${kind}`, "i").test(stderr);
 }
 
+// ---------------------------------------------------------------- 假 Docker daemon
+
+/** 一个跑在真的 unix socket 上的假 daemon。 */
+export interface FakeDaemon {
+  socketPath: string;
+  /** 收到的请求（method + 带 query 的完整路径），按顺序记下来。 */
+  requests: string[];
+  close: () => Promise<void>;
+}
+
+/**
+ * 起一个假 daemon。
+ *
+ * 放这里（而不是某个 `.test.ts` 里）是**必须**的：`node --test` 吃到某个测试文件时，
+ * 从它 import 进来的 `test()` 调用会一起注册到同一个进程里——把 helper 放进测试文件，
+ * 第二个 import 它的文件就会把那整份用例再跑一遍（文件头已经为 `makeSpec` 记过这条）。
+ *
+ * 做法的要点与理由见 `docker-api.test.ts` 的文件头：真的 HTTP 字节流比 mock `http.request`
+ * 诚实得多；socket 路径用 `/tmp/rc-docker-XXXX` 而不是 `os.tmpdir()`（macOS 的
+ * `/var/folders/...` 会碰到 unix socket 的 ~104 字节路径上限）。
+ */
+export async function startFakeDaemon(
+  handler: (req: IncomingMessage, res: ServerResponse, body: string) => void,
+): Promise<FakeDaemon> {
+  const dir = await mkdtemp("/tmp/rc-docker-");
+  const socketPath = path.join(dir, "docker.sock");
+  const requests: string[] = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      requests.push(`${req.method} ${req.url}`);
+      handler(req, res, body);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+  return {
+    socketPath,
+    requests,
+    close: async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
 // ---------------------------------------------------------------- 镜像
 
 /** 集成测试默认用的本地镜像 tag（`npm run build:image` 或 `npm run check:image` 建出来的）。 */
@@ -197,6 +249,10 @@ export const DEFAULT_PROXY_IMAGE_TAG = process.env.EGRESS_PROXY_IMAGE ?? "reuben
  * digest 放在 `RepoDigests` / `Id` 里（实验证明两者在这个环境下一致：
  * containerd 存储的 `.Id` 就是 manifest digest），provider 的 `#ensureImage` 又是
  * "本地命中就不拉"，所以本地开发不需要任何 registry。
+ *
+ * 返回的两种形态都被 `validateSpec()` 接受（`repo@sha256:…` 与裸 `sha256:…`）：
+ * 经典存储（overlay2 / graphdriver）下本地构建的镜像没有 RepoDigests，只能退回 `.Id`。
+ * 这不是妥协——两者都是不可变的内容寻址，tag 才是那个不该被接受的东西（见 Phase 7 备注 19）。
  *
  * @param hint 镜像不存在时告诉使用者该跑哪条命令。两个镜像的构建命令不同，所以让它可选。
  * @throws 镜像不存在时抛出，并告诉使用者先跑构建命令——比让 create 报"拉镜像失败"清楚得多。

@@ -112,8 +112,19 @@ export const LIMIT_MIN_MEM_MB = 128;
 export const LIMIT_MIN_PIDS = 32;
 export const LIMIT_MIN_TTL_SEC = 60;
 
-/** 镜像引用里的 digest 形状（§C.1：只接受 digest，不接受纯 tag）。 */
-const DIGEST_RE = /@sha256:[0-9a-f]{64}$/;
+/**
+ * 镜像引用里可以接受的两种 digest 形态（§C.1：只接受 digest，不接受纯 tag）：
+ *  - `repo@sha256:<64 hex>`：registry / containerd 存储的 digest 引用；
+ *  - `sha256:<64 hex>`：本地镜像 ID。经典存储（overlay2 / graphdriver）下，本地构建、
+ *    从未 push 的镜像没有 RepoDigests，`resolveImageRef()` 的兜底就是它（见 Phase 7 备注 19）。
+ *
+ * 两者共同点、也是这条校验真正要的：引用**钉住一个确切镜像**，而不是一个可变的 tag。
+ * 裸镜像 ID 没有 registry 名字，因此只可能命中本地（`#ensureImage` 不再尝试拉它）。
+ */
+const DIGEST_RE = /^(?:[^@\s]+@)?sha256:[0-9a-f]{64}$/;
+
+/** 裸镜像 ID：没有 registry 名字，去 registry 找它必然是一句 invalid reference format。 */
+const LOCAL_IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/;
 
 /** sandboxId / runId 等会进容器名与卷名的标识符。Docker 对卷名的字符集有要求。 */
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -197,7 +208,8 @@ interface AgentHealthPayload {
  * 非法输入不应该在 daemon 上留下任何痕迹，也不应该花 120s 去拉一个根本不该拉的镜像。
  *
  * 每一条拒绝都有具体理由，不是"防御性编程"：
- *  - 镜像没有 digest：tag 可变，"验证过的版本"和"下次跑的版本"无法证明是同一个。
+ *  - 镜像没有 digest：tag 可变，"验证过的版本"和"下次跑的版本"无法证明是同一个
+ *    （可接受的两种形态见 DIGEST_RE）。
  *  - limits 越界：见 LIMIT_* 的说明。
  *  - 标签缺失/非法：**对账的唯一依据**（§D），名字进容器名与卷名。
  *  - env 里带 `SANDBOX_AGENT_TOKEN`：token 由 provider 每次 create 现生成，
@@ -211,9 +223,12 @@ export function validateSpec(spec: SandboxSpec): ValidatedSpec {
   };
 
   if (typeof spec.image !== "string" || !DIGEST_RE.test(spec.image)) {
-    bad(`image 必须带 digest（形如 repo@sha256:<64 hex>），得到 ${JSON.stringify(spec.image)}`, {
-      image: spec.image,
-    });
+    bad(
+      `image 必须带 digest（repo@sha256:<64 hex>，或本地镜像 ID sha256:<64 hex>），得到 ${JSON.stringify(spec.image)}`,
+      {
+        image: spec.image,
+      },
+    );
   }
 
   const limits = spec.limits;
@@ -799,6 +814,10 @@ export class LocalDockerProvider implements SandboxProvider {
    *
    * digest 引用在这一步被验证：`@sha256:` 里那个 64 位十六进制要么在本地命中，
    * 要么能被 registry 解析，否则就是 `image_pull_failed`。
+   *
+   * 裸镜像 ID（`sha256:<64>`）是例外：它没有 registry 名字可解析，本地没有就到此为止——
+   * 继续往下会拿一个必然失败的引用去 `POST /images/create`，把一句语法错误包装成
+   * "拉镜像失败"，掩盖真正的原因（本地镜像不在了 / 引用的不是本机的那一份）。
    */
   async #ensureImage(image: string): Promise<void> {
     try {
@@ -809,6 +828,15 @@ export class LocalDockerProvider implements SandboxProvider {
     } catch (error) {
       if (!isNotFound(error)) throw asProviderError(error, "image_inspect");
       // 404：继续往下拉。
+    }
+
+    if (LOCAL_IMAGE_ID_RE.test(image)) {
+      throw new ProviderError(
+        "image_not_found",
+        `本地没有镜像 ${image}（裸镜像 ID 只可能命中本地，没有 registry 可拉）：先 \`npm run build:image\`，` +
+          `或用 SANDBOX_IMAGE 指定一个本机确实存在的引用。`,
+        { image },
+      );
     }
 
     try {

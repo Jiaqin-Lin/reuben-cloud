@@ -13,10 +13,6 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import http from "node:http";
-import type { IncomingMessage, ServerResponse } from "node:http";
-import path from "node:path";
 import test from "node:test";
 import {
   DockerApiError,
@@ -27,47 +23,9 @@ import {
   resolveDockerSocketPath,
   serializeQuery,
 } from "../../src/provider/docker-api.ts";
-
-interface FakeDaemon {
-  socketPath: string;
-  /** 收到的请求（method + 带 query 的完整路径），按顺序记下来。 */
-  requests: string[];
-  close: () => Promise<void>;
-}
-
-/**
- * 起一个假 daemon。
- *
- * socket 路径用 `/tmp/rc-docker-XXXX/docker.sock` 而不是 `os.tmpdir()`：
- * macOS 的 `os.tmpdir()` 是 `/var/folders/...`，unix socket 路径有 ~104 字节上限，
- * 长路径会以 "ENAMETOOLONG / EADDRINUSE" 这种看起来毫不相干的错误炸掉。
- */
-async function startFakeDaemon(
-  handler: (req: IncomingMessage, res: ServerResponse, body: string) => void,
-): Promise<FakeDaemon> {
-  const dir = await mkdtemp("/tmp/rc-docker-");
-  const socketPath = path.join(dir, "docker.sock");
-  const requests: string[] = [];
-  const server = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (chunk: Buffer) => {
-      body += chunk.toString("utf8");
-    });
-    req.on("end", () => {
-      requests.push(`${req.method} ${req.url}`);
-      handler(req, res, body);
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
-  return {
-    socketPath,
-    requests,
-    close: async () => {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(dir, { recursive: true, force: true });
-    },
-  };
-}
+// 假 daemon 的实现在 test/support.ts：provider 的镜像单测也要用它，而放进某个
+// `.test.ts` 会让 import 它的文件把那整份用例再跑一遍（support.ts 文件头记过这条坑）。
+import { startFakeDaemon } from "../support.ts";
 
 test("json()：路径带版本前缀，query 被正确编码", async () => {
   const daemon = await startFakeDaemon((_req, res) => {

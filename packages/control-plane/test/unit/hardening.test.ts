@@ -165,8 +165,11 @@ test("spec 校验：逐条拒绝非法输入，且都不碰 Docker", () => {
   // tag-only 镜像：tag 可变，"验证过的版本"和"下次跑的版本"无法证明是同一个。
   rejects(makeSpec({ image: "reuben-cloud/sandbox-base:dev" }), "必须带 digest");
   rejects(makeSpec({ image: `${"x"}` }), "必须带 digest");
-  // digest 长度不对。
+  // digest 长度不对 / 形状不对。
   rejects(makeSpec({ image: "repo@sha256:abc" }), "必须带 digest");
+  // 裸镜像 ID 也不能因为"看起来像本地的"就放行：长度与字符集必须对。
+  rejects(makeSpec({ image: `sha256:${"a".repeat(63)}` }), "必须带 digest");
+  rejects(makeSpec({ image: `sha256:${"g".repeat(64)}` }), "必须带 digest");
 
   rejects(makeSpec({ limits: { ...makeSpec().limits, cpu: 0 } }), "limits.cpu");
   rejects(makeSpec({ limits: { ...makeSpec().limits, cpu: LIMIT_MAX_CPU + 1 } }), "limits.cpu");
@@ -190,6 +193,11 @@ test("spec 校验：逐条拒绝非法输入，且都不碰 Docker", () => {
 test("spec 校验：合法输入被放行，env 归一化成空对象", () => {  const clean = validateSpec(makeSpec());
   assert.deepEqual(clean.env, {});
   assert.equal(clean.image, makeSpec().image);
+
+  // 裸本地镜像 ID（经典存储下 `resolveImageRef()` 的兜底形态）也是合法输入：
+  // 它和 `repo@sha256:` 一样钉住一个确切镜像，只是没有 registry 名字可拉（Phase 7 备注 19）。
+  const bareId = `sha256:${"b".repeat(64)}`;
+  assert.equal(validateSpec(makeSpec({ image: bareId })).image, bareId);
 
   // 边界值：恰好等于上限时要通过（上限是"允许的最大值"，不是"必须小于"）。
   const atLimit = validateSpec(

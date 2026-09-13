@@ -168,7 +168,9 @@ async function main(): Promise<number> {
   // 镜像必须先建好：冒烟不该顺手构建一个镜像（apt 层要几分钟），也不该给一个错觉
   // 说"跑一下就什么都有了"。失败信息里已经带着该跑哪条命令（见 resolveImageRef）。
   const imageRef = await resolveImageRef(process.env.SANDBOX_IMAGE ?? DEFAULT_IMAGE_TAG, "npm run build:image");
-  console.log(`沙箱镜像：${imageRef}`);
+  // 裸 `sha256:` 是经典存储下本地构建镜像的形态（没有 RepoDigests 可退回，见 Phase 7 备注 19）。
+  // 打出来是为了让 CI 日志能直接回答"这次跑的是哪种引用"——这两个形态的失败模式完全不同。
+  console.log(`沙箱镜像：${imageRef}${imageRef.startsWith("sha256:") ? "（本地镜像 ID）" : ""}`);
 
   // 代理：幂等拉起 + 用仓库里那份白名单。失败信息里同样带着该跑哪条命令。
   try {

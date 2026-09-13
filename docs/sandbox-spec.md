@@ -932,6 +932,16 @@ Phase 8 的对账逻辑完全建立在这两个方法上，所以它们从第一
 15. **`tmpfs /tmp` 必须显式写 `exec`**（Phase 6 回头修的）：Docker 会给 tmpfs 默认补上 `noexec`，原来那句
     `rw,nosuid,size=512m,mode=1777` 实测挂出来是 `noexec`。§F.1 明确不加 noexec，而它会打断 npm postinstall /
     node-gyp / python venv 的 console script——都是从 /tmp 执行刚写进去的文件。详见 Phase 6 实现备注 10。
+16. **`SandboxSpec.image` 也接受裸的本地镜像 ID（`sha256:<64 hex>`）**（Phase 7 的 CI 回来改的，见 Phase 7 备注 19）。
+    §C.1 的原话是「必须带 digest（repo@sha256:…）」，而经典存储（overlay2 / graphdriver）下**本地构建、
+    从未 push 的镜像没有 RepoDigests**。`resolveImageRef()` 的兜底就是镜像 `.Id`（config digest）：
+    它和 `repo@sha256:` 一样是不可变的内容寻址、钉住一个确切镜像，只是没有 registry 名字可拉。
+    原来的校验把这条兜底直接判成 `invalid_spec`，于是 CI runner（经典存储）上四个冒烟组的 `before`
+    钩子会在建任何沙箱之前全灭。现在 `DIGEST_RE` 同时接受两种形态（tag-only 引用仍然被拒），并且
+    `#ensureImage` 对「裸 ID 但本地没有」给出 `image_not_found`，不再拿一个必然 `invalid reference format`
+    的引用去 `POST /images/create`（那会把「本地镜像不在了」包装成「拉镜像失败」）。单测：
+    `hardening.test.ts` 两种形态各一条 + `provider-image.test.ts` 断言本地没有时只发
+    `GET /images/{id}/json` 一个请求。
 
 **完成标记：**
 - [x] **Phase 5 完成** — 沙箱能被创建、加固、回收，且不泄漏（集成 11/11、单测 21/21、`tsc --noEmit` 通过；手工复核过加固参数与零残留）
@@ -1224,10 +1234,11 @@ actions 用 `actions/checkout@v5` / `actions/setup-node@v5`：v4 的运行时是
 Node 24 强行跑它并打弃用警告（第一次跑 CI 时就看到了，见实现备注 16）。
 
 两个 job 都带一个 `if: failure()` 的诊断步骤：它把 `docker ps -a`、代理与各沙箱的 `docker logs`
-打出来，并且**把挂掉的用例名变成 `::error::` annotation**（`tests` 与冒烟的输出各自 tee 到文件再 grep）——
-GitHub 的 annotations 框里默认只显示 job 名，"哪一条用例挂了"才是第一眼要看到的东西，
-而 CI 失败的第一轮往往只能拿到一张截图。触发条件是 `pull_request` + **push 到 main** +
-`workflow_dispatch`：push 到 main 是为了让仓库第一次推送/每次合并都能看到完整结果（实现备注 15），
+打出来，并且把每个日志的**第一条错误**（`AssertionError` / `ProviderError` / `before` 钩子失败，含 25 行栈）
+与**冒烟日志开头 40 行**（preflight 的平台 / 镜像引用 / 代理）一起贴上，同时把错误的消息行变成
+`::error::` annotation（`tests` 与冒烟的输出各自 tee 到文件再 grep）——GitHub 的 annotations 框里
+默认只显示 job 名，而只有用例名也定位不了任何事（第四轮 CI 的"四组全灭"就是这么看了一天）。
+触发条件是 `pull_request` + **push 到 main** + `workflow_dispatch`：push 到 main 是为了让仓库第一次推送/每次合并都能看到完整结果（实现备注 15），
 `workflow_dispatch` 是红线出问题时的手工复跑（不必为了跑一次 CI 推一个空 commit）。
 
 - **必须跑在 Linux 上**。§J 明写了理由：macOS Docker Desktop 的内核/seccomp 行为不同，红线在那里得不到验证。
@@ -1247,7 +1258,9 @@ CI 里加一个**故意破坏**的 job：用环境变量把 `CapDrop` 设成 `[]
 那样连 darwin 的转发容器与 Phase 6 的出网代理也会一起失去加固，"被破坏的东西"就不唯一了，
 失败原因也不再可归因（实现备注 8）。
 
-CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**，且日志里出现 `CapDrop`。
+CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**，且失败原因正是 I10 那条断言
+（核对的是断言消息 `CapDrop 必须是`，不是随便一个含 `CapDrop` 的行——入口自己那行提示里就有它，
+并且要先排除"根本没跑到用例"的 `did not finish before its parent` / `Error [ProviderError]`）。
 第二件事同样重要——否则一个坏掉的 runner（Docker 挂了、镜像没建出来）也能让这个 job"通过"，
 那就从"有牙齿"退化成了"只要红就行"。
 
@@ -1270,9 +1283,16 @@ CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**
       ④ 修完入口顺序后本地把整个 Linux 路径搬进容器重跑：`npm test` 101+56 **连跑 3 次全绿**、
       `npm run smoke` **26/26 全绿**（含 I1–I10 红线在 Linux 语义下的首跑）、两个入口用例
       Linux 25 轮 / macOS 20 轮零失败
-      本地另已验：macOS 全量 26/26、`tsc --noEmit`、Phase 5/6 集成测试 24/24
-- [x] **反向验证 job 红了**（证明脚本有牙齿）—— 本地用 `SMOKE_ANY_PLATFORM=1 SMOKE_NEGATIVE_CONTROL=1` 跑 `--tag=isolation`：
-      10 条里**只有 I10 变红**，且断言消息里含 `CapDrop`（CI 的 job 断言的就是这两件事）
+      ⑤ 第四轮 CI（`eee565c`）：`smoke` job 的四个组 `before` 钩子全灭——表现与「runner 是经典镜像存储、
+      本地构建的镜像没有 RepoDigests」这条路上的 `invalid_spec` 逐字一致（本地用包装脚本复现，
+      实现备注 19）；同一轮还暴露出 negative-control 的 `grep CapDrop` 是假阳性。
+      修完后：本地两种存储形态（自带的 containerd 存储 + 把 RepoDigests 抹成 `[]` 的经典存储包装脚本）
+      与 Linux 容器里都是 `npm run smoke` 26/26、`npm test` 101+57、集成测试 24/24；
+      下一个 CI 轮次是最终确认。
+      本地另已验：macOS 全量 26/26（含 `SMOKE_ANY_PLATFORM=1` 的红线参考结论）、`tsc --noEmit`
+- [x] **反向验证 job 红了**（证明脚本有牙齿）—— Linux 容器里模拟经典存储跑
+      `SMOKE_NEGATIVE_CONTROL=1 npm run smoke -- --tag=isolation`：10 条里**只有 I10 变红**，且断言消息里含
+      `CapDrop 必须是`；另用一份「钩子没跑起来」的日志反向验证过 job 的判定逻辑会正确地拒掉它
 - [x] 手工把 `CapDrop` 去掉再跑一次，本地也变红 —— 同上一行（同一套机制；CI 里由 negative-control job 每次自动做）
 - [x] §J 的 11 项红线逐条能在 CI 日志里找到对应输出 —— 用例名逐条带编号 `I1 … I10`，
       `--test-reporter=spec` 会把每条的名字与耗时打出来；I10 一条内部覆盖了 Phase 5 那张表的全部字段
@@ -1387,6 +1407,28 @@ CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**
     0 的意思是"我按你的要求停了"），细节写进 stderr。
     验证：Linux 容器里那两个入口用例连跑 25 轮、macOS 连跑 20 轮，全绿；全量单测（101+56）与
     冒烟的 exec+flow 组（含 destroy 的 SIGTERM 路径）也都重跑过。
+19. **CI 第四轮：`smoke` job 的冒烟组「全灭」，根因是 runner 的镜像存储与本地不同。**
+    症状是每个组**每一条用例**都红、`✖` 的耗时只有 30–80ms——这是 `before` 钩子挂了，不是断言。
+    日志里真正的错误（诊断步骤当时只输出用例名，所以第一眼看不到）是
+    `ProviderError: image 必须带 digest（形如 repo@sha256:<64 hex>），得到 "sha256:317a…"`，reason `invalid_spec`。
+    环境差异：本机 Docker Desktop（containerd 存储）与「Linux 容器 + 宿主机 socket」里，`docker build`
+    出来的镜像**有** RepoDigests（`.Id == manifest digest`）；经典存储（overlay2 / graphdriver）下同一个
+    命令出来的镜像 `RepoDigests` 是 `[]`，`resolveImageRef()` 只好退回 `.Id`，而 `validateSpec()` 只认
+    `repo@sha256:` 形态。本地把 RepoDigests 抹成 `[]` 复现了逐字相同的失败（见下）；runner 的存储驱动
+    现在由 workflow 里 `docker info` 那一行一起打出来，跑完可以直接对照。
+    本地复现：在 Docker CLI 前面套一个只把 `docker image inspect … RepoDigests` 改写成 `[]` 的小包装
+    脚本（其余原样透传；provider 走 socket API，所以沙箱链路是真的），四个组立刻以同样的 37ms
+    全灭、错误逐字一致；修完这个包装脚本下 26/26 全绿。修法见 Phase 5 备注 16。
+    同一次还补了两个「证据链」上的洞：
+    - **negative-control job 的「原因」断言是假阳性**。它 `grep -q CapDrop` 的日志里，入口自己会
+      打一行 `⚠️ SMOKE_NEGATIVE_CONTROL=1：CapDrop 被故意拿掉…`——任何原因导致的失败（包括这一次的
+      `invalid_spec`）都能骗过它，于是这个 job 一直绿着。现在核对的是**断言消息**（`CapDrop 必须是`，
+      只在 I10 里出现），并且先排除「根本没跑到用例」（`did not finish before its parent` /
+      `Error [ProviderError]`）。
+    - **诊断步骤只输出 `✖` 用例名**，看不到原因。现在同时输出：两个日志的**第一条错误**（含 25 行栈）
+      并把它变成 `::error::` annotation、冒烟日志**开头 40 行**（preflight 的平台 / 镜像引用 / 代理）、
+      以及 `docker image inspect … digests=…` 与 `docker info` 的存储驱动——下一轮一眼就能看出
+      RepoDigests 是不是空的。顺带把 `grep … | head` 的 `write error: Broken pipe` 用 `|| true` 收掉。
 
 ---
 ---

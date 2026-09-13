@@ -9,6 +9,9 @@
 #   negative-control 故意把 `CapDrop` 清空（`SMOKE_NEGATIVE_CONTROL=1`，钩子在
 #                    provider/local-docker.ts 的 buildSandboxContainerRequest 里，一眼可见），
 #                    再跑 `--tag=isolation`，然后**断言它必须失败**，且失败原因正是 CapDrop。
+#                    注意「原因」核对的是**断言消息**（`CapDrop 必须是`），不能只 grep `CapDrop`：
+#                    入口自己会打一行 `⚠️ …CapDrop 被故意拿掉…`，任何故障都能骗过那个写法
+#                    （Phase 7 备注 19 记了 CI 第四轮是怎么被骗的）。
 # 少了第二个 job，第一个 job 就只是一段永远绿的装饰性代码——你永远不知道它是不是其实
 # 什么都没在测（这一句也是 spec 的原话）。
 #
@@ -60,10 +63,15 @@ jobs:
           npm run build:image
           npm run build:proxy-image
 
-      - name: 记录镜像 digest（排障时要能对上"跑的到底是哪个镜像"）
+      - name: 记录镜像 digest 与存储驱动（排障时要能对上"跑的到底是哪个镜像"）
         run: |
-          docker image inspect --format 'sandbox-base: {{.Id}}' reuben-cloud/sandbox-base:dev
-          docker image inspect --format 'egress-proxy: {{.Id}}' reuben-cloud/egress-proxy:dev
+          # RepoDigests 是这一轮才打出来的关键信息：经典存储（overlay2 / graphdriver）下，
+          # 本地构建的镜像**没有** RepoDigests（`[]`），resolveImageRef() 只能退回镜像 ID——
+          # CI 第四轮的"四个冒烟组全灭"与那条路上的 invalid_spec 逐字一致（见 docs/sandbox-spec.md
+          # Phase 7 备注 19），这行 log 就是下一轮的确认手段。
+          docker image inspect --format 'sandbox-base: {{.Id}} digests={{json .RepoDigests}}' reuben-cloud/sandbox-base:dev
+          docker image inspect --format 'egress-proxy: {{.Id}} digests={{json .RepoDigests}}' reuben-cloud/egress-proxy:dev
+          docker info --format '镜像存储：{{.Driver}} {{json .DriverStatus}}；Docker {{.ServerVersion}}'
 
       - name: 起出网代理
         run: npm run proxy:up
@@ -79,16 +87,32 @@ jobs:
       - name: 失败时收集诊断信息
         if: failure()
         run: |
-          # 挂掉的用例名 → annotation。annotations 框里默认只有 job 名，
-          # 而"哪一条用例挂了"才是第一眼要看到的（截图/粘贴也就说得清）。
-          for log in /tmp/unit.log /tmp/smoke.log; do
-            if [ -f "$log" ]; then
-              echo "===== $log 里失败的用例 ====="
-              grep -E "^[[:space:]]*(✖|not ok)" "$log" | head -20 | while IFS= read -r line; do
-                echo "::error::$line"
-              done
+          # 日志里"挂掉的用例名"与"真正的原因"在**两处**：✖ 那一行只有名字，原因
+          # （AssertionError / ProviderError / before 钩子失败）在详情块里。所以：
+          #   1) 把两个日志的第一条错误连栈打出来，并把它变成 annotation
+          #      （annotations 框里默认只有 job 名，而 CI 失败的第一轮往往只能拿到一张截图）；
+          #   2) 把冒烟日志的**开头**（preflight：平台 / 镜像引用 / 代理）也贴上——
+          #      "根本没起沙箱"与"用例断言挂了"的区别就在那几行里。
+          # `|| true`：head 凑够行数就关管道，grep 会收到 EPIPE；那行 Broken pipe 无害，
+          # 但看着像第二个故障。
+          dump_errors() {
+            local log="$1" line
+            [ -f "$log" ] || return 0
+            echo "===== $log 里失败的用例（✖）====="
+            grep -E "^[[:space:]]*(✖|not ok)" "$log" | head -20 || true
+            line="$(grep -n -m 1 -E '^ +[A-Za-z]*Error( \[[A-Za-z_]+\])?:' "$log" | cut -d: -f1 || true)"
+            if [ -n "$line" ]; then
+              echo "===== $log 第一条错误（$line 行起，含栈）====="
+              sed -n "${line},$((line + 25))p" "$log"
+              # annotation 里放不下整段栈，放错误的消息行（% 要转义成 %25，否则 GitHub 会当成自己的转义）。
+              echo "::error::$(sed -n "${line}p" "$log" | sed 's/^ *//; s/%/%25/g')"
             fi
-          done
+          }
+          dump_errors /tmp/unit.log
+          dump_errors /tmp/smoke.log
+
+          echo "===== 冒烟日志开头（preflight）====="
+          head -40 /tmp/smoke.log 2>/dev/null || true
 
           docker ps -a
           docker network inspect reuben-cloud-internal || true
@@ -140,7 +164,19 @@ jobs:
 
           # 失败必须是**我们故意的那个原因**。否则一个坏掉的 runner（Docker 挂了、镜像没建出来）
           # 也会让这个 job"通过"，那就从"有牙齿"退化成了"只要红就行"。
-          if ! grep -q "CapDrop" /tmp/negative-control.log; then
+          #
+          # 两道检查。第一道先排除"根本没跑到用例"：建沙箱阶段挂掉时，整个 isolation 组
+          # 会被 node --test 报成 cancelled（`did not finish before its parent`），那同样是非 0 退出。
+          if grep -qE "did not finish before its parent|Error \[ProviderError\]" /tmp/negative-control.log; then
+            echo "::error::isolation 在建沙箱/加载阶段就挂了，不是 I10 那条断言——先看上面的日志开头。"
+            head -40 /tmp/negative-control.log
+            exit 1
+          fi
+
+          # 第二道核对**断言消息**，而不是随便一个含 `CapDrop` 的行：入口自己那行提示
+          # （`⚠️ SMOKE_NEGATIVE_CONTROL=1：CapDrop 被故意拿掉…`）里就有这个词，
+          # 只 grep `CapDrop` 的话，任何原因导致的失败都能骗过这道门（CI 第四轮就是这么被骗的）。
+          if ! grep -qF 'CapDrop 必须是' /tmp/negative-control.log; then
             echo "::error::isolation 确实失败了，但失败原因不是 CapDrop 那条断言——见上面日志，"
             echo "::error::先确认不是环境问题（Docker daemon / 镜像 / 代理）。"
             exit 1
@@ -151,5 +187,10 @@ jobs:
       - name: 反向验证失败时收集诊断信息
         if: failure()
         run: |
+          # 这个 job 的失败有两种：真环境坏了，或者"红的原因不对"。两种都要看**开头**
+          # （preflight 的镜像引用 / 代理）——只看尾部会把"建沙箱失败"当成断言失败。
+          echo "===== 反向验证日志开头（preflight）====="
+          head -40 /tmp/negative-control.log 2>/dev/null || true
+          echo "===== 反向验证日志尾部 ====="
+          tail -120 /tmp/negative-control.log 2>/dev/null || true
           docker ps -a || true
-          cat /tmp/negative-control.log 2>/dev/null | tail -200 || true
