@@ -586,20 +586,33 @@ acquireSandbox(sessionId):                     // 工具层第一次要用沙箱
   ③ 返回 SandboxTarget（工具层拿到的东西与 M0 完全一样）
 
 reapIdleSessions(now):                         // 扩展现有 manager/sweeper.ts
-  for session where sandbox_id is not null
-                 and now() - sandbox_last_used_at > IDLE_TTL:
-      flush(session)                           // 有改动才推；无改动跳过
-      destroy(sandbox)；UPDATE sessions SET sandbox_id = null
+  for session where sandbox_id is not null:
+      if sessions.active_run_id is not null → continue       // 正在处理一句话：绝不回收
+      if sandbox 有 in-flight execution     → continue       // 正在跑命令：绝不回收
+      if now() - sandbox_last_used_at > IDLE_TTL
+            → reap(session, reason='idle')                   // 真闲着：flush + destroy
+      else if now() - sandbox.created_at > MAX_LIFETIME
+            → rotate(session, reason='max_lifetime')         // 换容器，不是砍任务
+
+// reap 与 rotate 的动作一样（flush → destroy），区别只在原因与后续：
+//   reap：下次要用时重建；rotate：立即重建（或懒到下一次工具调用再建，两者都可，后者更省）
+// flush 在两种情况下都不推：没有改动（diff 为空）
 ```
 
 **三条硬规则**：
 
 1. **一个会话同时只有一次执行在跑**：靠 `sessions.active_run_id` 的条件更新抢锁（不用 advisory lock，
    因为它是事务级的，而一次执行跨很多事务）。抢不到就拒，明确错误码 `session_busy`。
-2. **空闲 TTL 是硬配置**：默认 30 分钟，上限 2 小时（env 可调）。到点一定回收——
-   热着复用的代价就是容器占着内存，不能没有上限。
+2. **空闲 TTL 从“最后一次活动”算起，而且续时是自动的**：用户发言、每次模型调用、每次工具调用
+   （含沙箱文件 API）都会 `touchSession()` 把 `sandbox_last_used_at` 推到当前时间。默认 30 分钟
+   （env 可配），但**只在真的闲着时才计时**：正在处理一句话、或沙箱里有在跑的命令，到点也只续时，
+   绝不回收。一句话跑了 50 分钟不会被砍——期间每次工具调用都在续时。
 3. **回收前必须落地**：`flush()` 失败（推送失败/网络）→ **不销毁沙箱**，标 `flush_failed`，
    下个周期重试；连续 3 次仍失败 → 按 M0 Phase 10 的兜底落 archive 到对象存储再销毁。
+4. **容器总寿命（6h）到点是“换容器”，不是“砍任务”**：先等当前活动结束（在跑的 exec 最多
+   再等它自己的 600s 超时）→ flush → destroy → 下一次工具调用自动建新沙箱。用户只会看到
+   “下一句慢一点”。唯一的例外是真卡死：超过总寿命再加 30 分钟宽限仍无任何活动结束 → 强制回收
+   （这条是给跑飞的进程准备的，不是常规路径）。
 
 **为什么不用"一句一沙箱 + 每句推送"**（v1 草案）：讨论型的一句也要建沙箱、装依赖、推 Git；
 十句就是十次 clone + 十次 push。它把"每句都付固定成本"当成了常态。
@@ -642,6 +655,9 @@ reapIdleSessions(now):                         // 扩展现有 manager/sweeper.t
 | 15 | 落地失败不丢数据 | 注入 push 失败 → 沙箱**不**被销毁、状态 `flush_failed`；重试成功后销毁 |
 | 16 | 硬崩 | 直接删容器 → `ERROR(container_lost)`；会话保留，下一句能重建沙箱 |
 | 17 | 轮次标记 | `listRuns(sessionId)` 返回两句；每句的 `start_entry_id`/`end_entry_id` 能把 entries 切成两段而不重叠 |
+| 18 | 续时（空闲 TTL 从最后一次活动算） | 会话每 25 分钟发一句话、连续 3 次 → 沙箱**不**被回收（`provider.create` 仍为 1 次） |
+| 19 | 干活中不回收 | 拨快时钟穿过 IDLE_TTL，同时有一次长 exec 在跑 → 沙箱**不**被销毁；exec 结束后才进入回收 |
+| 20 | 总寿命到点换容器 | 拨快时钟到 6h；当前 exec 结束后 flush + destroy；下一次工具调用新建 1 个，会话继续（历史不断） |
 
 ### 验收标准
 
@@ -1396,6 +1412,9 @@ export const SECTIONS = [
   { name: "task",      budget: 0.10,  hard: true  },
   { name: "seed",      budget: 0.03,  hard: false },
   { name: "history",   budget: null,  hard: false },   // 剩余空间，不截断（由 compaction 管）
+  // 【预留，M2 不实现】用户文档知识库召回。没有配置知识库 / 开关为关时，这个分区不存在，
+  // 编译产物与 M2 完全一致——留接缝不等于提前实现，这一点要有测试兜住（下面第 11 条）。
+  // { name: "knowledge", budget: 0.10, hard: false },
 ] as const
 ```
 
@@ -1472,6 +1491,7 @@ Anthropic：在 `system` 末尾与 `repo_map` 末尾各打一个 `cache_control:
 | 8 | 压缩后编译 | 含 compactionSummary 的会话 → 编译出的 messages 含摘要前缀 |
 | 9 | 缓存断点 | 两次编译（仅 history 不同）→ 前缀部分（tools/system/repo_map）hash 相同 |
 | 10 | 回放 | 随机取 5 个历史 (session, turn) → 重建的输入逐字节等于当时记录 |
+| 11 | 预留分区缺席 | 不配置知识库 → 编译产物里没有 `knowledge` 分区，且与不加预留代码时逐字节相同 |
 
 ### 验收标准
 
