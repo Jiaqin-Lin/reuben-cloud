@@ -8,9 +8,9 @@
  * 而不是一个没人知道的孤儿容器。
  *
  * 【它不负责什么】不碰 docker socket（那是 provider 的唯一特权）、不拼 SQL
- * （那是 db/ 的事）、不做归档（Phase 10 的钩子挂在 sweeper 上）、不做重试策略
- * （属于 Phase 11 的工具层）。它只保证：每次状态变化都经过 transition()，
- * 每一次执行都有终态记录。
+ * （那是 db/ 的事）、不实现归档本身（那是 `artifacts/offload.ts` 的事——
+ * manager 只负责决定"什么时候归档、失败了怎么办"）。它只保证：每次状态变化都经过
+ * transition()，每一次执行都有终态记录。
  *
  * 【两条计时，缺一不可】§E 的原话。第一道是沙箱自己的 timeout（Phase 1 §9），
  * 这里实现的是**第二道**：看门狗（`timeoutMs + watchdogGraceMs`）。
@@ -21,6 +21,9 @@
 
 import { AGENT_TERMINAL_EVENTS, SandboxApiError, SandboxApiClient } from "../client/sandbox-api.ts";
 import type { AgentExecAccepted } from "../client/sandbox-api.ts";
+import type { ArtifactSummary, OffloadStep } from "../artifacts/offload.ts";
+import { ArtifactOffloader, OffloadError } from "../artifacts/offload.ts";
+import type { ArtifactStore } from "../artifacts/store.ts";
 import type { SseEvent } from "../client/sse.ts";
 import type { Db } from "../db/client.ts";
 import { recordExecution } from "../db/executions.ts";
@@ -94,7 +97,9 @@ export type SandboxManagerErrorReason =
   /** 事件流断了且重连用尽。 */
   | "stream_failed"
   /** 状态转换被别人抢先（并发），或行已经不在了。 */
-  | "state_conflict";
+  | "state_conflict"
+  /** 销毁前的归档还没成功（还在 10 分钟宽限期内）。`details.step` 是失败的环节。 */
+  | "archive_failed";
 
 /** Manager 层的失败。与 `ProviderError` / `SandboxApiError` 一样：调用方按 `reason` 分支。 */
 export class SandboxManagerError extends Error {
@@ -111,6 +116,52 @@ export class SandboxManagerError extends Error {
 
 // ---------------------------------------------------------------- 输入/输出
 
+/** 销毁前的归档设定（Phase 10）。给了才启用；不给就是裸跑/测试模式（与 Phase 8 行为一致）。 */
+export interface ArtifactOffloadOptions {
+  store: ArtifactStore;
+  /** 归档的总尝试次数（含第一次），默认 3。 */
+  attempts?: number;
+  /** 重试退避基数，默认 500ms（指数增长）。 */
+  backoffMs?: number;
+  /** 最后一次尝试之前的宽限期，默认 10 分钟（spec 的硬要求）。 */
+  graceMs?: number;
+  /** 归档体积软配额，不给就用沙箱的 `limits.diskMb`。 */
+  maxArchiveBytes?: number;
+  /** 可注入时钟（宽限期判断用；测试会拨快它）。 */
+  now?: () => Date;
+}
+
+/**
+ * 归档失败后的宽限期（spec："10 分钟宽限期后再试一次"）。
+ * 它不是一个"等 10 分钟再考虑"的定时器，而是"下一次销毁请求要先看看距第一次失败过没过 10 分钟"。
+ */
+export const ARCHIVE_GRACE_MS = 10 * 60_000;
+
+/** 销毁前的归档结果。`allowDestroy=false` 时 manager 会抛 `archive_failed`。 */
+export interface ArchiveOutcome {
+  /** 是否允许继续销毁（false = 首次失败、还在宽限期内）。 */
+  allowDestroy: boolean;
+  /** 产出是否已全部落到对象存储。没起来过的沙箱是 false + skipped。 */
+  archived: boolean;
+  /** 跳过归档的原因（`no_endpoint` / `already_destroyed`）。 */
+  skipped: string | null;
+  /** 宽限期过后仍然存不上去，被**强制**销毁（产出可能永远丢了）。 */
+  forced: boolean;
+  /** 失败的环节（`archive` / `exec_log`）。 */
+  failedStep: OffloadStep | null;
+  /** 上传成功的 artifacts 行。 */
+  artifacts: ArtifactSummary[];
+}
+
+/** `destroySandbox()` 的结果。Phase 12 会把它写进 Run 结果（`archive_failed` 就在里面）。 */
+export interface DestroyReport {
+  sandboxId: string;
+  /** 销毁后的状态（并发抢改时可能是别的）。 */
+  state: SandboxState | "missing";
+  /** 启用归档时是归档结果，否则是 null。 */
+  archive: ArchiveOutcome | null;
+}
+
 export interface SandboxManagerOptions {
   db: Db;
   provider: SandboxProvider;
@@ -123,6 +174,8 @@ export interface SandboxManagerOptions {
   watchdogGraceMs?: number;
   /** kill 之后等终态的时长，默认 15s；测试会调小。 */
   watchdogKillWaitMs?: number;
+  /** Phase 10：销毁之前把产出落到对象存储。不给 = 不归档（裸跑、单测）。 */
+  artifacts?: ArtifactOffloadOptions;
   log?: LogFn;
 }
 
@@ -202,7 +255,19 @@ export class SandboxManager {
   readonly #limits: SandboxLimits;
   readonly #watchdogGraceMs: number;
   readonly #watchdogKillWaitMs: number;
+  readonly #offloader: ArtifactOffloader | null;
+  readonly #offload: ArtifactOffloadOptions | null;
   readonly #log: LogFn;
+  /**
+   * 归档失败的"第一次"时刻（宽限期从这里算）。
+   *
+   * 【为什么是内存】它是**策略的计时器，不是事实**：失败事实本身已经落在 DB 里
+   * （`ERROR(archive_failed)` + 审计行），而"距第一次失败过了多久"可以用内存里的这个
+   * 时间戳回答。CP 重启后计时重新开始 —— 最坏的影响是这台沙箱在宽限期里多活 10 分钟，
+   * 而它不会让任何产出被提前删掉（归档没成功就不会销毁，除非宽限到了 → 强制销毁，
+   * 而那时时钟总是 >= 10 分钟）。
+   */
+  readonly #archiveFailures = new Map<string, Date>();
 
   constructor(options: SandboxManagerOptions) {
     this.#db = options.db;
@@ -212,7 +277,21 @@ export class SandboxManager {
     this.#limits = { ...DEFAULT_LIMITS, ...options.defaultLimits };
     this.#watchdogGraceMs = options.watchdogGraceMs ?? WATCHDOG_GRACE_MS;
     this.#watchdogKillWaitMs = options.watchdogKillWaitMs ?? WATCHDOG_KILL_WAIT_MS;
+    // `#log` 要先于 offloader 构造（offloader 自己也要一根日志线）。
     this.#log = options.log ?? noopLog;
+    this.#offload = options.artifacts ?? null;
+    this.#offloader =
+      this.#offload === null
+        ? null
+        : new ArtifactOffloader({
+            db: this.#db,
+            store: this.#offload.store,
+            api: this.#api,
+            ...(this.#offload.maxArchiveBytes === undefined
+              ? {}
+              : { maxArchiveBytes: this.#offload.maxArchiveBytes }),
+            log: this.#log,
+          });
   }
 
   get provider(): SandboxProvider {
@@ -633,15 +712,40 @@ export class SandboxManager {
    * 销毁沙箱。**幂等**：provider.destroy 幂等，状态已经是 DESTROYED 时只做一次物理清理，
    * 不再写审计行（否则每次重试都会多一条"销毁"记录，轨迹就没法看了）。
    *
-   * `archive` 不在这个函数里：它是 Phase 10 的钩子，挂在 sweeper 上（销毁之前调用）。
-   * 理由是同一条：归档属于"产出"，不属于"资源回收"。
+   * 【Phase 10 起多了一步：先归档】顺序是：
+   *   ① （启用时）拉 diff → dryRun → 归档 → 执行日志，全部落到对象存储
+   *   ② provider.destroy（容器 + 卷）
+   *   ③ transition(DESTROYED)
+   * ① 必须在 ② 前面：沙箱一销毁，`log_path` 与整个 workspace 都没有第二份了。
+   *
+   * 【为什么 ② 在 ③ 前面（与 spec 那一段的次序表相反）】spec 那张表写的是
+   * transition(DESTROYED) → provider.destroy。反过来做的话，destroy 失败时会留下一行
+   * **DESTROYED 但容器还活着**的记录——而 DESTROYED 没有出边（§D），对账又只扫
+   * 非 DESTROYED 的行，那个容器会永远没人认领。先删容器再改状态，崩在中途留下的是
+   * "RECORD 还在、容器已没了"，那正是 TTL 重试与对账都能处理的状态。
+   *
+   * 【归档失败怎么办】见 `#archiveBeforeDestroy`：重试 3 次 → `ERROR(archive_failed)`
+   * 并**不销毁** → 宽限期过后再试一次 → 仍失败则强制销毁（并把 `archive_failed` 写进
+   * 返回的报告与 `state_reason`）。
    */
-  async destroySandbox(sandboxId: string, reason = "destroyed"): Promise<void> {
+  async destroySandbox(sandboxId: string, reason = "destroyed"): Promise<DestroyReport> {
     const row = await getSandbox(this.#db, sandboxId);
     if (row === null) {
+      this.#archiveFailures.delete(sandboxId);
       throw new SandboxManagerError("sandbox_missing", `沙箱 ${sandboxId} 不存在`, { sandboxId });
     }
 
+    // ① 归档（只在启用时）。宽限期内失败会抛 archive_failed，由调用方决定重试时机。
+    const archive = this.#offloader === null ? null : await this.#archiveBeforeDestroy(row, this.#offloader);
+    if (archive !== null && !archive.allowDestroy) {
+      throw new SandboxManagerError("archive_failed", `沙箱 ${sandboxId} 的产出还没归档成功，暂不销毁`, {
+        sandboxId,
+        step: archive.failedStep,
+        reason,
+      });
+    }
+
+    // ② 物理销毁。provider 报 not_found = 已经没了，这不是失败。
     try {
       await this.#provider.destroy(sandboxId);
     } catch (error) {
@@ -657,13 +761,111 @@ export class SandboxManager {
       }
     }
 
-    if (row.state === "DESTROYED") return;
+    // ③ 状态收尾。已是 DESTROYED 的行不重复写审计（幂等）。
+    if (row.state === "DESTROYED") {
+      this.#archiveFailures.delete(sandboxId);
+      return { sandboxId, state: "DESTROYED", archive };
+    }
     const moved = await transition(this.#db, sandboxId, ["CREATING", "READY", "BUSY", "ERROR"], "DESTROYED", reason, {
       destroyed_at: new Date(),
+      // 强制销毁时把"产出没存上"这件事写进 state_reason：Run 结果（Phase 12）
+      // 与事后排障都要靠它，光看 DESTROYED 是看不出来产出丢了的。
+      ...(archive?.forced === true ? { state_reason: "archive_failed" } : {}),
     });
+    this.#archiveFailures.delete(sandboxId);
     if (!moved.ok) {
       const current = currentStateOf(moved);
       this.#log("warn", `沙箱 ${sandboxId} 的 → DESTROYED 没有生效（当前 ${current}）`, { reason });
+      return { sandboxId, state: current, archive };
+    }
+    return { sandboxId, state: "DESTROYED", archive };
+  }
+
+  /**
+   * 销毁前的归档策略（spec Phase 10 §2 的那三条）。**只在 `artifacts` 设定存在时调用**。
+   *
+   * 状态机视角：
+   *  - 第一次失败：`{CREATING,READY,BUSY} → ERROR(archive_failed)`，本轮不销毁。
+   *    行已经是 ERROR 的（比如上一轮 destroy_failed）转不了 ERROR→ERROR，这时
+   *    内存里的 `#archiveFailures` 就是宽限期的唯一依据（已在字段注释里说明）。
+   *  - 宽限期内：直接返回 `allowDestroy:false`，**不重复跑三次**——60 秒后的下一轮
+   *    再跑一遍相同重试只是把同一份错误刷屏，不会提高成功率。
+   *  - 宽限期后：最后试一次（单次，不重试）。成功 → 正常销毁；仍失败 → 强制销毁，
+   *    `forced=true` 会被写进 `state_reason` 与返回的报告。
+   */
+  async #archiveBeforeDestroy(row: SandboxRow, offloader: ArtifactOffloader): Promise<ArchiveOutcome> {
+    const notAllowDestroy = (outcome: Omit<ArchiveOutcome, "allowDestroy">): ArchiveOutcome => ({
+      ...outcome,
+      allowDestroy: false,
+    });
+
+    if (row.state === "DESTROYED") {
+      // 已经销毁过的行（幂等重试）没有"再归档一次"的道理：沙箱可能已经不在了。
+      return { allowDestroy: true, archived: false, skipped: "already_destroyed", forced: false, failedStep: null, artifacts: [] };
+    }
+
+    const failedAt = this.#archiveFailures.get(row.id) ?? null;
+    if (failedAt !== null) {
+      const graceMs = this.#offload?.graceMs ?? ARCHIVE_GRACE_MS;
+      const elapsedMs = (this.#offload?.now?.() ?? new Date()).getTime() - failedAt.getTime();
+      if (elapsedMs < graceMs) {
+        this.#log("info", `沙箱 ${row.id} 的产出尚未归档成功，宽限期内暂不销毁`, { elapsedMs, graceMs });
+        return notAllowDestroy({ archived: false, skipped: null, forced: false, failedStep: "archive", artifacts: [] });
+      }
+      // 宽限到了：最后试一次。这一步**不再重试**——它本身就是"重试 3 次失败了"之后的那次。
+      try {
+        const report = await offloader.offload(row);
+        this.#archiveFailures.delete(row.id);
+        return {
+          allowDestroy: true,
+          archived: report.skipped === null,
+          skipped: report.skipped,
+          forced: false,
+          failedStep: null,
+          artifacts: report.artifacts,
+        };
+      } catch (error) {
+        this.#archiveFailures.delete(row.id);
+        const step = failedStepOf(error);
+        this.#log("error", `沙箱 ${row.id} 宽限期后的最后一次归档仍然失败，强制销毁`, {
+          step,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return {
+          allowDestroy: true,
+          archived: false,
+          skipped: null,
+          forced: true,
+          failedStep: step,
+          artifacts: [],
+        };
+      }
+    }
+
+    try {
+      const report = await offloader.offloadWithRetries(row, {
+        ...(this.#offload?.attempts === undefined ? {} : { attempts: this.#offload.attempts }),
+        ...(this.#offload?.backoffMs === undefined ? {} : { backoffMs: this.#offload.backoffMs }),
+      });
+      return {
+        allowDestroy: true,
+        archived: report.skipped === null,
+        skipped: report.skipped,
+        forced: false,
+        failedStep: null,
+        artifacts: report.artifacts,
+      };
+    } catch (error) {
+      const step = failedStepOf(error);
+      this.#archiveFailures.set(row.id, this.#offload?.now?.() ?? new Date());
+      // 从 ERROR 出发没有 ERROR→ERROR 这条边，所以已经是 ERROR 的行这里会静默不生效
+      // （只留一条 warn 日志）——宽限期仍然由上面的内存时间戳守着。
+      await this.#transitionOrLog(row.id, ["CREATING", "READY", "BUSY"], "ERROR", "archive_failed");
+      this.#log("error", `沙箱 ${row.id} 归档失败，标记 ERROR 并等待宽限期`, {
+        step,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return notAllowDestroy({ archived: false, skipped: null, forced: false, failedStep: step, artifacts: [] });
     }
   }
 }
@@ -708,6 +910,11 @@ export function validateExecRequest(request: ExecInSandboxRequest): CleanExecReq
     timeoutMs,
     maxOutputBytes: request.maxOutputBytes,
   };
+}
+
+/** `OffloadError` → 失败的环节；其他异常（网络、DB 写入）归到 `archive`。 */
+function failedStepOf(error: unknown): OffloadStep {
+  return error instanceof OffloadError ? error.step : "archive";
 }
 
 /** 从镜像引用里取出 digest 部分（`repo@sha256:…` → `sha256:…`；裸镜像 ID 原样）。 */

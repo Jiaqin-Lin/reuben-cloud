@@ -11,6 +11,12 @@
  * 【什么时候写】只有上传成功之后才落行（三列都是 NOT NULL）：一行"指向不存在对象的
  * artifact"比没有这行更坏——它会让上层相信那份产出还在。Phase 10 的上传失败路径
  * 应该是"只有对象、没有行"（下一次对账/重跑可以覆盖），而不是反过来。
+ *
+ * 【为什么写行是 upsert 而不是纯 INSERT】Phase 10 的归档可重试：同一份产出（
+ * 同一次 Run 的 diff.patch、同一台沙箱的归档）可能被上传第二遍。`object_key` 上的
+ * 唯一索引（003）让第二遍落到 `DO UPDATE`：**一行 = 对象现在是什么样子**。
+ * 没有它，一次 MinIO 抖动会留下两行指向同一个 key、却带着不同 sha256 的记录，
+ * 而"哪一行是真的"从此没有答案。
  */
 
 import type { Queryable } from "./client.ts";
@@ -49,6 +55,13 @@ export async function insertArtifact(q: Queryable, input: InsertArtifactInput): 
     q,
     `INSERT INTO artifacts (id, run_id, sandbox_id, kind, object_key, size_bytes, sha256)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (object_key) DO UPDATE
+       SET run_id = EXCLUDED.run_id,
+           sandbox_id = EXCLUDED.sandbox_id,
+           kind = EXCLUDED.kind,
+           size_bytes = EXCLUDED.size_bytes,
+           sha256 = EXCLUDED.sha256,
+           created_at = now()
      RETURNING *`,
     [
       input.id,

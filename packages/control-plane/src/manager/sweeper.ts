@@ -10,6 +10,12 @@
  * "先删后归档"会永久丢掉那份产出，是本项目里最不能接受的一种失败。
  * Phase 8 不传这个钩子（归档是 Phase 10 的事），传了就用。
  *
+ * 【Phase 10 之后这个钩子与生产路径的关系】生产的归档在 `SandboxManager.destroySandbox()`
+ * 里（它能拿到 provider/agent 与重试策略，还带 10 分钟宽限期）。这个钩子是**更早的、
+ * 更通用的钩子**：Phase 8 的测试用它验证"失败就跳过销毁"这条语义，将来若有不经过
+ * manager 的销毁路径也可以用它。两边同时配会归档两次——目前没有这样的调用方，
+ * 真出现时应该删掉一边，而不是让两套策略同时跑。
+ *
  * 【只扫候选状态】DESTROYED 不在候选里（已经不需要销毁了）。ERROR 在：
  * 一个反复销毁失败的沙箱要靠下一轮 TTL 重试（这也是自愈的一部分）。
  */
@@ -36,7 +42,7 @@ export interface SandboxSweeperOptions {
   intervalMs?: number;
   /** 一次最多处理几个（免得一轮扫太久）。默认 50。 */
   batchSize?: number;
-  /** Phase 10 的归档钩子：TTL 到点、销毁之前调用。抛异常 = 这一轮不销毁。 */
+  /** TTL 到点、销毁之前调用的钩子（可选）。抛异常 = 这一轮不销毁。生产归档见文件头。 */
   archive?: (sandbox: SandboxRow) => Promise<void>;
   /** 可注入的时钟（测试用）。 */
   now?: () => Date;

@@ -1,0 +1,23 @@
+-- 003_artifact_object_key.sql —— object_key 唯一（Phase 10）。
+--
+-- 【为什么需要它】Phase 10 的归档是**可重试**的：MinIO 抖一下、CP 在宽限期内再试一次，
+-- 同一份产出（同一次 Run 的 diff.patch、同一台沙箱的归档）会被上传第二遍。没有约束时
+-- `insertArtifact` 会老老实实写第二行——两张"身份证"指向同一个对象，而且它们还可能
+-- 带着不同的 sha256（第二次的内容确实变了），从此没人知道哪一行是真的。
+--
+-- 【为什么不是"上传前先 SELECT 一下"】那是一个 check-then-act：两个并发的重试都查不到、
+-- 都去写，约束在数据库里才是真的（与 Phase 8 把状态机放进 SQL 函数是同一条理由）。
+-- 有了它，`insertArtifact` 用 `ON CONFLICT (object_key) DO UPDATE` 表达的就是
+-- **"这个对象现在是什么样子"**这层唯一语义。
+--
+-- 【为什么可以只加索引、不改表】对象 key 的布局（`runs/<runId>/…`）本身就是唯一命名：
+-- 一次 Run 的 diff 一份；归档带 sandboxId；执行日志带 executionId。撞 key 只可能来自
+-- "同一件东西传了第二遍"，而那种情况本来就应该落到同一行上（Phase 10 的语义：
+-- diff.patch 代表这次 Run 最新的产出，后一次覆盖前一次）。
+--
+-- 【为什么不怕存量数据】artifacts 表在 Phase 8 建出来之后一直没有写入者（Phase 10 才是
+-- 第一个），所以这个唯一索引在真实库上必然建得上。迁移仍然写成普通的 CREATE UNIQUE INDEX：
+-- 真出现了重复行，迁移失败需要人工看一眼（那是"Phase 10 之前有人手工插过数据"的证据），
+-- 静默去重会把这个证据抹掉。
+
+CREATE UNIQUE INDEX artifacts_object_key_idx ON artifacts (object_key);

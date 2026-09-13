@@ -19,6 +19,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
+import { CreateBucketCommand, S3Client } from "@aws-sdk/client-s3";
 import { Client } from "pg";
 import type { Db } from "../src/db/client.ts";
 import { ProviderError } from "../src/provider/types.ts";
@@ -57,6 +59,75 @@ export interface CommandResult {
   stdout: string;
   stderr: string;
 }
+
+/**
+ * 跑一条宿主命令并拿到**原始字节**（Node 的 stdout/stderr 管道本来就是 Buffer）。
+ *
+ * 【为什么不重用 `run()`】它把 stdout 解成 utf8 字符串——对 tar.gz 这种二进制流
+ * 是把内容弄坏（每个非 UTF-8 字节变成一个 U+FFFD）。归档类的断言（sha256、解包、
+ * 条目清单）必须看到原字节，所以脚手架里得有这么一份。
+ */
+export function runBinary(
+  argv: string[],
+  options: { cwd?: string; stdin?: Buffer; env?: NodeJS.ProcessEnv } = {},
+): Promise<BinaryResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(argv[0]!, argv.slice(1), {
+      cwd: options.cwd,
+      env: options.env ?? process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const chunks: Buffer[] = [];
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout: Buffer.concat(chunks), stderr }));
+    // stdin 一律接上再关：git 不读它，tar -tzf / tar -xzf 读它。
+    child.stdin.end(options.stdin);
+  });
+}
+
+export interface BinaryResult {
+  code: number | null;
+  stdout: Buffer;
+  stderr: string;
+}
+
+/**
+ * 把一份 tar.gz 解到一个**调用方指定的空目录**里，返回解出来的条目名。
+ * `--no-same-owner` 与不加 `-P` 是 spec 的要求（归档里可能有指向 workspace 外的符号链接，
+ * 解包时不能让它们变成绝对路径 / 改挂在别人身上）。
+ */
+export async function tarExtract(gzipped: Buffer, intoDir: string): Promise<string[]> {
+  const result = await runBinary(["tar", "--no-same-owner", "-xzf", "-", "-C", intoDir], { stdin: gzipped });
+  if (result.code !== 0) throw new Error(`tar -xzf 失败（归档不是合法的 tar.gz？）：${result.stderr.trim()}`);
+  const listed = await runBinary(["tar", "-tzf", "-"], { stdin: gzipped });
+  if (listed.code !== 0) throw new Error(`tar -tzf 失败：${listed.stderr.trim()}`);
+  return listed.stdout
+    .toString("utf8")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+}
+
+/** 把宿主上的一个目录打包成 tar.gz（`./...` 作为顶层）。归档样本与 fixture 都用它。 */
+export async function makeTarGz(sourceDir: string): Promise<Buffer> {
+  const result = await runBinary(["tar", "-czf", "-", "-C", sourceDir, "."], {
+    // macOS 的 bsdtar 会把扩展属性写成 `._*` AppleDouble 条目（Phase 7 踩过的坑）。
+    env: { ...process.env, COPYFILE_DISABLE: "1" },
+  });
+  if (result.code !== 0) throw new Error(`tar 打包失败：${result.stderr.trim()}`);
+  return result.stdout;
+}
+
+/**
+ * 假 agent 默认的归档响应体。**不是真正的 tar.gz**：它只保证"有字节流下来"，
+ * 需要验证归档内容的用例自己传 `onArchive().stream`（用 `makeTarGz()` 现造一份）。
+ */
+const DEFAULT_ARCHIVE_BODY = Buffer.from("fake-archive");
 
 /**
  * 跑一条宿主命令并收集输出。**产品代码不走这里**——集成测试要调 `docker` 做断言
@@ -607,6 +678,23 @@ export interface FakeAgentHooks {
   onEvents?: (executionId: string) => string[];
   /** 覆盖 POST /exec/{id}/kill 的响应。默认 200 + `{status:"killing"}`。 */
   onKill?: (executionId: string) => { status?: number; body?: Record<string, unknown> } | void;
+  /**
+   * GET /diff（Phase 10 的归档要用）。不给就给一份"没有改动"的合法响应。
+   * 返回的体里 `base` / `patch_bytes` 是客户端强校验的字段，覆盖时别忘了。
+   */
+  onDiff?: (query: URLSearchParams) => { status?: number; body?: Record<string, unknown> } | void;
+  /**
+   * GET /archive。`dryRun=1` 时用 `dryRun` 那两个字段；否则用 `stream` 作响应体。
+   * [关键] 真归档不预先给 content-length（沙箱那边就是这么流出来的），
+   * 所以这里用 `writeHead` + `pipe`，让客户端走真正的流式读。
+   */
+  onArchive?: (query: URLSearchParams) => {
+    status?: number;
+    dryRun?: { size_bytes: number; file_count: number };
+    stream?: Readable | Buffer | string;
+  } | void;
+  /** GET /files?raw=1&path=…（Phase 10 转存执行日志要用）。不给 body = 404。 */
+  onReadFile?: (path: string) => { status?: number; body?: Buffer | string } | void;
 }
 
 /**
@@ -729,6 +817,62 @@ export class FakeSandboxAgent {
         sendJson(res, override.status ?? 200, override.body ?? { execution_id: executionId, status: "killing" });
         return;
       }
+    }
+
+    if (req.method === "GET" && url.pathname === "/diff") {
+      const override = this.#hooks.onDiff?.(url.searchParams) ?? {};
+      // 缺省是一份"工作区没有任何改动"的合法响应：客户端会校验 base / patch_bytes。
+      sendJson(
+        res,
+        override.status ?? 200,
+        override.body ?? {
+          base: "0".repeat(40),
+          head: "0".repeat(40),
+          files: [],
+          patch: "",
+          patch_bytes: 0,
+          truncated: false,
+          patch_log_path: null,
+        },
+      );
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/archive") {
+      const override = this.#hooks.onArchive?.(url.searchParams) ?? {};
+      if (override.status !== undefined && override.status !== 200) {
+        sendJson(res, override.status, { error: "archive_failed", message: "fake agent 故意拒绝归档" });
+        return;
+      }
+      if (url.searchParams.get("dryRun") === "1") {
+        sendJson(res, 200, override.dryRun ?? { size_bytes: 0, file_count: 0 });
+        return;
+      }
+      const body = override.stream ?? DEFAULT_ARCHIVE_BODY;
+      res.writeHead(200, { "content-type": "application/gzip" });
+      if (Buffer.isBuffer(body) || typeof body === "string") {
+        res.end(body);
+      } else {
+        body.on("error", () => res.destroy());
+        body.pipe(res);
+      }
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/files" && url.searchParams.get("raw") === "1") {
+      const filePath = url.searchParams.get("path") ?? "";
+      const override = this.#hooks.onReadFile?.(filePath) ?? {};
+      if (override.body === undefined) {
+        sendJson(res, 404, { error: "not_found", message: `fake agent 没有这个文件：${filePath}` });
+        return;
+      }
+      const body = override.body;
+      res.writeHead(override.status ?? 200, {
+        "content-type": "application/octet-stream",
+        "content-length": Buffer.byteLength(body),
+      });
+      res.end(body);
+      return;
     }
 
     sendJson(res, 404, { error: "not_found", message: `fake agent 没有这条路由：${req.method} ${url.pathname}` });
@@ -1087,4 +1231,119 @@ async function gitOrFail(args: string[], cwd?: string, withIdentity = false): Pr
     throw new Error(`git ${args.join(" ")} 失败（exit ${result.code}）：${result.stderr.trim()}`);
   }
   return result.stdout;
+}
+
+// ---------------------------------------------------------------- Phase 10：MinIO
+
+export interface TestMinio {
+  containerName: string;
+  /** `http://127.0.0.1:<随机端口>`——SDK 用它。 */
+  endpoint: string;
+  bucket: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  /** `docker rm -f`（一次性容器，数据丢了就丢了）。 */
+  stop(): Promise<void>;
+}
+
+/**
+ * 一次性 MinIO 容器（spec Phase 10 的测试要点：用 MinIO 容器）。
+ *
+ * 【为什么端口随机】与 `startPostgres` 同一条理由：`node --test` 默认并行跑文件，
+ * 钉死 9000 会让两个集成测试文件撞在一起。用 `-p 127.0.0.1::9000` 让 Docker 分配。
+ *
+ * 【为什么由脚手架建桶】S3 的 CreateBucket 不是幂等的便利操作（AWS 上还牵扯 region），
+ * 每个用例都写一遍只会多一处会漂的实现。建完桶再把控制权交给用例。
+ *
+ * 【为什么健康检查用 HTTP 而不是"等端口通"】MinIO 起来后还要初始化磁盘，
+ * 端口通了不代表能签请求；`/minio/health/ready` 才是"能服务了"的定义。
+ */
+export async function startMinio(options: { image?: string; bucket?: string } = {}): Promise<TestMinio> {
+  const containerName = `rc-test-minio-${process.pid}-${randomBytes(3).toString("hex")}`;
+  const image = options.image ?? process.env.MINIO_IMAGE ?? "minio/minio:latest";
+  const accessKeyId = "reuben_cloud_test";
+  const secretAccessKey = "reuben_cloud_test_secret";
+  const bucket = options.bucket ?? "reuben-cloud-test";
+
+  await dockerOrThrow([
+    "run",
+    "-d",
+    "--name",
+    containerName,
+    "-e",
+    `MINIO_ROOT_USER=${accessKeyId}`,
+    "-e",
+    `MINIO_ROOT_PASSWORD=${secretAccessKey}`,
+    "-p",
+    "127.0.0.1::9000",
+    image,
+    "server",
+    "/data",
+  ]);
+
+  let endpoint = "";
+  try {
+    const portOutput = await dockerOrThrow(["port", containerName, "9000"]);
+    const port = Number(portOutput.trim().split("\n")[0]!.split(":").pop());
+    if (!Number.isInteger(port) || port <= 0) {
+      throw new Error(`拿不到 ${containerName} 的宿主端口：${JSON.stringify(portOutput)}`);
+    }
+    endpoint = `http://127.0.0.1:${port}`;
+    await waitForMinio(endpoint, 60_000);
+    await createBucket({ endpoint, accessKeyId, secretAccessKey, bucket });
+  } catch (error) {
+    await docker(["rm", "-f", containerName]);
+    throw error;
+  }
+
+  return {
+    containerName,
+    endpoint,
+    bucket,
+    accessKeyId,
+    secretAccessKey,
+    stop: async () => {
+      await docker(["rm", "-f", containerName]);
+    },
+  };
+}
+
+/** 轮询 `/minio/health/ready` 直到 200。 */
+async function waitForMinio(endpoint: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = "unknown";
+  for (;;) {
+    try {
+      const response = await fetch(`${endpoint}/minio/health/ready`);
+      if (response.status === 200) return;
+      lastError = `HTTP ${response.status}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+    if (Date.now() >= deadline) throw new Error(`等 MinIO 就绪超时（${timeoutMs}ms）：${lastError}`);
+    await delay(300);
+  }
+}
+
+/** 建桶。已存在（BucketAlreadyOwnedByYou / BucketAlreadyExists）视同成功。 */
+async function createBucket(config: {
+  endpoint: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucket: string;
+}): Promise<void> {
+  const client = new S3Client({
+    endpoint: config.endpoint,
+    region: "us-east-1",
+    forcePathStyle: true,
+    credentials: { accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey },
+  });
+  try {
+    await client.send(new CreateBucketCommand({ Bucket: config.bucket }));
+  } catch (error) {
+    const name = (error as { name?: string }).name ?? "";
+    if (name !== "BucketAlreadyOwnedByYou" && name !== "BucketAlreadyExists") throw error;
+  } finally {
+    client.destroy();
+  }
 }

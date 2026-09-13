@@ -93,6 +93,13 @@ export interface AgentKillResponse {
   sha256: string;
 }
 
+/** `GET /archive?dryRun=1` 的响应（CP 读到的那两个字段）。 */
+export interface AgentArchiveStats {
+  /** 目录树的 apparent size（`du -sb` 口径），不是 tar.gz 之后的字节数。 */
+  sizeBytes: number;
+  fileCount: number;
+}
+
 /** `GET /diff` 的 `files[]` 一项（Phase 9/10 用它算影响面、写 artifacts）。 */
 export interface AgentDiffFile {
   path: string;
@@ -302,6 +309,35 @@ export class SandboxApiClient {
     if (options.offset !== undefined) params.set("offset", String(options.offset));
     if (options.limit !== undefined) params.set("limit", String(options.limit));
     return this.#openStream(`${endpoint}/files?${params}`, "GET", token, options.signal);
+  }
+
+  /**
+   * `GET /archive?dryRun=1` 的体积估计（附录 A-6）。Phase 10 用它做「卷 + 归档体积上限」
+   * 的**软**判断：超过就记警告，不阻断——归档的价值高于那一点空间。
+   *
+   * 【为什么可以不带 exclude】默认归档 = 整个 workspace（含被 `.gitignore` 排除的构建产物，
+   * §J.6），dryRun 与真归档的参数必须一致，否则这个数字不是要拉的那份东西的大小。
+   * 所以这个方法不接受 exclude，与 `readArchive` 的缺省行为对齐。
+   */
+  async archiveStats(
+    endpoint: string,
+    token: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<AgentArchiveStats> {
+    const payload = await this.#json(`${endpoint}/archive?dryRun=1`, {
+      method: "GET",
+      token,
+      signal: options.signal,
+    });
+    const record = asRecord(payload);
+    const sizeBytes = typeof record["size_bytes"] === "number" ? record["size_bytes"] : null;
+    const fileCount = typeof record["file_count"] === "number" ? record["file_count"] : null;
+    if (sizeBytes === null || fileCount === null) {
+      throw new SandboxApiError("invalid_response", "/archive?dryRun=1 的响应缺少 size_bytes/file_count", {
+        details: { body: payload },
+      });
+    }
+    return { sizeBytes, fileCount };
   }
 
   /**
