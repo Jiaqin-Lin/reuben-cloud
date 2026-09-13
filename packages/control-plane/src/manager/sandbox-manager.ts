@@ -19,7 +19,7 @@
  * 所以这里的很多代码在正常路径上**永远不会执行**——它们是留给故障的那一半的。
  */
 
-import { SandboxApiError, SandboxApiClient } from "../client/sandbox-api.ts";
+import { AGENT_TERMINAL_EVENTS, SandboxApiError, SandboxApiClient } from "../client/sandbox-api.ts";
 import type { AgentExecAccepted } from "../client/sandbox-api.ts";
 import type { SseEvent } from "../client/sse.ts";
 import type { Db } from "../db/client.ts";
@@ -64,8 +64,11 @@ export const DEFAULT_LIMITS: SandboxLimits = {
   ttlSec: 21_600,
 };
 
-/** 终态事件四选一，互斥（§C.2）。 */
-export const TERMINAL_EVENTS: ReadonlySet<string> = new Set(["completed", "failed", "timeout", "killed"]);
+/**
+ * 终态事件四选一，互斥（§C.2）。**名单的来源在 client**：`execAndWait` 与 manager
+ * 必须认同一份定义，否则两条路对"什么算跑完了"的理解会静默地分叉。
+ */
+export const TERMINAL_EVENTS: ReadonlySet<string> = AGENT_TERMINAL_EVENTS;
 
 /** 有执行在跑时不接受新执行的状态。 */
 const NOT_READY_REASONS: Record<Exclude<SandboxState, "READY">, string> = {

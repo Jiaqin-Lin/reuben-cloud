@@ -13,10 +13,11 @@
 
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { Client } from "pg";
 import type { Db } from "../src/db/client.ts";
@@ -834,4 +835,256 @@ export function fakeManaged(sandboxId: string | null, overrides: Partial<Managed
     running: true,
     ...overrides,
   };
+}
+
+// ---------------------------------------------------------------- Phase 9：fixture 仓库与 smart-HTTP git 服务器
+
+/**
+ * 一个**真的** smart-HTTP git 服务器，背后是 git 自带的 CGI `git http-backend`。
+ *
+ * 【为什么不用 GitHub】CI 里没有 GitHub App 的私钥，而 Phase 9 的红线恰恰是
+ * "token 只走 `-c http.extraHeader`、绝不落盘"。这条红线的牙齿来自一个**会检查
+ * Authorization 头的真 HTTP 服务器**：没有它，用 `file://` 的 fixture 跑出来的
+ * "磁盘上没有 token"是一句空话（token 根本没被用过）。有了它，clone / push 走的是
+ * 真实的 smart-HTTP（info/refs、upload-pack、receive-pack），错误 token 会拿到 401。
+ *
+ * 【为什么套 http-backend 而不是自己实现协议】smart-HTTP 是二进制协议，手写一个假的
+ * 等于把"被测的东西"也一起换掉。http-backend 是 git 自带的 CGI，我们只给它套一个
+ * HTTP 外壳与一层鉴权。
+ */
+export interface GitHttpServer {
+  url: string;
+  root: string;
+  token: string;
+  /** 收到过的请求（断言"确实走过 HTTP"与"用的是哪个头"）。 */
+  readonly requests: Array<{ method: string; path: string; authorized: boolean }>;
+  close(): Promise<void>;
+}
+
+export async function startGitHttpServer(options: { root: string; token: string }): Promise<GitHttpServer> {
+  await mkdir(options.root, { recursive: true });
+  const requests: GitHttpServer["requests"] = [];
+  const expected = `Basic ${Buffer.from(`x-access-token:${options.token}`, "utf8").toString("base64")}`;
+
+  const server = http.createServer((req, res) => {
+    void handle(req, res);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const port = (server.address() as net.AddressInfo).port;
+
+  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? "/", "http://fixture");
+    const authorized = (req.headers.authorization ?? "") === expected;
+    requests.push({ method: req.method ?? "GET", path: url.pathname, authorized });
+    if (!authorized) {
+      req.resume(); // 把请求体丢掉，不然连接不会复用
+      res.writeHead(401, { "content-type": "text/plain", "www-authenticate": 'Basic realm="git"' });
+      res.end("authentication required\n");
+      return;
+    }
+    await serveGitBackend(req, res, port, options.root, url);
+  }
+
+  return {
+    url: `http://127.0.0.1:${port}`,
+    root: options.root,
+    token: options.token,
+    requests,
+    close: async () => {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+/** 把一条请求翻译成 CGI 环境变量，交给 `git http-backend`，再把 CGI 响应搬回 HTTP。 */
+async function serveGitBackend(
+  req: IncomingMessage,
+  res: ServerResponse,
+  port: number,
+  root: string,
+  url: URL,
+): Promise<void> {
+  const child = spawn("git", ["http-backend"], {
+    env: {
+      ...process.env,
+      GIT_PROJECT_ROOT: root,
+      GIT_HTTP_EXPORT_ALL: "1",
+      // push 的 pack 会被 http-backend 整体缓存到内存再交给 receive-pack，
+      // 默认上限 100MB。fixture 很小，但这个默认值在真实仓库上会直接 413，所以显式抬一下。
+      GIT_HTTP_MAX_REQUEST_BUFFER: "1G",
+      PATH_INFO: url.pathname,
+      // CGI 的 QUERY_STRING **不带**前导 `?`（带上的话 http-backend 认不出
+      // `service=git-receive-pack`，就会退回 dumb HTTP——clone 还能跑，push 直接死）。
+      QUERY_STRING: url.search.replace(/^\?/, ""),
+      REQUEST_METHOD: req.method ?? "GET",
+      CONTENT_TYPE: req.headers["content-type"] ?? "",
+      CONTENT_LENGTH: req.headers["content-length"] ?? "",
+      REMOTE_ADDR: "127.0.0.1",
+      REMOTE_USER: "x-access-token",
+      SERVER_PROTOCOL: "HTTP/1.1",
+      SERVER_NAME: "127.0.0.1",
+      SERVER_PORT: String(port),
+      GATEWAY_INTERFACE: "CGI/1.1",
+      HTTP_AUTHORIZATION: req.headers.authorization ?? "",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderr = (stderr + chunk.toString("utf8")).slice(-4_000);
+  });
+  const closed = new Promise<number | null>((resolve) => child.once("close", (code) => resolve(code)));
+  req.pipe(child.stdin);
+  res.on("close", () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  });
+
+  let buffer = Buffer.alloc(0);
+  let headersWritten = false;
+  for await (const chunk of child.stdout) {
+    const data = chunk as Buffer;
+    if (headersWritten) {
+      res.write(data);
+      continue;
+    }
+    buffer = Buffer.concat([buffer, data]);
+    const separator = buffer.indexOf("\r\n\r\n");
+    if (separator < 0) continue;
+    const head = buffer.subarray(0, separator).toString("utf8");
+    const rest = buffer.subarray(separator + 4);
+    const parsed = parseCgiHeaders(head);
+    res.writeHead(parsed.status, parsed.headers);
+    headersWritten = true;
+    if (rest.length > 0) res.write(rest);
+  }
+  const code = await closed;
+  if (!headersWritten) {
+    res.writeHead(500, { "content-type": "text/plain" });
+    res.end(`git http-backend 没有输出（exit ${code}）：${stderr}`);
+    return;
+  }
+  res.end();
+}
+
+function parseCgiHeaders(head: string): { status: number; headers: Record<string, string> } {
+  const headers: Record<string, string> = {};
+  let status = 200;
+  for (const line of head.split(/\r?\n/)) {
+    const separator = line.indexOf(":");
+    if (separator < 0) continue;
+    const key = line.slice(0, separator).trim().toLowerCase();
+    const value = line.slice(separator + 1).trim();
+    if (key === "status") status = Number(value.split(" ")[0]) || 200;
+    else headers[key] = value;
+  }
+  return { status, headers };
+}
+
+/** fixture 仓库的初始内容（含一个二进制文件与一个要被删除的文件）。 */
+const FIXTURE_FILES: Record<string, string | Buffer> = {
+  "README.md": "# rc-repo-fixture\n\nPhase 9 的仓库进出测试用它当远端。\n",
+  "src/greet.js": "module.exports = (name) => `hi ${name}`;\n",
+  "src/old-name.txt": "rename me\n",
+  "src/delete-me.txt": "delete me\n",
+  // 带 NUL 与非法 UTF-8 字节：二进制改动必须能过 --binary patch 这一关。
+  "assets/blob.bin": Buffer.from([0x00, 0x01, 0x02, 0x7f, 0x80, 0xfe, 0xff, 0x0a, 0x00, 0x42]),
+  ".gitignore": "dist/\nnode_modules/\n",
+};
+
+export interface GitFixtureRepo {
+  /** 裸仓库的宿主路径（http-backend 的 GIT_PROJECT_ROOT 下）。 */
+  bareDir: string;
+  /** HTTP clone 地址（`http://127.0.0.1:<port>/fixture/repo.git`）。 */
+  url: string;
+  /** 初始 commit 的 sha（`/diff?base=` 用它）。 */
+  baseSha: string;
+  branch: string;
+  /** 初始文件清单（相对仓库根）。 */
+  files: string[];
+}
+
+/** 在 `server.root` 下造一个裸仓库 fixture，并推一个初始提交进去。 */
+export async function createGitFixtureRepo(options: {
+  server: GitHttpServer;
+  owner?: string;
+  repo?: string;
+  branch?: string;
+}): Promise<GitFixtureRepo> {
+  const owner = options.owner ?? "fixture";
+  const repo = options.repo ?? "repo";
+  const branch = options.branch ?? "main";
+  const bareDir = path.join(options.server.root, owner, `${repo}.git`);
+  await mkdir(path.dirname(bareDir), { recursive: true });
+  await gitOrFail(["init", "--bare", "--initial-branch", branch, bareDir]);
+  // 裸仓库默认不收 push。smart-HTTP 的 receive-pack 要求显式打开。
+  await gitOrFail(["-C", bareDir, "config", "http.receivepack", "true"]);
+
+  const workDir = await mkdtemp(path.join(os.tmpdir(), "rc-fixture-"));
+  try {
+    await gitOrFail(["init", "-q", "--initial-branch", branch], workDir);
+    for (const [relative, content] of Object.entries(FIXTURE_FILES)) {
+      const target = path.join(workDir, relative);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, content);
+    }
+    await gitOrFail(["-C", workDir, "add", "-A"]);
+    await gitOrFail(["-C", workDir, "commit", "-qm", "fixture: 初始提交"], undefined, true);
+    const baseSha = (await gitOrFail(["-C", workDir, "rev-parse", "HEAD"])).trim();
+    await gitOrFail(["-C", workDir, "push", "-q", bareDir, `${branch}:refs/heads/${branch}`]);
+    await gitOrFail(["-C", bareDir, "symbolic-ref", "HEAD", `refs/heads/${branch}`]);
+    return { bareDir, url: `${options.server.url}/${owner}/${repo}.git`, baseSha, branch, files: Object.keys(FIXTURE_FILES) };
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * 站在“第三方”的位置往 fixture 的某条分支上推一个 commit。
+ * Phase 9 的 force-with-lease 保护用例需要它：远端在我们上次推完之后变了。
+ */
+export async function pushCommitToFixture(input: {
+  bareDir: string;
+  branch: string;
+  message: string;
+  files: Record<string, string | Buffer>;
+}): Promise<string> {
+  const workDir = await mkdtemp(path.join(os.tmpdir(), "rc-fixture-third-"));
+  try {
+    await gitOrFail(["clone", "-q", input.bareDir, workDir]);
+    // 分支可能在别处（还没创建）：那就在默认分支上开一条新的，而不是直接失败。
+    const exists = await run(["git", "-C", workDir, "rev-parse", "--verify", `origin/${input.branch}`]);
+    if (exists.code === 0) {
+      await gitOrFail(["-C", workDir, "checkout", "-q", "-B", input.branch, `origin/${input.branch}`]);
+    } else {
+      await gitOrFail(["-C", workDir, "checkout", "-q", "-b", input.branch]);
+    }
+    for (const [relative, content] of Object.entries(input.files)) {
+      const target = path.join(workDir, relative);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, content);
+    }
+    await gitOrFail(["-C", workDir, "add", "-A"]);
+    await gitOrFail(["-C", workDir, "commit", "-qm", input.message], undefined, true);
+    const sha = (await gitOrFail(["-C", workDir, "rev-parse", "HEAD"])).trim();
+    await gitOrFail(["-C", workDir, "push", "-q", "origin", `HEAD:refs/heads/${input.branch}`]);
+    return sha;
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+}
+
+/** fixture 里的 git 调用：身份、签名开关都显式传，CI runner 上没有全局配置。 */
+async function gitOrFail(args: string[], cwd?: string, withIdentity = false): Promise<string> {
+  const identity = withIdentity
+    ? ["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "-c", "commit.gpgsign=false"]
+    : [];
+  const result = await run(["git", ...identity, ...args], cwd === undefined ? {} : { cwd });
+  if (result.code !== 0) {
+    throw new Error(`git ${args.join(" ")} 失败（exit ${result.code}）：${result.stderr.trim()}`);
+  }
+  return result.stdout;
 }
