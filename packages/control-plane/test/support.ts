@@ -18,7 +18,17 @@ import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import net from "node:net";
 import path from "node:path";
-import type { SandboxSpec } from "../src/provider/types.ts";
+import { Client } from "pg";
+import type { Db } from "../src/db/client.ts";
+import { ProviderError } from "../src/provider/types.ts";
+import type {
+  ManagedSandbox,
+  SandboxHandle,
+  SandboxHealth,
+  SandboxInspection,
+  SandboxProvider,
+  SandboxSpec,
+} from "../src/provider/types.ts";
 
 // ---------------------------------------------------------------- 数据工厂
 
@@ -479,4 +489,349 @@ export class CleanupRegistry {
     this.#images.clear();
     return failed;
   }
+}
+
+// ---------------------------------------------------------------- Phase 8：一次性 Postgres
+
+/**
+ * 一个一次性 Postgres 容器（spec §0.5：不引 testcontainers）。
+ *
+ * 端口用 `-p 127.0.0.1::5432` 让 Docker 分配随机宿主端口，而不是钉死 55432：
+ * `node --test` 默认**并行跑文件**，两个集成测试文件各起一个 Postgres 时，
+ * 固定端口就是必然的碰撞。名字里带 pid + 随机段，上一次跑崩了留下的容器也不会挡路。
+ */
+export interface TestPostgres {
+  containerName: string;
+  /** 连接串。测试用它建 `Db`，也用它在 after() 里清数据。 */
+  url: string;
+  /** `docker rm -f`（一次性容器的数据不保留）。 */
+  stop(): Promise<void>;
+}
+
+export async function startPostgres(options: { image?: string; timeoutMs?: number } = {}): Promise<TestPostgres> {
+  const containerName = `rc-test-db-${process.pid}-${randomBytes(3).toString("hex")}`;
+  const image = options.image ?? "postgres:16-alpine";
+  const password = "reuben_cloud_test";
+  await dockerOrThrow([
+    "run",
+    "-d",
+    "--name",
+    containerName,
+    "-e",
+    `POSTGRES_PASSWORD=${password}`,
+    "-e",
+    "POSTGRES_DB=reuben_cloud",
+    "-p",
+    "127.0.0.1::5432",
+    image,
+  ]);
+  const portOutput = await dockerOrThrow(["port", containerName, "5432"]);
+  // 输出形如 `127.0.0.1:32768`（可能有多行，取第一行）。
+  const port = Number(portOutput.trim().split("\n")[0]!.split(":").pop());
+  if (!Number.isInteger(port) || port <= 0) {
+    await docker(["rm", "-f", containerName]);
+    throw new Error(`拿不到 ${containerName} 的宿主端口：${JSON.stringify(portOutput)}`);
+  }
+  const url = `postgres://postgres:${password}@127.0.0.1:${port}/reuben_cloud`;
+  try {
+    await waitForPostgres(url, options.timeoutMs ?? 60_000);
+  } catch (error) {
+    await docker(["rm", "-f", containerName]);
+    throw error;
+  }
+  return {
+    containerName,
+    url,
+    stop: async () => {
+      await docker(["rm", "-f", containerName]);
+    },
+  };
+}
+
+/** 等 Postgres 真的能执行查询。只等端口通是不够的——初始化那几秒里连接会被拒。 */
+async function waitForPostgres(url: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = "unknown";
+  for (;;) {
+    const client = new Client({ connectionString: url, connectionTimeoutMillis: 2000 });
+    try {
+      await client.connect();
+      await client.query("SELECT 1");
+      await client.end();
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      await client.end().catch(() => undefined);
+      if (Date.now() >= deadline) {
+        throw new Error(`等 Postgres 就绪超时（${timeoutMs}ms）：${lastError}`);
+      }
+      await delay(500);
+    }
+  }
+}
+
+/** 清掉测试造出来的沙箱行（executions 有外键，先删子表）。**只删指定的 id**。 */
+export async function deleteSandboxRows(db: Db, sandboxIds: readonly string[]): Promise<void> {
+  if (sandboxIds.length === 0) return;
+  await db.query("DELETE FROM executions WHERE sandbox_id = ANY ($1::text[])", [sandboxIds]);
+  await db.query("DELETE FROM sandbox_state_transitions WHERE sandbox_id = ANY ($1::text[])", [sandboxIds]);
+  await db.query("DELETE FROM sandboxes WHERE id = ANY ($1::text[])", [sandboxIds]);
+}
+
+// ---------------------------------------------------------------- Phase 8：假 agent
+
+export interface FakeAgentRequest {
+  method: string;
+  path: string;
+  authorization: string | null;
+  body: string;
+  /** SSE 连接上带的 `Last-Event-ID` 头（只有 events 请求有）。 */
+  lastEventId: string | null;
+}
+
+/** 假 agent 的全部开关：路由行为（hooks）外加几个整体开关。 */
+export interface FakeAgentOptions extends FakeAgentHooks {
+  /**
+   * 写完 frames 之后立刻 `res.end()`（默认 false = 挂着不结束）。
+   * 用来造"事件流被掐断"：SSE 客户端会带 `Last-Event-ID` 重连，重连用尽后 manager 判
+   * `stream_failed`——那是 §B 风险表里"最难查的一类"，值得有一条用例守着。
+   */
+  closeAfterFrames?: boolean;
+}
+
+export interface FakeAgentHooks {
+  /** 覆盖 POST /exec 的响应。默认 202 + 自增 id。 */
+  onExec?: (body: Record<string, unknown>) => { status?: number; body?: Record<string, unknown> } | void;
+  /** GET /exec/{id}/events 要写出去的 SSE 帧（原始文本，含行尾）。默认空 = 永不给终态。 */
+  onEvents?: (executionId: string) => string[];
+  /** 覆盖 POST /exec/{id}/kill 的响应。默认 200 + `{status:"killing"}`。 */
+  onKill?: (executionId: string) => { status?: number; body?: Record<string, unknown> } | void;
+}
+
+/**
+ * 一个真的 HTTP 假 agent。**不是 mock 函数**：它监听一个真端口、走真的字节流，
+ * 因为"看门狗到点会调 /kill"这件事只有通过一次真的 HTTP 请求才算验证过。
+ *
+ * 默认行为刻意是"最坏的那种"：事件流永远不给终态事件——那正是看门狗存在的理由。
+ * 需要别的行为时用 hooks 覆盖。
+ */
+export class FakeSandboxAgent {
+  readonly requests: FakeAgentRequest[] = [];
+  /** 收到过几次 `POST /exec/{id}/kill`（按顺序记 id）。 */
+  readonly killCalls: string[] = [];
+  /** 每次 SSE 连接：executionId + 请求头里的 Last-Event-ID。 */
+  readonly eventConnections: Array<{ executionId: string; lastEventId: string | null }> = [];
+  status = "ready";
+  version = "0.0.1-fake";
+  activeExecution: string | null = null;
+
+  /** POST /exec 发出去的 execution id（按顺序）。测试要断言它们时读这里。 */
+  readonly executions: string[] = [];
+
+  /** 见 `FakeAgentOptions.closeAfterFrames`。 */
+  readonly closeAfterFrames: boolean;
+
+  readonly #hooks: FakeAgentHooks;
+  /**
+   * execution id 的前缀带随机段：每个假 agent 实例的 id 空间是独立的。
+   * 不这么做的话两个用例都会产出 `exe_fake_1`，而 `executions` 的主键是 execution id——
+   * 第二条记录会去 UPDATE 第一条（`ON CONFLICT (id) DO UPDATE` 是给崩溃恢复用的），
+   * 于是"这个沙箱有几条执行记录"这种断言会莫名其妙地失败。
+   */
+  readonly #idPrefix = `exe_fake_${randomBytes(3).toString("hex")}`;
+  #server: http.Server | null = null;
+  #port = 0;
+  #seq = 0;
+
+  constructor(options: FakeAgentOptions = {}) {
+    const { closeAfterFrames = false, ...hooks } = options;
+    this.closeAfterFrames = closeAfterFrames;
+    this.#hooks = hooks;
+  }
+
+  get url(): string {
+    if (this.#server === null) throw new Error("FakeSandboxAgent 还没 start()");
+    return `http://127.0.0.1:${this.#port}`;
+  }
+
+  async start(): Promise<void> {
+    const server = http.createServer((req, res) => {
+      void this.#handle(req, res);
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        this.#port = (server.address() as net.AddressInfo).port;
+        resolve();
+      });
+    });
+    this.#server = server;
+  }
+
+  async close(): Promise<void> {
+    const server = this.#server;
+    this.#server = null;
+    if (server === null) return;
+    // 事件流是长连接：不主动断掉的话 close() 会一直等它们。
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  async #handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? "/", "http://fake");
+    const body = await readBody(req);
+    this.requests.push({
+      method: req.method ?? "GET",
+      path: url.pathname,
+      authorization: req.headers.authorization ?? null,
+      body,
+      lastEventId: (req.headers["last-event-id"] as string | undefined) ?? null,
+    });
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      sendJson(res, 200, { status: this.status, version: this.version, activeExecution: this.activeExecution });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/exec") {
+      const parsed = body === "" ? {} : (JSON.parse(body) as Record<string, unknown>);
+      const executionId = `${this.#idPrefix}_${++this.#seq}`;
+      this.executions.push(executionId);
+      const override = this.#hooks.onExec?.(parsed) ?? {};
+      const payload = override.body ?? { execution_id: executionId, log_path: `/tmp/reuben-cloud/exec/${executionId}.log` };
+      if (override.body?.execution_id === undefined) this.activeExecution = executionId;
+      sendJson(res, override.status ?? 202, payload);
+      return;
+    }
+
+    const execRoute = /^\/exec\/([^/]+)\/(events|kill)$/.exec(url.pathname);
+    if (execRoute !== null) {
+      const executionId = execRoute[1]!;
+      if (execRoute[2] === "events" && req.method === "GET") {
+        this.eventConnections.push({
+          executionId,
+          lastEventId: (req.headers["last-event-id"] as string | undefined) ?? null,
+        });
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        for (const frame of this.#hooks.onEvents?.(executionId) ?? []) res.write(frame);
+        // **默认不结束响应**：没有终态事件时连接就该一直挂着，直到调用方 abort。
+        if (this.closeAfterFrames) res.end();
+        return;
+      }
+      if (execRoute[2] === "kill" && req.method === "POST") {
+        this.killCalls.push(executionId);
+        const override = this.#hooks.onKill?.(executionId) ?? {};
+        sendJson(res, override.status ?? 200, override.body ?? { execution_id: executionId, status: "killing" });
+        return;
+      }
+    }
+
+    sendJson(res, 404, { error: "not_found", message: `fake agent 没有这条路由：${req.method} ${url.pathname}` });
+  }
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let text = "";
+    req.on("data", (chunk: Buffer) => {
+      text += chunk.toString("utf8");
+    });
+    req.on("end", () => resolve(text));
+    req.on("error", reject);
+  });
+}
+
+function sendJson(res: ServerResponse, status: number, payload: unknown): void {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+  res.end(body);
+}
+
+// ---------------------------------------------------------------- Phase 8：假 provider
+
+/**
+ * 只实现"对账看得见的那部分"的 provider：`inspect` / `listManaged` / `destroy`。
+ * `create` 故意不实现——对账永远不该建容器，真需要 create 的用例走 LocalDockerProvider。
+ *
+ * 有了它，对账的四条规则可以在**只有 Postgres** 的情况下被逐条测到（毫秒级），
+ * 而真容器那条路留给 `manager.integration.test.ts` 里的"容器丢失"用例。
+ */
+export class FakeProvider implements SandboxProvider {
+  readonly kind = "fake";
+  /** sandboxId → inspect 结果（不登记 = 容器不在）。 */
+  readonly inspections = new Map<string, SandboxInspection>();
+  /** listManaged() 的返回。 */
+  managed: ManagedSandbox[] = [];
+  /** destroy 被调用的 sandboxId（按顺序）。 */
+  readonly destroyed: string[] = [];
+  /** destroy 抛这个（测"删不掉"的路径）。 */
+  destroyError: Error | null = null;
+
+  create(): Promise<SandboxHandle> {
+    throw new Error("FakeProvider 不实现 create：对账不该建容器");
+  }
+
+  async destroy(sandboxId: string): Promise<void> {
+    this.destroyed.push(sandboxId);
+    if (this.destroyError !== null) throw this.destroyError;
+    this.inspections.delete(sandboxId);
+    // 容器真被删掉之后就不该再出现在 listManaged() 里——否则第二次对账会把同一个孤儿
+    // 再删一遍，而"对账幂等"这条断言就永远测不出真东西了。
+    this.managed = this.managed.filter((item) => item.sandboxId !== sandboxId);
+  }
+
+  async health(sandboxId: string): Promise<SandboxHealth> {
+    const inspection = this.inspections.get(sandboxId);
+    if (inspection === undefined) throw new ProviderError("not_found", `沙箱 ${sandboxId} 不存在`);
+    return {
+      sandboxId,
+      status: inspection.agentStatus,
+      version: inspection.version,
+      activeExecution: inspection.activeExecution,
+      endpoint: inspection.endpoint,
+    };
+  }
+
+  async listManaged(): Promise<ManagedSandbox[]> {
+    return this.managed;
+  }
+
+  async inspect(sandboxId: string): Promise<SandboxInspection | null> {
+    return this.inspections.get(sandboxId) ?? null;
+  }
+}
+
+/** 造一份 `SandboxInspection`（默认是"一切正常的 running 沙箱"）。 */
+export function fakeInspection(sandboxId: string, overrides: Partial<SandboxInspection> = {}): SandboxInspection {
+  return {
+    sandboxId,
+    providerRef: `ref_${sandboxId}`,
+    containerName: `reuben-cloud-sbx-${sandboxId}`,
+    running: true,
+    state: "running",
+    endpoint: "http://127.0.0.1:1",
+    agentStatus: "ready",
+    activeExecution: null,
+    version: "0.0.1-fake",
+    ...overrides,
+  };
+}
+
+/** 造一份 `ManagedSandbox`（默认是沙箱本体）。 */
+export function fakeManaged(sandboxId: string | null, overrides: Partial<ManagedSandbox> = {}): ManagedSandbox {
+  return {
+    sandboxId,
+    providerRef: `ref_${sandboxId ?? "proxy"}`,
+    containerName: sandboxId === null ? "reuben-cloud-proxy" : `reuben-cloud-sbx-${sandboxId}`,
+    runId: null,
+    taskId: null,
+    role: "sandbox",
+    state: "running",
+    running: true,
+    ...overrides,
+  };
 }
