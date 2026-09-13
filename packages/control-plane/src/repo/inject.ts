@@ -1,11 +1,13 @@
 /**
  * `inject.ts` —— 把 CP 手上的仓库灌进沙箱。
  *
- * 四步（§C.2「仓库怎么进沙箱」的 CP 侧实现）：
+ * 五步（§C.2「仓库怎么进沙箱」的 CP 侧实现）：
  *   1. 审计 clone 的 `.git/config`（有凭据就别往下走了）
  *   2. `tar czf -` 打包 → 流式 `PUT /files?path=/workspace/repo.tar.gz`
- *   3. `POST /exec ["tar","xzf",…,"-C","/workspace"]`
- *   4. `POST /exec ["rm","-f",…]`（无论成败）+ 校验收包后的 HEAD
+ *   3. `POST /exec ["mkdir","-p",workspaceDir]`（`tar -C` 要求目录已存在；Phase 11 起落点是
+ *      `/workspace/repo`，镜像里没有这个子目录）
+ *   4. `POST /exec ["tar","xzf",…,"-C",workspaceDir]`
+ *   5. `POST /exec ["rm","-f",…]`（无论成败）+ 校验收包后的 HEAD
  *
  * 【为什么 tar 落在 `/workspace/repo.tar.gz`】§Phase 2 只允许写 `/workspace`（写单根），
  * 而 tar 不能写进仓库自己（会污染 diff 与归档）。放在工作区根、用完立刻删，
@@ -15,7 +17,7 @@
  * 校验它等于 `clone.baseSha` 是这条链路的自检：不相等说明 tar 解包错了、
  * 或者沙箱里本来就有别的东西——两种情况都不该继续。
  *
- * 【内部命令不走 manager 的 BUSY 闸】这三条命令是 CP 自己搬仓库用的，
+ * 【内部命令不走 manager 的 BUSY 闸】这几条命令是 CP 自己搬仓库用的，
  * 发生在工具循环之前（Phase 11）或之后。它们通过 `client.execAndWait` 直接调
  * sandbox-agent：沙箱侧的单执行闸仍然在拦第二条并发命令，但没有 DB 记账——
  * 原因在 `client/sandbox-api.ts` 的 `execAndWait` 注释里。
@@ -32,7 +34,10 @@ import type { RepoApi, SandboxTarget } from "./types.ts";
 /** tar 在沙箱里的落点（spec §3）。 */
 export const DEFAULT_TAR_PATH = "/workspace/repo.tar.gz";
 
-/** 解包目标：仓库直接落在 workspace 根上（Phase 9 的口径，Phase 11 的 REPO_DIR 会指到这里）。 */
+/**
+ * 解包目标。**缺省是 workspace 根**（Phase 9 的口径）；Phase 11 起 agent 流程传
+ * `/workspace/repo`（`agent/prompt.ts` 的 `REPO_DIR`），工具层与提示词都按那个路径说话。
+ */
 export const DEFAULT_WORKSPACE_DIR = "/workspace";
 
 /** 内部命令的时限。`tar xzf` 一个几百 MiB 的仓库可能要几十秒到几分钟。 */
@@ -94,6 +99,10 @@ export async function injectRepo(input: InjectRepoInput): Promise<InjectRepoResu
 
   try {
     // ③ 解包。cwd 用 `-C` 显式给，不依赖沙箱的默认 cwd。
+    // 先建目录：`tar -C <dir>` 要求 <dir> 已经存在，而 Phase 11 起仓库的落点是
+    // `/workspace/repo`（workspace 根下的子目录，镜像里没有它）。幂等，代价一次 exec。
+    const ready = await execOrThrow(api, target, ["mkdir", "-p", workspaceDir], { timeoutMs });
+    executions.push(ready.executionId);
     const untar = await execOrThrow(api, target, ["tar", "xzf", tarPath, "-C", workspaceDir], { timeoutMs });
     executions.push(untar.executionId);
 

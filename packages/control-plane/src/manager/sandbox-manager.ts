@@ -218,7 +218,13 @@ export interface ExecInSandboxResult {
   durationMs: number | null;
   stdoutBytes: number;
   stderrBytes: number;
+  /** 事件流里丢了内容（完整输出在日志文件里）。 */
   truncated: boolean;
+  /**
+   * 连**日志文件**都到顶了（沙箱侧 `SANDBOX_AGENT_MAX_LOG_BYTES`，默认 256 MiB）。
+   * 这时 `logPath` 也不是完整输出——Phase 11 的 `bash` 工具要在提示里如实说明。
+   */
+  logTruncated: boolean;
   logPath: string | null;
   /** 收到的事件（含终态）。总量受 `maxOutputBytes` 约束，不会无界。 */
   events: SseEvent[];
@@ -243,6 +249,7 @@ interface TerminalInfo {
   stdoutBytes: number;
   stderrBytes: number;
   truncated: boolean;
+  logTruncated: boolean;
   logPath: string | null;
   error: string | null;
 }
@@ -603,6 +610,7 @@ export class SandboxManager {
         stdoutBytes: terminal.stdoutBytes,
         stderrBytes: terminal.stderrBytes,
         truncated: terminal.truncated,
+        logTruncated: terminal.logTruncated,
         logPath: terminal.logPath,
         events,
       };
@@ -939,6 +947,7 @@ function parseTerminalEvent(event: SseEvent): TerminalInfo {
     stdoutBytes: numberOr("stdout_bytes") ?? 0,
     stderrBytes: numberOr("stderr_bytes") ?? 0,
     truncated: data["truncated"] === true,
+    logTruncated: data["log_truncated"] === true,
     logPath: typeof data["log_path"] === "string" ? data["log_path"] : null,
     error: typeof data["error"] === "string" ? data["error"] : null,
   };

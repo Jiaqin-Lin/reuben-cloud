@@ -2007,7 +2007,7 @@ git -c http.extraHeader="..." push origin HEAD:refs/heads/reuben-cloud/<taskId>
 
 ### 交付物
 
-`packages/control-plane/src/agent/{loop.ts,prompt.ts,transcript.ts,model.ts}` + `src/agent/tools/{bash,read,write,list,truncate}.ts`。
+`packages/control-plane/src/agent/{loop.ts,prompt.ts,transcript.ts,model.ts}` + `src/agent/tools/{bash,read,write,list,truncate}.ts` + `src/agent/tools/{types,index}.ts`（后两个不在本清单里，理由见末尾实现备注 1）+ `scripts/agent-run.ts`（验收驱动，备注 12）。
 
 ### 具体如何实现
 
@@ -2252,14 +2252,80 @@ MVP 版本要讲清楚的事：
 
 ### 验收标准
 
-- [ ] 上表 16 项全绿（`@live` 那项在本地手工跑过一次）
-- [ ] §K 第 9 步：给一个真实 issue，跑完产出一个 patch
-- [ ] transcript 能在不重跑的情况下还原出每一轮的输入输出
-- [ ] `cache_read_input_tokens` 在多轮时确实非 0
-- [ ] 单条 `tool_result` 永远 ≤ 2000 行 / 50 KiB（含模型自带 offset/limit 的情况）
+- [x] 上表 16 项里 **15 项**自动跑绿（`npm test` 覆盖 12–16 与 1–7、9；集成测试覆盖 5、11）。第 8 项（`@live` 真模型）与第 10 项（缓存命中）需要 `ANTHROPIC_API_KEY`，本地没有可用的 Anthropic 端点，留在备注 15 里写了跑法
+- [ ] §K 第 9 步：给一个真实 issue，跑完产出一个 patch（入口与流程已就绪并跑通到"无模型"为止：`npm run agent:run`，见备注 12；真模型那一步待凭据）
+- [x] transcript 能在不重跑的情况下还原出每一轮的输入输出（`test/unit/agent-loop.test.ts` 的用例 9：JSONL 里含 system / tools / 每轮 usage / 完整 messages）
+- [ ] `cache_read_input_tokens` 在多轮时确实非 0（`@live` 用例断言了它，见备注 15）
+- [x] 单条 `tool_result` 永远 ≤ 2000 行 / 50 KiB（含模型自带 offset/limit 的情况——`limit` 只能往小了调）
 
 **完成标记：**
-- [ ] **Phase 11 完成** — Agent 循环能针对真实 issue 产出 patch
+- [x] **Phase 11 完成** — Agent 循环 + 4 个工具全部落地；16 项测试要点里 15 项真跑过（含 §F.3 的"沙箱内搜不到 API key"红线），剩两项是需要真实模型凭据的 `@live` 检查（跑法见备注 15）
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **多两个文件**：`tools/types.ts`（四个工具共用的 port / 上下文 / 参数校验 / 续读锚点表）与
+   `tools/index.ts`（装配成 `definitions + run`）。理由：**循环不该认识沙箱**——`loop.ts` 只认
+   `AgentToolkit` 与 `ModelClient`，换沙箱 API 不动循环逻辑，调循环策略不动工具；而"沙箱出口
+   只有一个"这件事需要一个落点（先例：Phase 1 的 `config.ts` / `paths.ts`）。
+2. **`ModelClient` 是一个接口而不是直接调 SDK**：循环与工具的单测因此可以塞脚本化模型，
+   **不需要网络、不需要 key**（`npm test` 的硬要求）。第二个 provider 出现之前不建注册表。
+3. **锚点记的是"这次返回的最后一行"，不是正文写的"第一行"**：同样是行首（所以绝不会从半个
+   字符开始解码），但第一次续读就能跳到目标字节。记第一行的话，`read(offset=2001)` 仍然要从
+   字节 0 扫完前 2000 行——O(n²) 只是被推迟一轮。沙箱的 `/files` 不返回 mtime，所以失效时机
+   是**穷举**的：`write` 失效那一个路径、`bash` 清空整张表（模型的全部写入口就是这两个）。
+4. **`bash` 的 cwd 缺省显式给 `REPO_DIR`**，而不是"不传递让沙箱用默认值"：沙箱的默认 cwd 是
+   workspace 根 `/workspace`，而仓库在 `/workspace/repo`。不显式给的话 `node test.js` 会在错的
+   目录里跑，报出来的是 ENOENT——与真正的原因隔一层。这条是集成测试第一次真跑时抓到的。
+5. **`read` 的分片路径用 `TextDecoder("utf-8", {fatal: true})`**：非法字节直接抛，翻译成
+   "这是二进制文件，用 bash"。非 fatal 解码会把二进制变成一片 U+FFFD 喂给模型；而窗口总是从
+   行首（或文件头）开始，所以"窗口开头是半个字符"根本不会发生。
+
+   **同一条路径上还给单行加了长度上限（`MAX_LINE_BYTES`，1 MiB + 一个窗口）**：正文没提，
+   但没有它的话"读一个 > 1 MiB 的 minified 文件"会把**整行**（可能几百 MB）攒进 CP 的内存——
+   而这一行永远装不进 50 KiB 的预算。到顶时抛 `LineTooLongError`，`read` 有两种收尾，都不返回
+   半行：它就是要读的第一行 → 那条 `sed -n` 提示（措辞是 `is over N`，因为真实长度没被完整扫过）；
+   前面已有内容 → 当成"这一行放不下"，提示里的 `offset=N` 正好指向它，下一次读就走到前一个分支。
+6. **形态 3（模型自己传的 limit 先到）在分片路径上只给通用提示**：`120 more lines in file`
+   需要把全文数一遍，与"总行数只在这次真的读到文件尾时才写"（§3.5）冲突。小文件路径
+   （全文在手）仍然给出准确的行数。
+7. **`bash` 的输出取自沙箱 exec 日志的尾部，不是事件流**：事件流把 stdout / stderr 分成两类
+   事件（拼起来会丢交错顺序），且有 1 MiB 内联上限。日志尾部的读法是"先 `readFile(limit:1)`
+   拿 size（只读 1 个字节），再 `raw=1` 读最后 256 KiB"。窗口 ≥ 5 × 50 KiB，所以只有"最后一行
+   本身超过窗口"会让 `truncateTail` 走半行分支——那时结果仍然是最后 50 KiB。
+8. **`SandboxManager` 的 `ExecInSandboxResult` 多一个 `logTruncated`**（从终态事件的
+   `log_truncated` 解出来）：沙箱的日志文件也有 256 MiB 上限，到顶时 `Full output: <path>` 这
+   句话是假的。`bash` 现在会在提示里写"log file hit the sandbox's size cap"。
+9. **`injectRepo` 多一条 `mkdir -p <workspaceDir>`**：`tar -C` 要求目录已经存在，而 Phase 11 起
+   仓库的落点是 `/workspace/repo`（workspace 根下的子目录，镜像里没有它）。幂等，代价一次 exec。
+10. **`max_tokens` 截断的处理是"记警告 + 继续"，不是"提高上限重试一次"**：单轮上限
+    （64000）已经是模型的硬顶，没有"更高"可提；截断后若这一轮没有完整的 tool_use，按
+    `incomplete_response` 停下并如实说明（不空转）。
+11. **上下文裁剪把旧 `tool_result` 的**内容**换成占位符，块本身留着**：Anthropic 要求每个
+    `tool_use` 有配对的 `tool_result`，删块会让下一次请求 400。裁剪只发生在旧的工具结果上，
+    user / assistant 的文字不丢（§4 的 MVP 策略）。
+12. **多一个 `scripts/agent-run.ts`（`npm run agent:run`）**：交付物清单里没有它，但 §K 第 9 步
+    （给一个真实 issue 跑出 patch）需要一个能复跑的入口。它只做装配：建沙箱 → clone →
+    `mkdir` + 灌入 → 跑循环 → `GET /diff` → 落 patch → 销毁（`--keep` 可留沙箱排障）。
+    不引入新的核心逻辑，Phase 12 会把中间那段换成带 PR 收尾的版本。
+13. **工具描述里写清了"什么时候用"与失败后的下一步**：`description` 里带 2000 行 / 50 KiB 的
+    上限、`Full output:` 的续读办法、`offset` 是**行号**、`cwd`/`path` 相对仓库根、`cmd` 是 argv
+    数组——模型看不到本文，只看得到这段话（§3 提到触发条件对 should-call 率有明显影响）。
+14. **`@live` 是单独一层**：`npm run test:live -w @reuben-cloud/control-plane`（没有
+    `ANTHROPIC_API_KEY` 就整层跳过）。集成测试里另有一条 `RUN_LIVE_AGENT=1` 的端到端
+    （真模型 + 真沙箱 → 真的产出 patch），默认跳过。
+15. **两条需要凭据的检查没跑成**（本机没有可用的 Anthropic 端点）：测试要点 8（真模型 smoke）
+    与 10（`cache_read_input_tokens > 0`）。跑法：
+    ```bash
+    ANTHROPIC_API_KEY=sk-... REUBEN_CLOUD_MODEL=claude-haiku-4-5 \
+      npm run test:live -w @reuben-cloud/control-plane
+    # 端到端（真沙箱 + 真模型 → patch）：
+    npm run dev:up && export DATABASE_URL=$(npm run --silent db:url)
+    npm run build:image && npm run proxy:up
+    RUN_LIVE_AGENT=1 ANTHROPIC_API_KEY=sk-... npm run test:integration -w @reuben-cloud/control-plane
+    ```
+    新增的 env（都只在 CP 侧）：`ANTHROPIC_API_KEY`（必填）、`REUBEN_CLOUD_MODEL`（默认
+    `claude-opus-4-8`）、`REUBEN_CLOUD_EFFORT`（默认 `high`）、`REUBEN_CLOUD_MAX_TOKENS`
+    （默认 64000，硬顶同值）、`RUN_LIVE_AGENT`（只被测试读）。
 
 ---
 

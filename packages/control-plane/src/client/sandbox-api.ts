@@ -87,10 +87,48 @@ export interface AgentKillResponse {
   status: string;
 }
 
-/** `PUT /files` 的响应（Phase 9 拿 sha256 校验灌进去的 tar 完整）。 */export interface AgentFileWrite {
+/** `PUT /files` 的响应（Phase 9 拿 sha256 校验灌进去的 tar 完整）。 */
+export interface AgentFileWrite {
   path: string;
   size: number;
   sha256: string;
+}
+
+/**
+ * `GET /files` 的内联 JSON 响应（Phase 11 的 `read` 工具用它读小文件）。
+ *
+ * `size` / `bytes` / `sha256` 三个尺寸字段不是一回事：`size` 是文件总字节数，
+ * `bytes` 是本次返回的字节数，`sha256` 只覆盖**本次返回的那段字节**。
+ */
+export interface AgentFileRead {
+  /** 解析符号链接之后的绝对路径（CP 之后续读时要原样传回来）。 */
+  path: string;
+  /** 文件总字节数。 */
+  size: number;
+  sha256: string;
+  /** `utf8` 或 `base64`。 */
+  encoding: string;
+  offset: number;
+  bytes: number;
+  content: string;
+}
+
+/** `GET /files/list` 的一项。`name` 在 `depth>1` 时是相对本次请求路径的相对路径。 */
+export interface AgentFileEntry {
+  name: string;
+  /** file / dir / symlink / other。**不跟随符号链接**。 */
+  type: string;
+  size: number;
+  /** mtime，毫秒时间戳。 */
+  mtime: number;
+}
+
+/** `GET /files/list` 的响应（对象而不是裸数组：`truncated` 需要一个落点）。 */
+export interface AgentFileList {
+  path: string;
+  entries: AgentFileEntry[];
+  /** 沙箱侧的条目上限（默认 1000）被撞到了。 */
+  truncated: boolean;
 }
 
 /** `GET /archive?dryRun=1` 的响应（CP 读到的那两个字段）。 */
@@ -290,6 +328,66 @@ export class SandboxApiClient {
       );
     }
     return { path: typeof record["path"] === "string" ? record["path"] : path, size, sha256 };
+  }
+
+  /**
+   * 内联读文件（`GET /files`，JSON）。**只用于小文件**：沙箱侧内联上限 1 MiB，
+   * 超了会回 413 `too_large`（调用方据此改走 `readRaw` 的分片窗口）。
+   *
+   * 不传 `limit` 时是"全读"语义：剩余部分超过内联上限会**拒绝**而不是静默截断。
+   * 传了 `limit` 就是"返回这一段"（Phase 2 实现备注 1），分片读必须传它。
+   */
+  async readFile(
+    endpoint: string,
+    token: string,
+    path: string,
+    options: { offset?: number; limit?: number; encoding?: "utf8" | "base64"; signal?: AbortSignal } = {},
+  ): Promise<AgentFileRead> {
+    const params = new URLSearchParams({ path });
+    if (options.offset !== undefined) params.set("offset", String(options.offset));
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    if (options.encoding !== undefined) params.set("encoding", options.encoding);
+    const url = `${endpoint}/files?${params}`;
+    const payload = await this.#json(url, { method: "GET", token, signal: options.signal });
+    const record = asRecord(payload);
+    const size = numberOrNull(record["size"]);
+    if (typeof record["path"] !== "string" || typeof record["content"] !== "string" || size === null) {
+      throw new SandboxApiError("invalid_response", `${url} 的响应缺少 path/content/size`, { details: { body: payload } });
+    }
+    return {
+      path: record["path"],
+      size,
+      sha256: typeof record["sha256"] === "string" ? record["sha256"] : "",
+      encoding: typeof record["encoding"] === "string" ? record["encoding"] : "utf8",
+      offset: numberOrNull(record["offset"]) ?? 0,
+      bytes: numberOrNull(record["bytes"]) ?? 0,
+      content: record["content"],
+    };
+  }
+
+  /**
+   * 列目录（`GET /files/list`）。`name` 相对本次请求路径；不跟随符号链接。
+   * 这是文件工具里唯一能拿到 `mtime` 的入口（`read` 的续读锚点不依赖它，见 `tools/read.ts`）。
+   */
+  async listFiles(
+    endpoint: string,
+    token: string,
+    path: string,
+    options: { depth?: number; signal?: AbortSignal } = {},
+  ): Promise<AgentFileList> {
+    const params = new URLSearchParams({ path });
+    if (options.depth !== undefined) params.set("depth", String(options.depth));
+    const url = `${endpoint}/files/list?${params}`;
+    const payload = await this.#json(url, { method: "GET", token, signal: options.signal });
+    const record = asRecord(payload);
+    if (typeof record["path"] !== "string" || !Array.isArray(record["entries"])) {
+      throw new SandboxApiError("invalid_response", `${url} 的响应缺少 path/entries`, { details: { body: payload } });
+    }
+    return {
+      path: record["path"],
+      entries: record["entries"].map(toFileEntry),
+      truncated: record["truncated"] === true,
+    };
   }
 
   /**
@@ -567,6 +665,17 @@ function numberOrNull(value: unknown): number | null {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** `/files/list` 的一项：只取 CP 认识的字段，不认识的给缺省值。 */
+function toFileEntry(value: unknown): AgentFileEntry {
+  const record = asRecord(value);
+  return {
+    name: typeof record["name"] === "string" ? record["name"] : "",
+    type: typeof record["type"] === "string" ? record["type"] : "other",
+    size: numberOrNull(record["size"]) ?? 0,
+    mtime: numberOrNull(record["mtime"]) ?? 0,
+  };
 }
 
 /** `/diff` 的 `files[]` 一项：只取 CP 认识的字段，不认识的给缺省值。 */

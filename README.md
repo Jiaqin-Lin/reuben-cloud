@@ -615,10 +615,10 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 
 **Agent 侧**（沙箱跑通之后再开始）：
 
-- [ ] Agent 主循环（tool-use，4-8 个内置工具）
-- [ ] 本地 Web UI：实时 transcript
-- [ ] GitHub App：token 签发 + PR 创建
-- [ ] 产出 unified diff
+- [x] Agent 主循环（tool-use，4 个内置工具：bash / read / write / list）（`packages/control-plane/src/agent/`：循环在 CP、模型 key 不进沙箱、每轮 system+tools+messages 落 JSONL transcript、三重硬上限 + 重复调用检测、单条 tool_result 硬顶 2000 行 / 50 KiB；`npm test` 覆盖循环与工具，`npm run test:live` 跑真模型，手工验收 `npm run agent:run`，见 spec Phase 11）
+- [x] 产出 unified diff（沙箱 `/diff` → `git apply --binary` 往返见 Phase 9；`npm run agent:run` 会把 patch 写到 `agent-patch.diff`）
+- [ ] 本地 Web UI：实时 transcript（Phase 13，可选；`onText` 回调已预留）
+- [ ] GitHub App：token 签发 + PR 创建（Phase 12）
 
 - [ ] **不做**：云端、多用户、权限、MCP、预热池、快照、密钥代理
 
@@ -731,7 +731,29 @@ export S3_ENDPOINT=http://127.0.0.1:9000
 export S3_BUCKET=reuben-cloud
 export S3_ACCESS_KEY_ID=reuben-cloud
 export S3_SECRET_ACCESS_KEY=reuben-cloud-dev
+
+# Phase 11 起：agent 循环要模型凭据。**只在 CP 里**（§F.3 红线：沙箱内不存在任何凭据）。
+export ANTHROPIC_API_KEY=sk-...
+export REUBEN_CLOUD_MODEL=claude-opus-4-8   # 可选；也是默认值
+export REUBEN_CLOUD_EFFORT=high             # 可选；low|medium|high|xhigh|max
 ```
+
+### 跑一次 agent（Phase 11）
+
+```bash
+npm run dev:up && export DATABASE_URL=$(npm run --silent db:url)
+npm run build:image && npm run proxy:up          # 沙箱镜像 + 出网代理（装依赖要用）
+
+# 本地仓库（不需要 GitHub App）：产出写到 agent-patch.diff
+npm run agent:run -- --local ~/code/my-project \
+  --issue "npm test 里第三条用例失败了，修好它"
+
+# GitHub 仓库（需要 GITHUB_APP_* 三个变量）
+npm run agent:run -- --repo owner/name --issue-file issue.md --keep
+```
+
+看它到底看到了什么：`/tmp/reuben-cloud-cp/<runId>/transcript.jsonl`（每轮的 system / tools /
+完整 messages / usage 都在里面）；`--keep` 会留下沙箱，可以 `docker exec` 进去看工作区。
 
 所有变量都有合理缺省（不配也能跑）：`REUBEN_CLOUD_DB_IMAGE / _NAME / _PORT / _PASSWORD`、`REUBEN_CLOUD_MINIO_IMAGE / _PORT / _CONSOLE_PORT / _USER / _PASSWORD / _BUCKET`、`REUBEN_CLOUD_MC_IMAGE`。
 
