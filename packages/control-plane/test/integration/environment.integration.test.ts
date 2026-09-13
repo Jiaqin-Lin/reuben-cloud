@@ -22,8 +22,23 @@ import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Db, isCheckViolation } from "../../src/db/client.ts";
 import { runMigrations } from "../../src/db/migrate.ts";
+import type { HealthReport } from "../../src/environment/health.ts";
+import { readStoredHealth } from "../../src/environment/health.ts";
 import { inferFromClone } from "../../src/environment/infer.ts";
-import { insertEnvironment, latestEnvironment, listEnvironments } from "../../src/environment/store.ts";
+import {
+  cacheHitOf,
+  findCacheHit,
+  getEnvironmentByRevision,
+  getProjectEnvState,
+  insertEnvironment,
+  latestEnvironment,
+  listEnvironments,
+  listReferencedDigests,
+  setEnvironmentHealth,
+  setEnvironmentImage,
+} from "../../src/environment/store.ts";
+import { environmentStore } from "../../src/environment/runtime.ts";
+import { planRevisionCleanup, promoteEnvironment, rollbackEnvironment, RollbackError } from "../../src/environment/revision.ts";
 import { CleanupRegistry, dockerAvailable, run, startPostgres } from "../support.ts";
 import type { TestPostgres } from "../support.ts";
 
@@ -195,6 +210,156 @@ describe("environments 表", () => {
       ),
       /environments_revision_unique|duplicate key/,
     );
+  });
+});
+
+
+describe("Phase 7 · 版本、缓存与指针（真 PG）", () => {
+  const projectKey = "fixture/p7-revisions";
+  const digest = `sha256:${"a".repeat(64)}`;
+  const otherDigest = `sha256:${"b".repeat(64)}`;
+
+  /** 一条 ready 的体检报告（`setEnvironmentHealth` 同时写状态与报告）。 */
+  function readyReport(): HealthReport {
+    return {
+      status: "ready",
+      reason: null,
+      detail: null,
+      facts: [],
+      steps: [{ cmd: "npm ci", required: true, exitCode: 0, timedOut: false, durationMs: 12, outputTail: "ok" }],
+      logKey: "env-logs/fixture__p7-revisions/1/envcheck_IT.health.log",
+      checkedAt: new Date("2026-01-02T03:04:05Z").toISOString(),
+    };
+  }
+
+  test("cache_key / parent_revision / health 三组字段是真的落进 PG 的", async () => {
+    const inference = await inferFromClone(path.join(FIXTURES, "node-ts-basic"));
+    const first = await insertEnvironment(db, {
+      projectKey,
+      candidate: inference.candidate,
+      signals: inference.signals,
+      cacheKey: "cache-first",
+    });
+    assert.equal(first.cache_key, "cache-first");
+    assert.equal(first.parent_revision, null, "首版没有父指针");
+    assert.equal(first.image_digest, null);
+    assert.deepEqual(first.health, {}, "没体检过时是空对象（不是 NULL）");
+
+    const second = await insertEnvironment(db, {
+      projectKey,
+      candidate: inference.candidate,
+      signals: inference.signals,
+      cacheKey: "cache-second",
+    });
+    assert.equal(second.revision, 2);
+    assert.equal(second.parent_revision, 1, "父指针指向上一版（插入时由 SQL 一起写）");
+
+    // 镜像与体检结论分开落两次（构建成功 → 体检通过），读回来时都在。
+    assert.equal(await setEnvironmentImage(db, projectKey, second.revision, digest), 1);
+    assert.equal(await setEnvironmentHealth(db, projectKey, second.revision, readyReport()), 1);
+    const row = await getEnvironmentByRevision(db, projectKey, second.revision);
+    assert.equal(row?.status, "ready", "体检结论同时推进状态");
+    assert.equal(row?.image_digest, digest);
+    assert.equal(row?.health_reason, null);
+    assert.equal(row?.health_log_key, "env-logs/fixture__p7-revisions/1/envcheck_IT.health.log");
+    assert.ok(row?.health_checked_at instanceof Date);
+    const report = readStoredHealth(row!.health);
+    assert.equal(report?.steps[0]?.cmd, "npm ci");
+  });
+
+  test("缓存命中只认 ready / degraded + 有 digest 的那一行（draft 不算）", async () => {
+    const key = "cache-hit-probe";
+    const inference = await inferFromClone(path.join(FIXTURES, "node-ts-basic"));
+    const row = await insertEnvironment(db, {
+      projectKey: "fixture/p7-cache",
+      candidate: inference.candidate,
+      signals: inference.signals,
+      cacheKey: key,
+    });
+    assert.equal(await findCacheHit(db, "fixture/p7-cache", key), null, "draft 没有可用镜像");
+    await setEnvironmentImage(db, "fixture/p7-cache", row.revision, otherDigest);
+    assert.equal(await findCacheHit(db, "fixture/p7-cache", key), null, "还是 draft：没体检就不算能用");
+    await setEnvironmentHealth(db, "fixture/p7-cache", row.revision, {
+      ...readyReport(),
+      status: "degraded",
+      reason: "declared_risk",
+    });
+    const hit = await findCacheHit(db, "fixture/p7-cache", key);
+    assert.equal(hit?.revision, row.revision);
+    assert.equal(cacheHitOf(hit!)?.status, "degraded");
+    assert.equal(await findCacheHit(db, "fixture/p7-cache", "别的键"), null);
+  });
+
+  test("当前指针：upsert 指过去、回滚指回来、回滚到不能用的版本被拒", async () => {
+    const inference = await inferFromClone(path.join(FIXTURES, "node-ts-basic"));
+    const store = environmentStore(db);
+    const first = await insertEnvironment(db, { projectKey: "fixture/p7-pointer", candidate: inference.candidate, signals: inference.signals, cacheKey: "k1" });
+    const second = await insertEnvironment(db, { projectKey: "fixture/p7-pointer", candidate: inference.candidate, signals: inference.signals, cacheKey: "k2" });
+    await setEnvironmentHealth(db, "fixture/p7-pointer", first.revision, readyReport());
+    await setEnvironmentImage(db, "fixture/p7-pointer", first.revision, digest);
+
+    await store.setProjectEnvState("fixture/p7-pointer", second.revision);
+    assert.equal((await getProjectEnvState(db, "fixture/p7-pointer"))?.current_revision, 2);
+    await store.setProjectEnvState("fixture/p7-pointer", first.revision);
+    assert.equal((await getProjectEnvState(db, "fixture/p7-pointer"))?.current_revision, 1, "upsert 第二条生效");
+
+    const rolled = await rollbackEnvironment(store, { projectKey: "fixture/p7-pointer", revision: 1 });
+    assert.equal(rolled.status, "ready");
+    assert.equal((await getProjectEnvState(db, "fixture/p7-pointer"))?.current_revision, 1);
+    await assert.rejects(
+      () => rollbackEnvironment(store, { projectKey: "fixture/p7-pointer", revision: 2 }),
+      (error: unknown) => error instanceof RollbackError && error.reason === "not_usable",
+    );
+  });
+
+  test("promote：新 revision 带父指针与缓存键、成功之后才动指针", async () => {
+    const inference = await inferFromClone(path.join(FIXTURES, "node-ts-basic"));
+    const store = environmentStore(db);
+    const queue = { enqueue: async (request: { revision: number }) => ({ ok: true, revision: request.revision }) as never };
+    const result = await promoteEnvironment(
+      { store, queue },
+      {
+        projectKey: "fixture/p7-promote",
+        dockerfile: `FROM ${inference.candidate.baseImage}\nRUN echo promoted\n`,
+        candidate: inference.candidate,
+        signals: inference.signals,
+      },
+    );
+    assert.equal(result.environment?.parent_revision, null);
+    assert.equal(result.cacheKey.length, 64);
+    const row = await getEnvironmentByRevision(db, "fixture/p7-promote", result.revision);
+    assert.equal(row?.cache_key, result.cacheKey);
+    assert.equal(row?.dockerfile, `FROM ${inference.candidate.baseImage}\nRUN echo promoted\n`);
+    assert.equal((await getProjectEnvState(db, "fixture/p7-promote"))?.current_revision, result.revision);
+  });
+
+  test("清理计划读得到沙箱引用：被 sandboxes.image_digest 指过的镜像永不清理", async () => {
+    const inference = await inferFromClone(path.join(FIXTURES, "node-ts-basic"));
+    const referencedKey = "fixture/p7-prune-referenced";
+    const referenced = await insertEnvironment(db, {
+      projectKey: referencedKey,
+      candidate: inference.candidate,
+      signals: inference.signals,
+      cacheKey: "k-ref",
+    });
+    await setEnvironmentImage(db, referencedKey, referenced.revision, digest);
+    await db.query(
+      `INSERT INTO sandboxes (id, provider, image, image_digest, state, run_id)
+       VALUES ('sbx_it_p7_ref', 'local-docker', $1, $1, 'DESTROYED', 'run_it_p7')`,
+      [digest],
+    );
+    assert.ok((await listReferencedDigests(db)).includes(digest), "扫到被引用过的 digest");
+
+    const referencedDigests = await listReferencedDigests(db);
+    const rows = [
+      { revision: 3, image_digest: digest, status: "ready" as const },
+      { revision: 2, image_digest: otherDigest, status: "ready" as const },
+      { revision: 1, image_digest: null, status: "failed" as const },
+    ];
+    const plan = planRevisionCleanup(rows, { keep: 1, referencedDigests });
+    assert.deepEqual(plan.keep, [3], "被引用的那一版留在保留集里");
+    assert.deepEqual(plan.pruned.sort((a, b) => a - b), [1, 2], "第 2 版超窗可删，第 1 版没有镜像");
+    assert.deepEqual(plan.removeImages, [otherDigest], "只删第 2 版那个没被引用的镜像");
   });
 });
 

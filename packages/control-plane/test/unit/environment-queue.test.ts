@@ -19,7 +19,10 @@ import { describe, test } from "node:test";
 import type { BuildRunner } from "../../src/environment/build.ts";
 import { BuildQueue } from "../../src/environment/queue.ts";
 import {
+  FAKE_DIGEST,
   FakeBuildRunner,
+  FakeHealthChecker,
+  fakeHealthReport,
   fakeCandidate,
   fakeSignals,
   MemoryEnvBuildStore,
@@ -45,6 +48,8 @@ function requestOf(overrides: {
     candidate: overrides.candidate ?? fakeCandidate(),
     signals: fakeSignals(),
     trigger: "first_seen" as const,
+    // 缓存键由 computeCacheKey 算出来（这里的内容无所谓：替身按精确的键去查）。
+    cacheKey: "test-cache-key",
   };
 }
 
@@ -357,5 +362,97 @@ describe("Phase 6 · 队列", () => {
     await queue.drain();
     assert.equal(queue.pendingCount, 0);
     assert.equal(builder.calls, 1);
+  });
+});
+
+describe("Phase 7 · 缓存闸与体检", () => {
+  test("缓存命中（非 manual）：一轮都不跑、不产生 attempt 行，digest 与体检结论复制到本次那一版", async () => {
+    const builder = new FakeBuildRunner();
+    const store = new MemoryEnvBuildStore();
+    store.cacheHit("acme/web", "test-cache-key", {
+      revision: 3,
+      imageDigest: FAKE_DIGEST,
+      health: fakeHealthReport("degraded", [
+        { reason: "declared_risk", affected: ["integration_tests"], detail: "postgres 起不来" },
+      ]),
+      status: "degraded",
+      cacheKey: "test-cache-key",
+    });
+    const queue = new BuildQueue({ builder, store, generator: null });
+
+    const outcome = await queue.enqueue(requestOf());
+
+    assert.equal(outcome.cached, true);
+    assert.equal(outcome.attempts, 0);
+    assert.equal(outcome.imageDigest, FAKE_DIGEST);
+    assert.equal(outcome.health?.status, "degraded");
+    assert.equal(builder.calls, 0, "命中之后一次构建都不该发生");
+    assert.equal(store.builds.length, 0, "不产生 attempt 行");
+    assert.deepEqual(store.images, [{ projectKey: "acme/web", revision: 1, imageDigest: FAKE_DIGEST }]);
+    assert.equal(store.healths.length, 1, "体检结论跟着复制到本次那一版");
+  });
+
+  test("manual 触发跳过缓存：同一个键也照样重建（人显式要求，见附录 A-40）", async () => {
+    const builder = new FakeBuildRunner();
+    const store = new MemoryEnvBuildStore();
+    store.cacheHit("acme/web", "test-cache-key", {
+      revision: 3,
+      imageDigest: FAKE_DIGEST,
+      health: fakeHealthReport(),
+      status: "ready",
+      cacheKey: "test-cache-key",
+    });
+    const queue = new BuildQueue({ builder, store, generator: null });
+
+    const outcome = await queue.enqueue({ ...requestOf(), trigger: "manual" });
+
+    assert.equal(outcome.cached, false);
+    assert.equal(builder.calls, 1);
+    assert.equal(store.builds.length, 1);
+  });
+
+  test("构建成功 → 落 digest 并体检：ready / degraded 直接写进环境行", async () => {
+    for (const status of ["ready", "degraded"] as const) {
+      const builder = new FakeBuildRunner();
+      const store = new MemoryEnvBuildStore();
+      const health = new FakeHealthChecker();
+      health.report = fakeHealthReport(status);
+      const queue = new BuildQueue({ builder, store, generator: null, health });
+
+      const outcome = await queue.enqueue(requestOf());
+
+      assert.equal(outcome.ok, true);
+      assert.equal(outcome.health?.status, status);
+      assert.equal(health.calls.length, 1, "体检要拿刚建出来的那个 digest");
+      assert.equal(health.calls[0]!.image, FAKE_DIGEST);
+      assert.deepEqual(store.images, [{ projectKey: "acme/web", revision: 1, imageDigest: FAKE_DIGEST }]);
+      assert.equal(store.healths.length, 1);
+      assert.equal(store.healths[0]!.report.status, status);
+    }
+  });
+
+  test("体检自己崩了 → 不把环境判死：只记 warn，状态留在 building", async () => {
+    const builder = new FakeBuildRunner();
+    const store = new MemoryEnvBuildStore();
+    const health = new FakeHealthChecker();
+    health.fail = "建体检沙箱时 docker 挂了";
+    const queue = new BuildQueue({ builder, store, generator: null, health });
+
+    const outcome = await queue.enqueue(requestOf());
+
+    assert.equal(outcome.ok, true, "镜像真的建出来了");
+    assert.equal(outcome.health, null);
+    assert.deepEqual(store.healths, [], "没有结论就不写结论");
+    assert.equal(store.statuses.some((item) => item.status === "failed"), false, "一次基础设施抖动不该把环境判死");
+  });
+
+  test("没有体检端口 → 构建成功后就停在 building（P6 的行为）", async () => {
+    const builder = new FakeBuildRunner();
+    const store = new MemoryEnvBuildStore();
+    const queue = new BuildQueue({ builder, store, generator: null });
+    const outcome = await queue.enqueue(requestOf());
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.health, null);
+    assert.equal(store.statuses.at(-1)?.status, "building");
   });
 });

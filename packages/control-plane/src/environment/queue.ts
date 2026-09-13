@@ -16,9 +16,16 @@
  *  · **失败不阻塞**：链上挂的是"吞掉结果"的 promise。一个坏仓库的 3×10 分钟不应该让后面
  *    所有仓库都等它。（这也是"失败是结果"在队列层面的样子：`enqueue` 对构建失败不抛。）
  *
- * 【成功之后为什么状态还是 building】`ready` 的定义是"依赖装上了、构建命令跑通了"（设计文档
- * §C.6），那是 P7 在一次性沙箱里体检的结论。P6 只能证明"docker build 成功"，所以环境行留在
- * `building`，等健康检查收尾。把这里写成 ready 会在 P7 之前虚假地把\"能用\"当成事实。
+ * 【成功之后为什么状态还是 building（直到体检）】`ready` 的定义是"依赖装上了、构建命令跑通了"（设计文档
+ * §C.6），那是 P7 在一次性沙箱里体检的结论。P6 只能证明"docker build 成功"，所以环境行先留在
+ * `building`；P7 接上体检端口之后，队列在同一次入队里把它推到 ready / degraded / failed。
+ * 没有体检端口（没接 Docker 的部署形态、集成测试里只验构建）时仍然留在 `building`。
+ *
+ * 【队列为什么自己也查缓存】P6 §6 的原话：“已有 ready 且 cache_key 没变 → 直接返回旧 digest”。
+ * 上游（resolve / `env:build`）也会在插入新 revision 之前查一次，那一次是常规路径；
+ * 这里这一道是**最后一道闸**：即使调用方没查、或者两个进程同时为了同一个仓库入队，
+ * 也不会重复构建。命中时把 digest 与体检结论复制到本次要求的那一版上，好让“它被要求建，
+ * 但事实上复用了”这件事在库里也看得见。
  */
 
 import type { Usage, UsageRow } from "@reuben-cloud/agent-runtime";
@@ -26,6 +33,7 @@ import type { BuildFailure, BuildResult, BuildRunner, EnvBuildErrorClass } from 
 import { classifyBuildFailure, envBuildLogKey, envImageTag } from "./build.ts";
 import type { DockerfileGenerator } from "./generate.ts";
 import { GenerationError, validateGeneratedDockerfile } from "./generate.ts";
+import type { EnvironmentHealthChecker, HealthReport } from "./health.ts";
 import type { EnvBuildStore } from "./store.ts";
 import { envBuildId } from "./store.ts";
 import type { EnvBuildInference, EnvBuildTrigger, EnvironmentCandidate, RepoSignals } from "./types.ts";
@@ -53,6 +61,11 @@ export interface EnqueueRequest {
   /** 与候选一起采集的信号（生成 prompt 的输入）。 */
   signals: RepoSignals;
   trigger: EnvBuildTrigger;
+  /**
+   * 这一版的缓存键（`computeCacheKey()`）。队列用它做最后一道缓存闸；
+   * `trigger === "manual"` 时跳过（人显式要求重建，见文件头的说明与附录 A-4x）。
+   */
+  cacheKey: string;
 }
 
 /** 一次入队的最终结果。**失败也是结果**（ok=false + 结构化原因，不抛）。 */
@@ -72,6 +85,10 @@ export interface BuildOutcome {
   buildIds: string[];
   /** 模型真的参与了（有 LLM 生成）——成本与排障用。 */
   usedModel: boolean;
+  /** 缓存命中：**一轮都没跑**，digest 与体检结论都是复用的。`attempts === 0` 与它同义。 */
+  cached: boolean;
+  /** 体检报告（没接体检端口、或体检自己崩了时为 null）。 */
+  health: HealthReport | null;
 }
 
 export interface BuildQueueOptions {
@@ -82,6 +99,11 @@ export interface BuildQueueOptions {
    * `signals` 级的仓库会退化成"只有一行 FROM 的规则镜像"，能跑但没有系统依赖。
    */
   generator?: DockerfileGenerator | null;
+  /**
+   * 体检端口（P7）。不给 = 构建成功后就停在 `building`（没接 Docker 的部署形态、
+   * 只验构建的集成测试）。给了且在构建成功后跑一次，结论直接落进环境行的 status / health。
+   */
+  health?: EnvironmentHealthChecker | null;
   /** 轮数上限。缺省 3（测试会调小）。 */
   maxAttempts?: number;
   /** 单轮超时，透传给 builder。缺省由 builder 定（10 分钟）。 */
@@ -105,6 +127,7 @@ export class BuildQueue {
   readonly #builder: BuildRunner;
   readonly #store: EnvBuildStore;
   readonly #generator: DockerfileGenerator | null;
+  readonly #health: EnvironmentHealthChecker | null;
   readonly #maxAttempts: number;
   readonly #timeoutMs: number | undefined;
   readonly #log: LogFn;
@@ -117,6 +140,7 @@ export class BuildQueue {
     this.#builder = options.builder;
     this.#store = options.store;
     this.#generator = options.generator ?? null;
+    this.#health = options.health ?? null;
     this.#maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
     this.#timeoutMs = options.timeoutMs;
     this.#log = options.log ?? noopLog;
@@ -168,6 +192,36 @@ export class BuildQueue {
   async #run(request: EnqueueRequest): Promise<BuildOutcome> {
     const { projectKey, revision, candidate } = request;
     this.#log("info", "开始构建环境", { projectKey, revision, trigger: request.trigger });
+
+    // ---- 最后一道缓存闸（见文件头）。manual 跳过：人显式要求重建时，"缓存键没变"不是理由
+    // ——他可能正是因为 Layer 1 被重建、上游依赖变了才点的那一下（缓存键看不见这两件事）。
+    if (request.trigger !== "manual") {
+      const hit = await this.#store.findCacheHit(projectKey, request.cacheKey);
+      if (hit !== null) {
+        await this.#store.setEnvironmentImage(projectKey, revision, hit.imageDigest);
+        if (hit.health !== null) await this.#store.setEnvironmentHealth(projectKey, revision, hit.health);
+        else await this.#store.setEnvironmentStatus(projectKey, revision, hit.status);
+        this.#log("info", "缓存命中，复用已有镜像与体检结论", {
+          projectKey,
+          revision,
+          hitRevision: hit.revision,
+          digest: hit.imageDigest,
+        });
+        return {
+          projectKey,
+          revision,
+          ok: true,
+          imageDigest: hit.imageDigest,
+          attempts: 0,
+          errorClass: null,
+          detail: null,
+          buildIds: [],
+          usedModel: false,
+          cached: true,
+          health: hit.health,
+        };
+      }
+    }
 
     const touched = await this.#store.setEnvironmentStatus(projectKey, revision, "building");
     if (touched === 0) {
@@ -339,10 +393,38 @@ export class BuildQueue {
     }
 
     const ok = built !== null;
+    let health: HealthReport | null = null;
     if (built !== null) {
       // 自愈改过的文本要写回环境定义：P7 的缓存键读的是这一列（见 store.ts 的说明）。
       if (built.text !== candidate.dockerfile) {
         await this.#store.setEnvironmentDockerfile(projectKey, revision, built.text);
+      }
+      // ---- 镜像落库（P7）：Run 侧的解析、缓存命中、UI 都读这一列。
+      const imaged = await this.#store.setEnvironmentImage(projectKey, revision, built.digest);
+      if (imaged === 0) this.#log("warn", "环境行不存在，镜像 digest 没能落库", { projectKey, revision });
+
+      // ---- 体检（P7 §3）：构建成功 ≠ 能用。这一步在**一次性沙箱**里跑（§C.6）。
+      // 没接体检端口：留在 building（P6 的行为，见文件头）。
+      if (this.#health !== null) {
+        try {
+          health = await this.#health.check({
+            projectKey,
+            revision,
+            image: built.digest,
+            candidate,
+            signals: request.signals,
+          });
+          const checked = await this.#store.setEnvironmentHealth(projectKey, revision, health);
+          if (checked === 0) this.#log("warn", "环境行不存在，体检结论没能落库", { projectKey, revision });
+        } catch (error) {
+          // 体检自己崩了（建沙箱的基础设施错误、存储抖动）：**不把环境判死**。
+          // 镜像真的建出来了，只是我们还不知道能不能用——那就如实停在 building。
+          this.#log("warn", "环境体检没能完成，状态留在 building", {
+            projectKey,
+            revision,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
     } else {
       // 三/二/一轮全失败：环境行收在 failed（P7 的健康检查不会再跑它）。
@@ -360,6 +442,8 @@ export class BuildQueue {
       detail: ok ? null : (failure?.advice ?? null),
       buildIds,
       usedModel,
+      cached: false,
+      health,
     };
     this.#log("info", ok ? "环境构建完成" : "环境构建最终失败", {
       projectKey,

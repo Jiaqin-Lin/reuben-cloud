@@ -142,6 +142,11 @@ export interface BuildLogStore {
   /** 流式上传。返回上传过程中算出的字节数与 sha256（不需要 content-length）。 */
   put(objectKey: string, body: Readable): Promise<{ sizeBytes: number; sha256: string }>;
   get(objectKey: string): Promise<Readable>;
+  /**
+   * 关掉底层连接池（可选：本地文件实现没有连接可关）。
+   * 【为什么在接口上】S3 客户端会保持 keep-alive 连接，而 CLI 跑完要能退干净。
+   */
+  close?(): void;
 }
 
 // ---------------------------------------------------------------- 错误分类
@@ -358,6 +363,17 @@ export function envImageTag(projectKey: string, revision: number): string {
  */
 export function envBuildLogKey(projectKey: string, revision: number, buildId: string): string {
   return [ENV_LOG_PREFIX, slugifyProjectKey(projectKey), String(revision), `${buildId}.log`].join("/");
+}
+
+/**
+ * 体检日志的对象 key（P7）：与构建日志同一个前缀，同一套 slug 规则。
+ *
+ * 【为什么 key 里带 runId】体检与构建是两件事：一次构建可能有几行 attempt（各有各的日志），
+ * 而体检每次一行。用体检沙箱自己的 runId 作文件名，"这份日志是哪一次体检"一目了然，
+ * 也不会有两次体检互相覆写。
+ */
+export function envHealthLogKey(projectKey: string, revision: number, runId: string): string {
+  return [ENV_LOG_PREFIX, slugifyProjectKey(projectKey), String(revision), `${runId}.health.log`].join("/");
 }
 
 // ---------------------------------------------------------------- 构建上下文

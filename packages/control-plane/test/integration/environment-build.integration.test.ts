@@ -26,17 +26,27 @@ import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Db } from "../../src/db/client.ts";
 import { runMigrations } from "../../src/db/migrate.ts";
+import { SandboxApiClient } from "../../src/client/sandbox-api.ts";
 import { DockerBuildRunner, FileBuildLogStore } from "../../src/environment/build.ts";
+import type { HealthSandboxPort } from "../../src/environment/health.ts";
+import { runHealthCheck } from "../../src/environment/health.ts";
+import { createHealthSandboxPort } from "../../src/environment/health-sandbox.ts";
+import { computeCacheKey } from "../../src/environment/cache.ts";
 import { inferFromClone } from "../../src/environment/infer.ts";
 import { BuildQueue } from "../../src/environment/queue.ts";
 import {
+  getEnvironmentByRevision,
   insertEnvironment,
   latestEnvironment,
   listEnvBuilds,
   pgEnvBuildStore,
+  setEnvironmentHealth,
 } from "../../src/environment/store.ts";
+import { LocalDockerProvider } from "../../src/provider/local-docker.ts";
+import { SandboxManager } from "../../src/manager/sandbox-manager.ts";
+import { REPO_DIR } from "@reuben-cloud/agent-runtime";
 import type { RepoSignals } from "../../src/environment/types.ts";
-import { CleanupRegistry, dockerAvailable, run, startPostgres } from "../support.ts";
+import { CleanupRegistry, dockerAvailable, resolveImageRef, run, startPostgres } from "../support.ts";
 import type { TestPostgres } from "../support.ts";
 import { FakeBuildRunner, ScriptedDockerfileGenerator } from "../environment-fakes.ts";
 
@@ -71,6 +81,15 @@ after(async () => {
   await cleanup.sweep();
   if (logRoot !== undefined) await rm(logRoot, { recursive: true, force: true });
 });
+
+/** 推断结果 → 缓存键（队列入队时要有它）。 */
+function cacheKeyOf(inference: Awaited<ReturnType<typeof inferFromClone>>): string {
+  return computeCacheKey({
+    baseImage: inference.candidate.baseImage,
+    signals: inference.signals,
+    dockerfileText: inference.candidate.dockerfile,
+  });
+}
 
 /** 读一个流（日志取回用）。 */
 async function readStream(stream: Readable): Promise<string> {
@@ -115,6 +134,7 @@ describe("Phase 6 · 真 docker 的自愈", () => {
         candidate: inference.candidate,
         signals: inference.signals,
         trigger: "manual",
+        cacheKey: cacheKeyOf(inference),
       });
 
       assert.equal(outcome.ok, true, `构建应当自愈成功：${outcome.detail ?? ""}`);
@@ -187,12 +207,12 @@ describe("Phase 6 · 队列行为走真 PG", () => {
     const queue = new BuildQueue({ builder, store: pgEnvBuildStore(db), generator });
 
     // 同一个仓库连发两次（测试要点 9 / P7 测试要点 10 的同一个行为）：只建一次。
-    const dup1 = queue.enqueue({ projectKey: keys.dup, revision: revisions.get(keys.dup)!, candidate: inference.candidate, signals, trigger: "first_seen" });
-    const dup2 = queue.enqueue({ projectKey: keys.dup, revision: revisions.get(keys.dup)!, candidate: inference.candidate, signals, trigger: "first_seen" });
+    const dup1 = queue.enqueue({ projectKey: keys.dup, revision: revisions.get(keys.dup)!, candidate: inference.candidate, signals, trigger: "first_seen", cacheKey: cacheKeyOf(inference) });
+    const dup2 = queue.enqueue({ projectKey: keys.dup, revision: revisions.get(keys.dup)!, candidate: inference.candidate, signals, trigger: "first_seen", cacheKey: cacheKeyOf(inference) });
     assert.equal(dup1, dup2, "第二个入队复用进行中的那次");
 
-    const broken = queue.enqueue({ projectKey: keys.broken, revision: revisions.get(keys.broken)!, candidate: inference.candidate, signals, trigger: "first_seen" });
-    const healthy = queue.enqueue({ projectKey: keys.healthy, revision: revisions.get(keys.healthy)!, candidate: inference.candidate, signals, trigger: "first_seen" });
+    const broken = queue.enqueue({ projectKey: keys.broken, revision: revisions.get(keys.broken)!, candidate: inference.candidate, signals, trigger: "first_seen", cacheKey: cacheKeyOf(inference) });
+    const healthy = queue.enqueue({ projectKey: keys.healthy, revision: revisions.get(keys.healthy)!, candidate: inference.candidate, signals, trigger: "first_seen", cacheKey: cacheKeyOf(inference) });
     const [a, b, c] = await Promise.all([dup1, broken, healthy]);
 
     assert.equal(a.ok, true);
@@ -220,4 +240,112 @@ async function countEnvUsage(): Promise<number> {
     "SELECT count(*)::int AS count FROM usage_ledger WHERE kind = 'env_build'",
   );
   return result.rows[0]?.count ?? 0;
+}
+
+describe("Phase 7 · 真沙箱里的体检", () => {
+  test(
+    "一次性沙箱：起容器 → 灌入 fixture 仓库 → exec → ready 落库 → 沙箱销毁",
+    { timeout: 900_000 },
+    async () => {
+      const projectKey = "fixture/node-ts-basic-p7-health";
+      const inference = await inferFromClone(path.join(FIXTURES, "node-ts-basic"));
+      const environment = await insertEnvironment(db, {
+        projectKey,
+        candidate: inference.candidate,
+        signals: inference.signals,
+        cacheKey: "p7-health-cache",
+      });
+
+      // 这一版的"产物"用 Layer 1 的 digest：**构建**那条真路径在 P6 的用例里证过了，
+      // 这里要证的是 P7 那三段真动作（起一次性沙箱 / 灌仓库 / exec / 销毁）。
+      const image = await resolveImageRef(BASE_IMAGE);
+
+      // 体检要在一个真 git 仓库上跑：把 fixture 拷出来做一个本地仓库（cloneRepo 直接 clone 它）。
+      const repoDir = await mkdtemp(path.join(os.tmpdir(), "rc-p7-health-repo-"));
+      const local = await run(["bash", "-lc", `cp -r ${path.join(FIXTURES, "node-ts-basic")}/. ${repoDir}/`]);
+      assert.equal(local.code, 0, `拷 fixture 失败：${local.stderr}`);
+      for (const gitArgs of [
+        ["init", "-q", "--initial-branch", "main"],
+        ["add", "-A"],
+        ["-c", "user.email=fixture@example.com", "-c", "user.name=fixture", "commit", "-qm", "fixture"],
+      ]) {
+        const result = await run(["git", "-C", repoDir, ...gitArgs]);
+        assert.equal(result.code, 0, `git ${gitArgs.join(" ")} 失败：${result.stderr}`);
+      }
+      const commit = (await run(["git", "-C", repoDir, "rev-parse", "HEAD"])).stdout.trim();
+
+      const provider = new LocalDockerProvider();
+      // 体检沙箱用一个**不带 artifacts** 的 manager（体检没有产出要归档）。
+      const manager = new SandboxManager({ db, provider, image });
+      const sandbox = createHealthSandboxPort({
+        manager,
+        api: new SandboxApiClient(),
+        repo: { url: repoDir, commit, token: async () => null },
+        workspaceDir: REPO_DIR,
+      });
+      const tracked = trackSandboxes(sandbox);
+      const logKey = "env-logs/fixture__node-ts-basic-p7-health/1/envcheck_it.health.log";
+
+      try {
+        const report = await runHealthCheck({
+          image,
+          runId: "envcheck_it_p7",
+          repoDir: REPO_DIR,
+          // 体检计划换成一条**不依赖网络**的命令：这条用例要验的是"仓库真的在沙箱里、
+          // 命令真的在仓库根里跑、结论真的落库"，而不是 npm registry 今天通不通（那是 P6 的事）。
+          plan: {
+            steps: [
+              { cmd: "test -f package.json && test -d .git && pwd", required: true, purpose: "仓库灌进来了、cwd 对" },
+            ],
+            facts: [],
+          },
+          sandbox: tracked,
+          logs: new FileBuildLogStore(logRoot),
+          logKey,
+        });
+
+        assert.equal(report.status, "ready", `体检没通过：${JSON.stringify(report.steps)}`);
+        assert.match(report.steps[0]!.outputTail, new RegExp(REPO_DIR));
+        assert.equal(report.logKey, logKey);
+        // 日志真的落到盘上（"日志可取回并人类可读"这条验收的真实形态）。
+        const text = await readStream(await new FileBuildLogStore(logRoot).get(logKey));
+        assert.match(text, /test -f package.json/);
+        assert.match(text, /# 结论：ready/);
+
+        // ---- 结论落库：状态与报告一起写，Run 侧的解析才拿得到 status=ready + digest。
+        assert.equal(await setEnvironmentHealth(db, projectKey, environment.revision, report), 1);
+        const row = await getEnvironmentByRevision(db, projectKey, environment.revision);
+        assert.equal(row?.status, "ready");
+        assert.ok(row?.health_checked_at instanceof Date);
+        assert.match(row?.health_log_key ?? "", /envcheck_it\.health\.log$/);
+
+        // ---- 一次性沙箱真的销毁了（不是留给 sweeper）。
+        assert.deepEqual(tracked.destroyed, tracked.opened);
+        const sbx = await db.query<{ state: string }>("SELECT state FROM sandboxes WHERE id = $1", [tracked.opened[0]]);
+        assert.equal(sbx.rows[0]?.state, "DESTROYED");
+      } finally {
+        await rm(repoDir, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+/** 包一层：记下体检真的建了哪个沙箱、真的销毁了哪个（断言"跑完即焚"）。 */
+function trackSandboxes(port: HealthSandboxPort): HealthSandboxPort & { opened: string[]; destroyed: string[] } {
+  const opened: string[] = [];
+  const destroyed: string[] = [];
+  return {
+    opened,
+    destroyed,
+    async open(input: { image: string; runId: string }) {
+      const handle = await port.open(input);
+      opened.push(handle.sandboxId);
+      return handle;
+    },
+    exec: (input) => port.exec(input),
+    async destroy(sandboxId: string, reason: string) {
+      destroyed.push(sandboxId);
+      await port.destroy(sandboxId, reason);
+    },
+  };
 }

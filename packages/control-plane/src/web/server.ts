@@ -1,18 +1,28 @@
 /**
- * `server.ts` —— CP 的第一个（也是 M0 唯一的）HTTP 服务：**观察窗**（Phase 13，P4 加会话视图）。
+ * `server.ts` —— CP 的第一个（也是 M0 唯一的）HTTP 服务：**观察窗**（Phase 13，P4 加会话视图，
+ * P7 加环境页）。
  *
  * 【它不是 API 服务器，刻意不是】没有鉴权、没有多用户、没有一个 CRUD。README 里画的
- * Hono + 完整 API 面是 M1 的事；M0 需要的只有这几条路由：
- *   GET /                        → 有 run 就跳到最近那个，没有就渲染空状态
- *   GET /runs/{id}               → 页面（`packages/web/public/index.html`）
- *   GET /runs/{id}/info          → 这个 run 的元信息（JSON）
- *   GET /runs/{id}/stream        → **SSE**：Run 生命周期 + 循环事件 + 沙箱命令输出
- *   GET /runs/{id}/transcript    → 本次执行的 entries（P4，读 `session_entries`）
- *   GET /sessions/{id}/entries   → 整个会话的 entries + runs（P4，页面默认的会话视图）
- *   GET /app.js /style.css       → 白名单静态资源（见 `static.ts`）
+ * Hono + 完整 API 面是 M1 的事；现在需要的只有这几条路由：
+ *   GET  /                        → 有 run 就跳到最近那个，没有就渲染空状态
+ *   GET  /runs/{id}               → 页面（`packages/web/public/index.html`）
+ *   GET  /runs/{id}/info          → 这个 run 的元信息（JSON）
+ *   GET  /runs/{id}/stream        → **SSE**：Run 生命周期 + 循环事件 + 沙箱命令输出
+ *   GET  /runs/{id}/transcript    → 本次执行的 entries（P4，读 `session_entries`）
+ *   GET  /sessions/{id}/entries   → 整个会话的 entries + runs（P4，页面默认的会话视图）
+ *   GET  /env/{projectKey}        → 环境页（P7：状态、体检细节、历次构建）
+ *   GET  /env/{projectKey}/info   → 环境页的读模型（JSON）
+ *   POST /env/{projectKey}/build  → manual 入队（P7：页面上那个"构建 / 重建"按钮）
+ *   GET  /env/{projectKey}/logs/{revision}?build=…|health=…  → 日志只读代理（P7）
+ *   GET  /app.js /style.css /env.js → 白名单静态资源（见 `static.ts`）
  *
  * 所以实现就是 `node:http` 加一个 switch：多引一个框架只会让"这个进程到底监听了什么"
  * 变得更难回答。
+ *
+ * 【为什么 P7 破了"这个服务只有 GET"这条】环境页上那个"构建 / 重建"按钮走 GET 的话，
+ * 就与"链接预取 / 浏览器重放 / 爬虫"这套语义撞上（一个 GET 不该有副作用）。所以它是一条
+ * **POST**，而这条写口的合法性来自它所在的位置：只绑定回环、无鉴权、单租户（见文件末的安全
+ * 边界）。M1 的真 API 面（带鉴权）不在这里长。
  *
  * 【为什么不把 SSE 端点做成"包一层沙箱的流"】沙箱的事件流只覆盖命令输出，而观察窗要的是
  * 一次 Run 的全景（模型在想什么、调了什么工具、命令跑出什么）。事件在 CP 侧汇集到
@@ -33,6 +43,8 @@ import type { SessionStore } from "@reuben-cloud/agent-runtime";
 import type { LogFn } from "../log.ts";
 import { noopLog } from "../log.ts";
 import { sseFrameOf } from "../agent/events.ts";
+import type { EnvironmentWebPort } from "./env.ts";
+import { logRequestOf, readEnvironmentLog, readEnvironmentView } from "./env.ts";
 import type { HubEventRecord, RunHub } from "./hub.ts";
 import { readRunView, readSessionView } from "./history.ts";
 import { readStatic, webRoot } from "./static.ts";
@@ -53,6 +65,11 @@ export interface WebServerOptions {
    * 观察窗的核心（实时流）不依赖它，所以它是可选的。
    */
   store?: SessionStore | null;
+  /**
+   * 环境页的读口与触发口（P7）。不给时 `/env/...` 回 503——观察窗的核心（实时流）不依赖它，
+   * 所以它与 `store` 一样是可选件。
+   */
+  environments?: EnvironmentWebPort | null;
   /** 前端资源目录；缺省 `packages/web/public`（`static.ts` 的 `webRoot()`）。 */
   webRoot?: string;
   /** 端口；0 = 让系统分配（测试用）。 */
@@ -81,8 +98,15 @@ export function createWebHandler(options: WebServerOptions): WebHandler {
     const url = new URL(req.url ?? "/", `http://${LOOPBACK}`);
     const pathname = url.pathname;
 
+    // 环境页（P7）：它既读又写（页面 + 一个 manual 触发的按钮），所以形状与观察窗那几条
+    // 不一样，单独解析（projectKey 里有 `/`，不能走 `parseRoute` 的按段解码）。
+    const envRoute = parseEnvRoute(pathname);
+    if (envRoute !== null) {
+      return handleEnvRoute(req, res, envRoute, options.environments ?? null, url, root, log);
+    }
+
     if (req.method !== "GET") {
-      return sendJson(res, 405, { error: "method_not_allowed", message: "观察窗只有 GET" });
+      return sendJson(res, 405, { error: "method_not_allowed", message: "这条路径只有 GET（唯一的写口是 /env/{key}/build）" });
     }
 
     // 静态白名单先查：文件名只来自表，`pathname` 不参与拼路径（见 `static.ts`）。
@@ -95,7 +119,7 @@ export function createWebHandler(options: WebServerOptions): WebHandler {
       }
       return sendStatic(res, "/index.html", root);
     }
-    if (pathname === "/app.js" || pathname === "/style.css") {
+    if (pathname === "/app.js" || pathname === "/style.css" || pathname === "/env.js") {
       return sendStatic(res, pathname, root);
     }
     if (pathname === "/favicon.ico") {
@@ -160,6 +184,145 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
+}
+
+// ---------------------------------------------------------------- 环境页（P7）
+
+interface EnvRoute {
+  kind: "page" | "info" | "build" | "logs";
+  projectKey: string;
+  revision: number | null;
+}
+
+/**
+ * 解析 `/env/...`。
+ *
+ * 【为什么不走 `parseRoute`】环境页的 id 是 `owner/name`——一个含 `/` 的键。按段 split 之后
+ * 它天然跨两段，而 URL 里它通常被 `encodeURIComponent` 写成 `owner%2Fname`（浏览器地址栏与
+ * 页面的 `fetch` 都不会把 `%2F` 还原）。所以这一段自己解码、自己校验字符集与长度，
+ * 而不是复用一份"不含斜杠"的规则。
+ */
+export function parseEnvRoute(pathname: string): EnvRoute | null {
+  if (pathname !== "/env" && !pathname.startsWith("/env/")) return null;
+  const rest = pathname.slice("/env".length).replace(/^\/+/, "");
+  const slash = rest.indexOf("/");
+  const rawKey = slash === -1 ? rest : rest.slice(0, slash);
+  const tail = slash === -1 ? "" : rest.slice(slash + 1);
+  const projectKey = decodeProjectKey(rawKey);
+  if (projectKey === null) return null;
+  if (tail === "") return { kind: "page", projectKey, revision: null };
+  if (tail === "info") return { kind: "info", projectKey, revision: null };
+  if (tail === "build") return { kind: "build", projectKey, revision: null };
+  const logMatch = /^logs\/(\d{1,9})$/.exec(tail);
+  if (logMatch !== null) return { kind: "logs", projectKey, revision: Number(logMatch[1]) };
+  return null;
+}
+
+/** `owner/name` 的解码与校验。**只允许项目键的字符集**：它同时进 SQL 与日志 key。 */
+function decodeProjectKey(raw: string): string | null {
+  if (raw === "") return null;
+  let value: string;
+  try {
+    value = decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+  if (!/^[A-Za-z0-9._\/-]{1,200}$/.test(value)) return null;
+  if (value.includes("..") || value.startsWith("/") || value.endsWith("/")) return null;
+  return value;
+}
+
+/** `/env/{key}/logs/{revision}` 的两个二选一参数（`build` / `health`）。 */
+function logKindOf(url: URL): { buildId: string | null; healthRunId: string | null } {
+  const safe = (value: string | null): string | null =>
+    value !== null && /^[A-Za-z0-9._-]{1,64}$/.test(value) ? value : null;
+  return {
+    buildId: safe(url.searchParams.get("build")),
+    healthRunId: safe(url.searchParams.get("health")),
+  };
+}
+
+async function handleEnvRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  route: EnvRoute,
+  port: EnvironmentWebPort | null,
+  url: URL,
+  root: string,
+  log: LogFn,
+): Promise<void> {
+  if (route.kind === "page") {
+    // 页面本身对不存在的仓库也回 200：谁来告诉用户"没有这个环境"是前端的事（它靠 `/info`），
+    // 与 `/runs/{id}` 同一条规矩。
+    if (req.method !== "GET") return sendJson(res, 405, { error: "method_not_allowed", message: "环境页只有 GET" });
+    return sendStatic(res, "/env.html", root);
+  }
+  if (port === null) {
+    return sendJson(res, 503, {
+      error: "environments_unavailable",
+      message: "这个观察窗没有接环境子系统（起服务时传 environments: { store, runtime, logs }）",
+    });
+  }
+
+  if (route.kind === "info") {
+    if (req.method !== "GET") return sendJson(res, 405, { error: "method_not_allowed", message: "info 只有 GET" });
+    const view = await readEnvironmentView(port, route.projectKey);
+    if (view === null) {
+      return sendJson(res, 404, { error: "environment_not_found", message: `这个仓库还没有任何环境记录：${route.projectKey}` });
+    }
+    return sendJson(res, 200, view);
+  }
+
+  if (route.kind === "build") {
+    if (req.method !== "POST") return sendJson(res, 405, { error: "method_not_allowed", message: "构建是 POST" });
+    const runtime = port.runtime ?? null;
+    if (runtime === null) {
+      return sendJson(res, 503, { error: "build_unavailable", message: "这个进程没有接构建队列" });
+    }
+    if (runtime.projectKey !== route.projectKey) {
+      return sendJson(res, 409, {
+        error: "project_not_served",
+        message: `这个进程只服务 ${runtime.projectKey}（环境页对别的仓库是只读的）`,
+      });
+    }
+    // 不 await 构建：页面点一下是"把它排队"，10 分钟的构建不该挂在这个请求上（设计文档 §C.8）。
+    void runtime.rebuild("manual").catch((error: unknown) => {
+      log("error", "环境页触发的构建失败", {
+        projectKey: route.projectKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return sendJson(res, 202, { queued: true, projectKey: route.projectKey });
+  }
+
+  // 日志只读代理（key 由服务端拼，见 `web/env.ts` 的文件头）。
+  if (req.method !== "GET") return sendJson(res, 405, { error: "method_not_allowed", message: "日志只有 GET" });
+  const kind = logKindOf(url);
+  const request = logRequestOf({
+    projectKey: route.projectKey,
+    revision: route.revision!,
+    buildId: kind.buildId,
+    healthRunId: kind.healthRunId,
+  });
+  if (request === null) {
+    return sendJson(res, 400, {
+      error: "bad_log_request",
+      message: "要 ?build=<bld_id> 或 ?health=<run_id> 二选一",
+    });
+  }
+  const result = await readEnvironmentLog(port, request);
+  if (!result.ok) {
+    return result.reason === "no_log_store"
+      ? sendJson(res, 503, { error: "logs_unavailable", message: "这个进程没有日志落点（没配 S3 也没配本地目录）" })
+      : sendJson(res, 404, { error: "log_not_found", message: `没有这份日志：${request.buildId ?? request.healthRunId}` });
+  }
+  const body = result.truncated ? `${result.text}\n\n…（日志超过上限，已截断）\n` : result.text;
+  res.writeHead(200, {
+    "content-type": "text/plain; charset=utf-8",
+    "content-length": Buffer.byteLength(body),
+    "cache-control": "no-store",
+  });
+  res.end(body);
 }
 
 // ---------------------------------------------------------------- SSE

@@ -35,6 +35,8 @@ export class FakeNode {
   hidden = false;
   href = "";
   title = "";
+  /** 按钮的禁用态（`env.js` 在构建期间禁用它）。 */
+  disabled = false;
 
   /** 事件监听（`app.js` 只用了 click）。 */
   #listeners = new Map<string, Array<() => void>>();
@@ -87,6 +89,19 @@ export class FakeNode {
   prepend(node: FakeNode): void {
     node.parentNode = this;
     this.childNodes.unshift(node);
+  }
+
+  /** `append` 的另一种写法（真 DOM 两个都有；`env.js` 用的是这个）。 */
+  appendChild(node: FakeNode): FakeNode {
+    this.append(node);
+    return node;
+  }
+
+  /** 清空再追加（`env.js` 用 `replaceChildren` 重画一块区域）。 */
+  replaceChildren(...nodes: FakeNode[]): void {
+    for (const child of this.childNodes) child.parentNode = null;
+    this.childNodes.length = 0;
+    this.append(...nodes);
   }
 
   remove(): void {
@@ -191,6 +206,8 @@ export interface FakeDom {
   document: FakeDocument;
   window: Record<string, unknown> & { location: { pathname: string } };
   sources: FakeEventSource[];
+  /** 页面发出去的 `fetch`（env.js 那个按钮要看"是不是真的发了 POST"）。 */
+  requests: Array<{ url: string; method: string }>;
   /** 直接丢给 `vm.createContext()` 的那一组全局（`app.js` 引用的裸名字）。 */
   globals: Record<string, unknown>;
 }
@@ -263,7 +280,14 @@ export function createDom(options: { ids: string[]; pathname: string; fetches?: 
     disconnect(): void {}
   }
 
-  const fetchImpl = async (url: unknown): Promise<{ status: number; ok: boolean; json: () => Promise<unknown> }> => {
+  const requests: FakeDom["requests"] = [];
+  const fetchImpl = async (
+    url: unknown,
+    init?: { method?: string },
+  ): Promise<{ status: number; ok: boolean; json: () => Promise<unknown> }> => {
+    const method = init?.method ?? "GET";
+    requests.push({ url: String(url), method });
+    // POST 是写口（env.js 那个按钮）：调用方用 `fetches` 里同名 match 的规则给它状态码。
     const rule = fetches.find((candidate) => String(url).includes(candidate.match));
     if (rule === undefined) return { status: 404, ok: false, json: async () => ({ error: "not_found" }) };
     return { status: rule.status, ok: rule.status < 400, json: async () => rule.body };
@@ -273,9 +297,15 @@ export function createDom(options: { ids: string[]; pathname: string; fetches?: 
     document: root,
     window,
     sources,
+    requests,
     globals: {
       document: root,
       window,
+      // 浏览器里 `location` / `localStorage` / `matchMedia` 同时是 window 的属性与全局裸名字，
+      // 页面代码两种写法都会出现（app.js 用 `window.*`，env.js 用裸名字）。
+      location: window.location,
+      localStorage: window.localStorage,
+      matchMedia: window.matchMedia,
       EventSource: EventSourceStub,
       IntersectionObserver: IntersectionObserverStub,
       fetch: fetchImpl,

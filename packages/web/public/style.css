@@ -673,3 +673,107 @@ body {
     transition: none !important;
   }
 }
+
+/* ---------------------------------------------------------------- 环境页（P7） */
+
+/* 【为什么新开一段而不是改上面的类】环境页与观察窗共用 tokens 与 .card / .meta / .note，
+   这里只加"环境特有"的那几个形状：一行 build、一版 revision 的头、以及状态徽章。
+   徽章的四个状态用同一套 tokens（不引新颜色）：ready 用强调色，degraded 用次要文字色，
+   failed 用危险色，building 用强调色但降低不透明度（它是"还在跑"，不是结论）。 */
+
+.env__actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 18px 0 4px;
+}
+
+.env__hint {
+  color: var(--ink-muted);
+  font-size: 12.5px;
+}
+
+.env__rev {
+  margin-top: 14px;
+}
+
+.env__rev-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.env__rev-title {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.env__rev-sub {
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.env__builds {
+  margin: 8px 0 4px;
+}
+
+.env__build {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+
+.env__build-attempt,
+.env__build-inference,
+.env__build-meta {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.env__build-attempt {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.env__build-inference,
+.env__build-meta {
+  color: var(--ink-muted);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.badge[data-status="ready"] {
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+.badge[data-status="failed"] {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.badge[data-status="degraded"] {
+  color: var(--ink);
+}
+
+.badge[data-status="building"],
+.badge[data-status="draft"] {
+  opacity: 0.75;
+}

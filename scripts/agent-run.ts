@@ -65,6 +65,12 @@ import { runStatusFor } from "../packages/control-plane/src/session/session-run.
 import { branchNameForTask } from "../packages/control-plane/src/repo/push.ts";
 import { REPO_DIR, buildSystemPrompt } from "@reuben-cloud/agent-runtime";
 import { createSandboxToolkit } from "../packages/control-plane/src/agent/sandbox-operations.ts";
+import { healthFactLine } from "../packages/control-plane/src/environment/health.ts";
+import { describeResolution } from "../packages/control-plane/src/environment/resolve.ts";
+import { envBuildLogStoreFromEnv } from "../packages/control-plane/src/environment/build.ts";
+import { createEnvironmentSubsystem } from "../packages/control-plane/src/environment/runtime.ts";
+import { pgEnvironmentWebStore } from "../packages/control-plane/src/web/env.ts";
+import type { EnvironmentWebPort } from "../packages/control-plane/src/web/env.ts";
 import { RunHub } from "../packages/control-plane/src/web/hub.ts";
 import type { WebServer } from "../packages/control-plane/src/web/server.ts";
 import { startWebServer } from "../packages/control-plane/src/web/server.ts";
@@ -96,6 +102,14 @@ interface Args {
   exportPath: string | null;
   /** `--compact [n]`：在第 n 次轮次准备时强制压缩一次（默认 1 = 第一轮之后）。 */
   compactAfterTurn: number | null;
+  /** `--env-revision <n>`：显式指定用哪一版环境（P7）。 */
+  envRevision: number | null;
+  /** `--rebuild-env`：先显式重建一版环境（跳过缓存），再跑这次 Run（P7）。 */
+  rebuildEnv: boolean;
+  /** `--promote-env <文件>`：把一份 Dockerfile 固化成新 revision（P7）。 */
+  promoteEnv: string | null;
+  /** `--no-env`：不碰环境子系统（用 SANDBOX_IMAGE 的默认镜像跑）。 */
+  noEnv: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -118,6 +132,10 @@ function parseArgs(argv: string[]): Args {
     session: null,
     exportPath: null,
     compactAfterTurn: null,
+    envRevision: null,
+    rebuildEnv: false,
+    promoteEnv: null,
+    noEnv: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const current = argv[index]!;
@@ -182,6 +200,18 @@ function parseArgs(argv: string[]): Args {
       case "--session":
         args.session = next();
         break;
+      case "--env-revision":
+        args.envRevision = parsePositiveInt(current, next());
+        break;
+      case "--rebuild-env":
+        args.rebuildEnv = true;
+        break;
+      case "--promote-env":
+        args.promoteEnv = next();
+        break;
+      case "--no-env":
+        args.noEnv = true;
+        break;
       case "--export":
         args.exportPath = next();
         break;
@@ -233,6 +263,10 @@ function printUsage(): void {
   --no-draft            PR 不用 draft（默认 draft）
   --max-turns <n>       轮数上限（默认 40）
   --session <id>        续用已有会话（默认新建；续用会从会话的分支 head 接上）
+  --env-revision <n>    用指定的一版项目环境（只有 ready / degraded 能跑；P7）
+  --rebuild-env         先显式重建一版环境（跳过缓存）再跑这次 Run（P7）
+  --promote-env <文件>  把这份 Dockerfile 固化成项目环境的新一版（P7）
+  --no-env              不碰环境子系统（用 SANDBOX_IMAGE 的默认镜像跑，不解析也不入队）
   --export <文件>       把整个会话导出成 JSONL（跨 Run；--keep 时默认导出一份）
   --compact [n]         在第 n 次轮次准备时强制压缩一次（调试/验证用；默认 1 = 第一轮之后）
   --serve               同时起本地观察窗（SSE 实时 transcript，默认 127.0.0.1:8787）
@@ -288,6 +322,10 @@ async function main(): Promise<void> {
   const store = artifactStoreFromEnv();
   const db = new Db({ connectionString: databaseUrl });
   await runMigrations(db);
+  // ---- Phase 7：环境子系统的**两个先决件**在观察窗之前就备好——日志落点在起沙箱之前要交给
+  // 体检端口（构建日志与体检日志是同一个落点），而环境页的读模型只依赖 db。
+  const envLogStore = envBuildLogStoreFromEnv();
+  const envPort: EnvironmentWebPort = { store: pgEnvironmentWebStore(db), runtime: null, logs: envLogStore };
   // ---- Phase 2：会话存储。脚本是**单轮的手工验收驱动**，但它落的账与产品路径
   // （`handleUserMessage`）是同一套表——不然"手工跑能落库"就只是一句空话。
   const sessionStore = new PostgresSessionStore(db);
@@ -301,7 +339,15 @@ async function main(): Promise<void> {
   let web: WebServer | null = null;
   if (hub !== null) {
     try {
-      web = await startWebServer({ hub, store: sessionStore, ...(args.port === null ? {} : { port: args.port }), log });
+      web = await startWebServer({
+        hub,
+        store: sessionStore,
+        // 环境页（P7）：读模型现在就能用，触发口在 clone 之后才会接上（`runtime` 是同一个对象上的
+        // 可变字段，页面按请求读它）——那之前点按钮会得到"这个进程没有接构建队列"。
+        environments: envPort,
+        ...(args.port === null ? {} : { port: args.port }),
+        log,
+      });
       log("info", `观察窗：${web.url}/runs/${runId}（跑完仍然保留，Ctrl-C 退出）`);
     } catch (error) {
       log("warn", `观察窗没起来（端口被占？），这次 Run 没有实时 transcript`, {
@@ -373,6 +419,61 @@ async function main(): Promise<void> {
   });
   log("info", `仓库已 clone（base ${clone.baseSha.slice(0, 12)}）`, { dir: clone.dir });
 
+  // ---- Phase 7：环境解析。**一次读，从不构建**（设计文档 §C.8）：有 ready / degraded 的
+  // 版本就用它的 digest，没有就用 Layer 1 的镜像 + 一句沙箱事实，并把构建**异步**排进队列。
+  // 这一整段都发生在建沙箱之前——沙箱的 image 就是它的输出。
+  const projectKey = ref === null ? `local/${path.basename(path.resolve(args.local!))}` : `${ref.owner}/${ref.repo}`;
+  const environment = args.noEnv
+    ? null
+    : createEnvironmentSubsystem({
+        db,
+        projectKey,
+        cloneDir: clone.dir,
+        // 体检沙箱用一个**不带归档**的 manager：给一个刚建出来、仓库还没改过的沙箱归档没有意义。
+        healthManager: new SandboxManager({ db, provider, image, log }),
+        api,
+        repo: { url: remote.url, commit: clone.baseSha, token: async () => remote.token },
+        logStore: envLogStore,
+        repoDir: REPO_DIR,
+        log,
+      });
+  // 环境页的触发口：现在起它才认识这个仓库（页面上的"构建 / 重建"按钮走 manual 入队）。
+  envPort.runtime = environment?.runtime ?? null;
+  if (environment !== null && args.rebuildEnv) {
+    // 显式重建：跳过缓存、等它跑完。它本来就是"我要先把它建出来"的意思。
+    const attempt = await environment.runtime.rebuild("manual");
+    log(attempt.outcome?.ok === true ? "info" : "warn", "环境重建完成", {
+      revision: attempt.revision,
+      ok: attempt.outcome?.ok ?? null,
+      attempts: attempt.outcome?.attempts ?? 0,
+      status: attempt.outcome?.health?.status ?? null,
+      errorClass: attempt.outcome?.errorClass ?? null,
+    });
+  }
+  if (environment !== null && args.promoteEnv !== null) {
+    // promote：把一份（会话里验证有效的）Dockerfile 固化成项目级新一版（设计文档 §C.5）。
+    const text = readFileSync(args.promoteEnv, "utf8");
+    const promoted = await environment.runtime.promote(text);
+    log("info", "环境已固化为一版新 revision", {
+      revision: promoted.revision,
+      cacheHit: promoted.cacheHit,
+      ok: promoted.outcome?.ok ?? null,
+    });
+  }
+  const resolution =
+    environment === null
+      ? null
+      : await environment.runtime.resolve({
+          ...(args.envRevision === null ? {} : { forcedRevision: args.envRevision }),
+        });
+  if (resolution !== null) {
+    log("info", `环境：${describeResolution(resolution)}`, {
+      image: resolution.image,
+      revision: resolution.revision,
+      facts: resolution.facts.length,
+    });
+  }
+
   const session =
     resumed !== null
       ? resumed
@@ -396,11 +497,13 @@ async function main(): Promise<void> {
     headCommit: session.headCommit,
   });
 
-  // ---- 沙箱。归属**会话**（`sandboxes.session_id`）。
+  // ---- 沙箱。归属**会话**（`sandboxes.session_id`）。镜像来自 P7 的环境解析：
+  // 项目环境的 digest 或 Layer 1 的 digest（没环境子系统时用 manager 的缺省镜像）。
   const sandbox = await manager.createSandbox({
     runId,
     sessionId: session.id,
     ...(session.taskId === null ? {} : { taskId: session.taskId }),
+    ...(resolution === null ? {} : { image: resolution.image }),
   });
   await sessionStore.setSessionSandbox(session.id, { sandboxId: sandbox.sandboxId, at: new Date() });
   log("info", `沙箱就绪：${sandbox.sandboxId}`, { endpoint: sandbox.endpoint });
@@ -441,6 +544,8 @@ async function main(): Promise<void> {
       startEntryId: session.leafEntryId,
       provider: model.provider,
       model: model.model,
+      // P7：这一轮用的是哪一版环境（回退到 Layer 1 时是 null）。
+      envRevision: resolution?.revision === null || resolution === null ? null : String(resolution.revision),
     });
     const history = buildContextEntries(await sessionStore.listEntries(session.id));
     const prompts: AgentMessage[] | null =
@@ -474,7 +579,10 @@ async function main(): Promise<void> {
       sessionId: session.id,
       history,
       ...(prompts === null ? {} : { prompts }),
-      system: buildSystemPrompt(),
+      // P7：degraded / "依赖还没装" 是**沙箱事实**，与 repoDir 同一条通道进 system（§C.6/§C.8）。
+      system: buildSystemPrompt({
+        sandbox: { repoDir: REPO_DIR, health: healthFactLine(resolution?.facts ?? []) },
+      }),
       maxTurns: args.maxTurns,
       maxTokens: maxTokensFromEnv(model.model),
       // 压缩（P3）：与产品路径同一份构造（`createSessionCompaction`），只是强制轮次可配。
@@ -572,6 +680,13 @@ async function main(): Promise<void> {
       `轮数 / 工具调用 ${result.turns} / ${result.toolCalls}`,
       `用量           in=${result.usage.inputTokens} out=${result.usage.outputTokens} ` +
         `cache_read=${result.usage.cacheReadInputTokens} cache_write=${result.usage.cacheCreationInputTokens}`,
+      ...(resolution === null
+        ? ["环境           未接（--no-env）"]
+        : [
+            `环境           ${describeResolution(resolution)}`,
+            `沙箱镜像       ${resolution.image}`,
+            ...(resolution.facts.length === 0 ? [] : [`环境事实       ${resolution.facts.map((fact) => fact.detail).join("；")}`]),
+          ]),
       `改动的文件     ${finished.changes.files.length} 个（+${sum(finished.changes.files.map((file) => file.additions))} / -${sum(finished.changes.files.map((file) => file.deletions))}）`,
       `改动来源       ${finished.changes.source}${finished.changes.fallbackReason === null ? "" : `（回退原因：${finished.changes.fallbackReason}）`}`,
       `验证           ${describeVerification(finished.verification)}`,
@@ -626,8 +741,18 @@ async function main(): Promise<void> {
       }
     }
     await removeRunDir(runId).catch(() => undefined);
+    // 【为什么这里要看一眼队列】"Run 不等构建"是产品语义（设计文档 §C.8），但进程退出会**中断**
+    // 那个后台构建。所以：不阻塞退出，但要如实说一句——否则下一次 Run 会发现环境停在 building，
+    // 而没有任何线索解释它为什么没建完。
+    if (environment !== null && environment.queue.pendingCount > 0) {
+      log("warn", "环境构建还在后台跑：这个进程退出会中断它（下一次 Run 会重新排队）", {
+        projectKey,
+        pending: environment.queue.pendingCount,
+      });
+    }
     await db.close();
     store?.close();
+    envLogStore.close?.();
   }
 
   if (summary !== null) console.log(summary);

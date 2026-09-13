@@ -25,6 +25,8 @@ import type { Queryable } from "../db/client.ts";
 import { maybeOne, one } from "../db/client.ts";
 import { insertUsage } from "../session/postgres.ts";
 import { prefixedId } from "../ulid.ts";
+import type { HealthReport } from "./health.ts";
+import { readStoredHealth } from "./health.ts";
 import type {
   EnvBuildInference,
   EnvBuildStatus,
@@ -51,6 +53,17 @@ export interface EnvironmentRow {
   degraded_risks: string[];
   build_commands: string[];
   verify_commands: string[];
+  /** P7：这一版环境的镜像（digest 引用）。没构建成功过就是 null。 */
+  image_digest: string | null;
+  /** P7：缓存键（`cache.ts` 算的）。没有它这一版不参与缓存命中。 */
+  cache_key: string | null;
+  /** P7：上一版（首版为 NULL）。回滚与"这一版怎么来的"都读它。 */
+  parent_revision: number | null;
+  /** P7：体检报告；没体检过是 `{}`（用 `health.ts` 的 `readStoredHealth()` 读它）。 */
+  health: HealthReport | Record<string, never>;
+  health_reason: string | null;
+  health_checked_at: Date | null;
+  health_log_key: string | null;
   created_at: Date;
 }
 
@@ -64,6 +77,8 @@ export interface NewEnvironment {
   kind?: EnvKind;
   /** 缺省 `draft`：P5 只推断，P6/P7 才会把它推到 building / ready。 */
   status?: EnvStatus;
+  /** P7 的缓存键。调用方用 `computeCacheKey()` 算好给进来（SQL 里不重算一遍）。 */
+  cacheKey?: string | null;
 }
 
 /** `env_<ulid>`（spec §0.1 的 ID 前缀表）。 */
@@ -83,9 +98,9 @@ export async function insertEnvironment(q: Queryable, input: NewEnvironment): Pr
     q,
     `INSERT INTO environments
        (id, project_key, revision, kind, level, status, base_image, dockerfile, signals,
-        notes, degraded_risks, build_commands, verify_commands)
+        notes, degraded_risks, build_commands, verify_commands, cache_key, parent_revision)
      SELECT $1, $2, COALESCE(MAX(revision), 0) + 1, $3, $4, $5, $6, $7, $8::jsonb,
-            $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb
+            $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb, $13, MAX(revision)
        FROM environments WHERE project_key = $2
      RETURNING *`,
     [
@@ -101,6 +116,7 @@ export async function insertEnvironment(q: Queryable, input: NewEnvironment): Pr
       JSON.stringify(candidate.degradedRisks),
       JSON.stringify(candidate.buildCommands),
       JSON.stringify(candidate.verifyCommands),
+      input.cacheKey ?? null,
     ],
   );
 }
@@ -131,6 +147,142 @@ export function listEnvironments(q: Queryable, projectKey: string, limit = 10): 
       [projectKey, limit],
     )
     .then((result) => result.rows);
+}
+
+// ---------------------------------------------------------------- 缓存命中、镜像与体检（P7）
+
+/** 某一版（`--env-revision` / 回滚 / 缓存命中的落点都按 revision 取）。 */
+export function getEnvironmentByRevision(
+  q: Queryable,
+  projectKey: string,
+  revision: number,
+): Promise<EnvironmentRow | null> {
+  return maybeOne<EnvironmentRow>(q, "SELECT * FROM environments WHERE project_key = $1 AND revision = $2", [
+    projectKey,
+    revision,
+  ]);
+}
+
+/**
+ * 缓存命中：同一个键、已经体检通过（ready / degraded）、拿得到 digest 的那一行。
+ *
+ * 【为什么只认 ready / degraded】`building` 的那一行还没有可用镜像；`failed` 的那一行复用
+ * 出去就是“把一个已知不能用的环境当成好的”（那比重新构建贵得多）。`draft` 同理。
+ * 【为什么按 revision DESC 取第一行】同一个键可能命中多版（回滚过、手动重建过），
+ * 取最新的那一版是唯一能解释的选择：它离当前事实最近。
+ */
+export function findCacheHit(q: Queryable, projectKey: string, cacheKey: string): Promise<EnvironmentRow | null> {
+  return maybeOne<EnvironmentRow>(
+    q,
+    `SELECT * FROM environments
+      WHERE project_key = $1 AND cache_key = $2 AND image_digest IS NOT NULL
+        AND status IN ('ready', 'degraded')
+      ORDER BY revision DESC LIMIT 1`,
+    [projectKey, cacheKey],
+  );
+}
+
+/** 构建成功后落“这一版环境的镜像是什么”。返回受影响行数（0 = 那一版不在了）。 */
+export async function setEnvironmentImage(
+  q: Queryable,
+  projectKey: string,
+  revision: number,
+  imageDigest: string,
+): Promise<number> {
+  const result = await q.query(
+    "UPDATE environments SET image_digest = $3 WHERE project_key = $1 AND revision = $2",
+    [projectKey, revision, imageDigest],
+  );
+  return result.rowCount ?? 0;
+}
+
+/**
+ * 体检结论落地：**状态与报告一起写**（一次 UPDATE）。
+ *
+ * 【为什么不能拆成两次】“status 已是 ready 但 health 还是空的”这种中间态会被 UI 与
+ * Run 侧的解析同时读到，而它们会给出互相矛盾的结论（状态说能用、报告说不知道为什么）。
+ */
+export async function setEnvironmentHealth(
+  q: Queryable,
+  projectKey: string,
+  revision: number,
+  report: HealthReport,
+): Promise<number> {
+  const result = await q.query(
+    `UPDATE environments
+        SET status = $3, health = $4::jsonb, health_reason = $5, health_checked_at = $6, health_log_key = $7
+      WHERE project_key = $1 AND revision = $2`,
+    [
+      projectKey,
+      revision,
+      report.status,
+      JSON.stringify(report),
+      report.reason,
+      report.checkedAt,
+      report.logKey,
+    ],
+  );
+  return result.rowCount ?? 0;
+}
+
+/** “当前生效的是哪一版”（一行小表，见 008 迁移的注释）。 */
+export interface ProjectEnvStateRow {
+  project_key: string;
+  current_revision: number;
+  updated_at: Date;
+}
+
+export function getProjectEnvState(q: Queryable, projectKey: string): Promise<ProjectEnvStateRow | null> {
+  return maybeOne<ProjectEnvStateRow>(q, "SELECT * FROM project_env_state WHERE project_key = $1", [projectKey]);
+}
+
+/** upsert 当前 revision（首次指向与回滚走的是同一个入口）。 */
+export async function setProjectEnvState(q: Queryable, projectKey: string, currentRevision: number): Promise<void> {
+  await q.query(
+    `INSERT INTO project_env_state (project_key, current_revision, updated_at)
+     VALUES ($1, $2, now())
+     ON CONFLICT (project_key) DO UPDATE SET current_revision = EXCLUDED.current_revision, updated_at = now()`,
+    [projectKey, currentRevision],
+  );
+}
+
+/**
+ * 被沙箱引用过的镜像 digest（清理策略的输入：这些**永不清理**，设计文档 §C.5）。
+ *
+ * 扫 `sandboxes.image_digest` 而不是 `runs.env_revision`：前者是“真的有容器用过这个镜像”的
+ * 硬件事实，而后者只能证明“某次执行声明要用它”。
+ */
+export async function listReferencedDigests(q: Queryable): Promise<string[]> {
+  const result = await q.query<{ image_digest: string | null }>(
+    "SELECT DISTINCT image_digest FROM sandboxes WHERE image_digest IS NOT NULL",
+  );
+  return result.rows.map((row) => row.image_digest!).filter((digest) => digest !== "");
+}
+
+/**
+ * 缓存命中的最小形态。**故意不是整行 `EnvironmentRow`**：队列与解析层只用得上这四样，
+ * 而"端口返回什么"决定了替身要模拟多少（单测不必造一行里的全部字段）。
+ */
+export interface CacheHit {
+  revision: number;
+  imageDigest: string;
+  /** 命中那一版的体检结论（degraded 时 Run 要把它当沙箱事实写进 system）。 */
+  health: HealthReport | null;
+  /** 命中那一版的状态（镜像存在但 `health` 列还是 `{}` 的旧行也要能如实交接）。 */
+  status: EnvStatus;
+  cacheKey: string;
+}
+
+/** 整行 → 端口形状（`image_digest` / `cache_key` 缺一个就不算命中）。 */
+export function cacheHitOf(row: EnvironmentRow): CacheHit | null {
+  if (row.image_digest === null || row.cache_key === null) return null;
+  return {
+    revision: row.revision,
+    imageDigest: row.image_digest,
+    health: readStoredHealth(row.health),
+    status: row.status,
+    cacheKey: row.cache_key,
+  };
 }
 
 // ---------------------------------------------------------------- 环境状态的推进（P6 的队列写）
@@ -234,6 +386,15 @@ export interface EnvBuildStore {
   /** 推进环境状态；返回受影响行数（见 `setEnvironmentStatus`）。 */
   setEnvironmentStatus(projectKey: string, revision: number, status: EnvStatus): Promise<number>;
   setEnvironmentDockerfile(projectKey: string, revision: number, dockerfile: string): Promise<void>;
+  /**
+   * 构建成功后的镜像落库（P7）。返回受影响行数——0 时队列只记一条 warn，
+   * 不与“构建成功”这件事纠缠（镜像真的建出来了，只是那一行不在了）。
+   */
+  setEnvironmentImage(projectKey: string, revision: number, imageDigest: string): Promise<number>;
+  /** 体检结论落地（状态 + 报告一次写完，见 `setEnvironmentHealth`）。 */
+  setEnvironmentHealth(projectKey: string, revision: number, report: HealthReport): Promise<number>;
+  /** 缓存命中查询（只认 ready / degraded + 有 digest）。 */
+  findCacheHit(projectKey: string, cacheKey: string): Promise<CacheHit | null>;
   /** 一次 LLM 生成的用量进账本（kind='env_build'，没有 session / run）。 */
   recordUsage(row: UsageRow): Promise<void>;
 }
@@ -300,6 +461,16 @@ export function pgEnvBuildStore(db: Queryable): EnvBuildStore {
     },
     async setEnvironmentDockerfile(projectKey: string, revision: number, dockerfile: string): Promise<void> {
       await setEnvironmentDockerfile(db, projectKey, revision, dockerfile);
+    },
+    setEnvironmentImage(projectKey: string, revision: number, imageDigest: string): Promise<number> {
+      return setEnvironmentImage(db, projectKey, revision, imageDigest);
+    },
+    setEnvironmentHealth(projectKey: string, revision: number, report: HealthReport): Promise<number> {
+      return setEnvironmentHealth(db, projectKey, revision, report);
+    },
+    async findCacheHit(projectKey: string, cacheKey: string): Promise<CacheHit | null> {
+      const row = await findCacheHit(db, projectKey, cacheKey);
+      return row === null ? null : cacheHitOf(row);
     },
     async recordUsage(row: UsageRow): Promise<void> {
       // 账本 SQL 复用会话侧的插入（`usage_ledger` 只有一份写入实现）。

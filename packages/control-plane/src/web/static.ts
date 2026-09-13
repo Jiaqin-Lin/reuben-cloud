@@ -21,13 +21,16 @@ export interface StaticFile {
 }
 
 /**
- * 允许被访问的静态资源。**只有这三个**：没有图标二进制、没有 sourcemap、没有字体。
+ * 允许被访问的静态资源。**只有这五个**：观察窗（index/app）与环境页（env）各两个文件，
+ * 加一份共用的样式表。没有图标二进制、没有 sourcemap、没有字体。
  * `/favicon.ico` 不走这张表——服务器直接回 204（见 `server.ts`）：不引二进制资源，
  * 也消掉浏览器控制台那条 404。
  */
 export const STATIC_FILES: Readonly<Record<string, StaticFile>> = {
   "/index.html": { file: "index.html", type: "text/html; charset=utf-8" },
   "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
+  "/env.html": { file: "env.html", type: "text/html; charset=utf-8" },
+  "/env.js": { file: "env.js", type: "text/javascript; charset=utf-8" },
   "/style.css": { file: "style.css", type: "text/css; charset=utf-8" },
 };
 

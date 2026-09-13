@@ -710,7 +710,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 **第二部分 · Environment**
 - [x] P5 环境定义与推断（**Layer 1 七档镜像矩阵** `images/base/Dockerfile.{common,node-dev,python-dev,go-dev,rust-dev,fullstack,ubuntu-dev}`——非语言部分抽到 `common`（sandbox-agent + git/curl/tar/gzip/procps + uid 1000 契约），语言镜像只加自己的工具链；`images/sandbox/Dockerfile` 只剩 `FROM base-fullstack` + 两个 LABEL，构建入口换成 `npm run build:image` = `scripts/build-images.ts`（按拓扑序建链 + 打印 digest，另有 `build:base-images` 建七档）；CP 侧 `environment/{base-images,signals,devcontainer,infer}.ts` + 最小 `store.ts`——三级判定（**devcontainer 子集** > Dockerfile/compose > 信号）、信号采集（锁文件优先级 / 运行时版本 / 构建入口 / CI / compose 服务 / monorepo，**只读不执行**、**两次采集逐字节相同**）、自带的容错 **JSONC** 解析、**确定性渲染**出完整可构建的 Dockerfile（`checkDockerfileConstraints` 与 P6 共用硬约束，`USER root` 必须切回）；`006_environments.sql`（revision 单调 + `kind`/`level`/`status` 三个 CHECK）；三个 fixture 仓库（`test/fixtures/repos/`）各命中一级，集成测试里**真的 build 成功**且继承 Layer 1 的 `CMD` 与 `1000:1000`）
 - [x] P6 LLM 生成 Dockerfile + 自愈循环 + **构建队列**（`environment/{generate,build,queue}.ts` + `007_env_builds.sql`：生成 prompt = 规则基线 + 信号 + 上一版 + 错误分类 + 日志尾部 40 行（`cache:"none"`）；**`signals` 级第一轮就上模型**、devcontainer / dockerfile 级第一轮用规则、失败才自愈（附录 A-33）；硬约束复用 P5 的 `checkDockerfileConstraints`，违反**不进 build**；错误分类 10 类 + 优先级 + 抽包名 / 行号（DNS 与"看不到包"同时出现时先报网络）；真 builder = `docker build --iidfile`——构建上下文只含 Dockerfile、日志边跑边写（有 S3 写 S3，否则 `REUBEN_CLOUD_ENV_LOG_DIR`）、10 分钟超时杀**进程组**、构建进程 env 白名单里没有凭据；队列并发 1 + 按 `project_key` 去重 + 失败不阻塞；每次 LLM 生成进 `usage_ledger`（`kind='env_build'`）；`env_builds` 逐 attempt 一行（status / inference / trigger 三个 CHECK）；手工验收 `npm run env:build -- --local <path>`——真模型跑过一次（`deepseek-flash` 给 node 仓库补了 make / build-essential / python3）
-- [ ] P7 缓存 + 版本化 + 健康检查（ready / degraded / failed）+ promote + **触发接线**（`first_seen` / `manual` / `promote`，Run 拿不到环境就先用基础镜像）
+- [x] P7 缓存 + 版本化 + 健康检查 + promote + **触发接线**（`environment/{cache,health,health-sandbox,revision,resolve,runtime}.ts` + `008_env_health.sql`：**缓存键** = `sha256(基础镜像 + 规范化信号 + BUILDER_VERSION + Dockerfile 文本)`，命中直接复用 digest 与体检结论（`findCacheHit` 只认 ready / degraded）；**体检**在用该镜像起的一次性沙箱里跑（clone → 灌仓库 → 按语言选命令 → `ready` / `degraded`（结构化事实 `{reason, affected, detail}`）/ `failed`，跑完即焚），构建成功后由队列同一条链收尾；**版本**：`revision` 单调 + `parent_revision`、`project_env_state.current_revision`（回滚 = 指针指回旧值、不删行）、promote（会话里验证过的 Dockerfile 固化成新 revision）、保留最近 10 版且被 `sandboxes.image_digest` 引用过的镜像永不清理（只删镜像不删行）；**Run 侧只解析不构建**——`resolveEnvironment` 命中就用项目环境、没命中就用 Layer 1 镜像 + 一句结构化事实并**异步入队** `first_seen`（`runs.env_revision` 记用了哪一版）；CLI `agent:run --env-revision/--rebuild-env/--promote-env/--no-env`、`env:build --rebuild/--no-health`；环境页 `/env/{projectKey}`（状态 / 体检细节 / 历次构建 / 日志只读代理 + manual 触发按钮））
 
 **第三部分 · 索引与上下文**
 - [ ] P8 仓库符号索引（tree-sitter WASM + 文件级引用图 + 增量）
@@ -874,6 +874,13 @@ npm run agent:run -- --repo owner/name --issue-file issue.md \
 # ③ 一边跑一边看：观察窗（只读、本地回环、无鉴权）
 npm run agent:run -- --local ~/code/my-project --issue "..." --serve
 # → 观察窗：http://127.0.0.1:8787/runs/run_01H...（跑完不退出，Ctrl-C 结束）
+
+# ④ 环境（Phase 7）：Run 侧**只解析不构建**——有 ready / degraded 的版本就用它的镜像，
+#    没有就用 Layer 1 的镜像 + 一句沙箱事实，并把构建异步入队（用户不等构建）。
+npm run agent:run -- --local ~/code/my-project --issue "..." --rebuild-env   # 先重建一版再跑
+npm run agent:run -- --local ~/code/my-project --issue "..." --env-revision 2 # 用指定那一版
+npm run agent:run -- --local ~/code/my-project --issue "..." --promote-env ./env.Dockerfile
+npm run agent:run -- --local ~/code/my-project --issue "..." --no-env         # 不碰环境子系统
 ```
 
 看它到底看到了什么：`/tmp/reuben-cloud-cp/<runId>/transcript.jsonl`（每轮的 system / tools /
@@ -886,24 +893,35 @@ npm run agent:run -- --local ~/code/my-project --issue "..." --serve
 建完 GitHub App 之后用 `npm run app:installations` 查 installation id 并核对三个权限（只读 API）；
 把私钥放在仓库根时记得别改 `.env` 里的路径——它已经被 `.gitignore` 拦住了（`*.pem`）。
 
-### 跑一次环境构建（Phase 6）
+### 跑一次环境构建（Phase 6 + 7）
 
 ```bash
 npm run dev:up && export DATABASE_URL=$(npm run --silent db:url)
-npm run build:image                              # Layer 1（生成的 Dockerfile 的 FROM 指它）
+npm run build:base-images                        # Layer 1（生成的 Dockerfile 的 FROM 指它）
 
-# 推断 → LLM 生成 + 自愈（≤3 轮）→ environments / env_builds 两张表
+# 推断 → LLM 生成 + 自愈（≤3 轮）→ 构建 → **体检**（一次性沙箱）→ environments / env_builds
 npm run env:build -- --local ~/code/my-project
 npm run env:build -- --local ~/code/my-project --project acme/web --trigger manual
-npm run env:build -- --local ~/code/my-project --no-model   # 只看规则生成的 Dockerfile
+npm run env:build -- --local ~/code/my-project --no-model    # 只看规则生成的 Dockerfile
+npm run env:build -- --local ~/code/my-project --rebuild     # 显式重建（跳过缓存）
+npm run env:build -- --local ~/code/my-project --no-health   # 不体检（构建成功就停在 building）
+npm run env:build -- --local ~/code/my-project --promote ./env.Dockerfile   # 把这份文本固化成一版
 ```
 
 - 模型凭据来自 `.env`（与 `agent:run` 同一份）；没配 key 时自动退化成规则生成（不是错误）；
-- 脚本会打印每一轮的 status / 错误分类 / 日志 key / digest；构建成功之后环境定义留在 `building`
-  ——能不能用是 Phase 7 的健康检查的结论（设计文档 §C.6）；
+- **缓存优先**：同一份事实（基础镜像 + 信号 + `BUILDER_VERSION` + Dockerfile 文本）第二次跑
+  直接命中，不构建也不体检——脚本会打印 `缓存命中：复用 revision N 的镜像`（秒回）；
+  `--rebuild` 是"我说了算"那条路（人显式要求时跳过缓存，附录 A-40）；
+- **体检**（Phase 7）：在用这一版镜像起的一次性沙箱里 clone + 灌入仓库，按语言跑安装 / 构建命令
+  （`buildCommands`）+ 一条轻量校验（`compileall` / `go build` / `cargo check`），结论三态：
+  `ready`（全过且没有降级风险）/ `degraded`（能用但缺一块能力，事实是结构化的）/ `failed`
+  （装不上依赖或构建失败）；跑完即焚，日志与构建日志同一个落点；
+- 脚本会打印每一轮的 status / 错误分类 / 日志 key / digest、体检的每一步与 `health_reason`、
+  以及当前 revision 与历史版本数；没有体检端口时环境停在 `building`（P6 的行为）；
 - 日志：配了 S3 就落对象存储（`env-logs/` 前缀），否则落本地目录（见上面的
   `REUBEN_CLOUD_ENV_LOG_DIR`）；
-- 同一个仓库再跑一次 = 新 revision；"第二次秒开"要等 Phase 7 的缓存命中。
+- 旧镜像清理：保留最近 10 版，**被任何沙箱引用过的 digest 永不清理**（只删镜像，不删行——
+  行是 `runs.env_revision` 的证据）；每次新镜像建出来之后在后台跑一次。
 
 ### 会话与沙箱租约（Phase 2）
 
@@ -997,3 +1015,22 @@ npm run agent:run -- --local ~/code/my-project --issue "..." --compact 3
 curl -s 127.0.0.1:8787/runs/<runId>/transcript   # 本次执行的 entries（runs.start_entry_id 的边界也在这）
 curl -s 127.0.0.1:8787/sessions/<sessionId>/entries | head -c 400   # 整个会话（跨 Run）
 ```
+
+### 环境页（Phase 7）
+
+同一个进程里还有一条 `/env/...` 路由（`agent:run --serve` 或任何起了回环服务的脚本）：
+
+```
+GET  /env/{projectKey}            页面：当前 revision、状态徽章、体检细节、历次构建
+GET  /env/{projectKey}/info       同一份数据的 JSON（页面读它）
+POST /env/{projectKey}/build      manual 触发（跳过缓存、落新 revision、体检）——**唯一的写口**
+GET  /env/{projectKey}/logs/{n}?build=<bld_id>    某次构建的日志
+GET  /env/{projectKey}/logs/{n}?health=<run_id>   某次体检的日志
+```
+
+- `projectKey` 是 `owner/name`，URL 里写成 `owner%2Fname`（`curl "127.0.0.1:8787/env/acme%2Fweb"`）；
+- 日志的 key **由服务端用校验过的段拼**（永远落在 `env-logs/` 下），页面不传 key——"只读代理"
+  因此是结构上的性质，而不是一条 if；
+- 触发只对**这个进程认识的那个仓库**有效（环境页对别的仓库是只读的）；
+- 它是观察窗里唯一一条非 GET 路由：一个 GET 不该有副作用（浏览器预取、链接重放都会踩到）。
+

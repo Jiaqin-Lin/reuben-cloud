@@ -1198,6 +1198,37 @@ CREATE INDEX env_builds_project_idx ON env_builds (project_key, revision, attemp
   会话创建时首次见到某个 `project_key` → 异步入队 `trigger: "first_seen"`；
   Run 侧的回退（拿不到 `ready` / `degraded` 就用 Layer 1 镜像 + 一句沙箱事实）
 
+> **实现备注**：P7 落地时有 10 条有意偏差，逐条记在附录 A-39 … A-48——迁移号 008 给了 P7、
+> P8 的索引迁移顺延为 `009_repo_index.sql`（A-39）；**`manual` 触发跳过缓存**，且缓存命中在
+> 插入新 revision **之前**判断（命中不产生新行，A-40）；"当前 revision"落在一张一行的小表
+> `project_env_state` 上，且只在构建 + 体检成功之后才动（A-41）；交付物多四个文件
+> `health-sandbox.ts` / `resolve.ts` / `runtime.ts` / `web/env.ts`（A-42）；体检沙箱**先灌仓库
+> 再跑命令**（A-43）；体检的第三步只跑按语言选的轻量校验、不跑 `verifyCommands` 里的真测试
+> （A-44）；体检日志记在 `environments.health_log_key`（A-45）；清理只删镜像、不删行（A-46）；
+> 环境页有一条 POST 写口、日志代理的 key 由服务端拼（A-47）；`resolveImageRef` 从测试脚手架
+> 搬进产品代码（A-48）。
+>
+> 另外三处把 spec 没说死的地方写死：① `degraded` 的 `affected` 由关键词推断（浏览器 / playwright /
+> e2e → `e2e`，其余 → `integration_tests`）——P5 的 `degradedRisks` 是人话文本，没有结构化的
+> "受影响的动作"；② `first_seen` 的接线落在 **Run 侧解析**那一层（`resolveEnvironment`；会话创建与
+> 第一次 Run 在脚本里相邻，M3 的调度器走同一个入口）：落一版 `draft` → **异步入队** → 回退到
+> Layer 1；③ 异步那次构建成功之后会把 `current_revision` 往前推（`pointForwardIfNewer`，只往前走）
+> ——否则指针要等到下一次 Run 的缓存命中才动，UI 上的"当前"会一直空着。
+>
+> **验证**：`npm test` 全绿（agent-runtime 124 / control-plane 405 / sandbox-agent 101 / web 33）；
+> `npm run typecheck` 全绿；`npm run test:integration` **整套**全绿（122 项：121 通过 + 1 项平台条件
+> 跳过；含 `environment.integration.test.ts` 新加的一节——新列的真 PG 往返 / 缓存命中只认
+> ready|degraded / 指针 upsert 与回滚 / promote 的父指针 / 清理读得到 `sandboxes.image_digest`
+> 的引用——与 `environment-build.integration.test.ts` 的真沙箱体检：起容器 → 灌 fixture 仓库 →
+> exec → 日志落盘 → `ready` 落库 → 沙箱 `DESTROYED`）；`npm run smoke` 16 项全绿（Linux 专有的
+> 隔离红线在 macOS 上按设计跳过）；
+> 手工验收：`env:build` 第一次 2.3s 建出环境（`degraded`，事实是人话）、第二次 **0.64s 缓存命中**
+> （`不构建也不体检`）、`--rebuild` 落 revision 2（父 1）、`--promote ./env.Dockerfile` 落 revision 3
+> （父 2，真装了 jq，21s）且同一份文本再 promote 一次直接命中缓存；`agent:run` 在没命中时用 Layer 1 镜像 +
+> 一句事实（system 里真的带上了），那次 Run 还在跑时后台构建就完成了（revision 1 → `ready`），
+> 下一次 Run 直接用它的 digest 且 `runs.env_revision='1'`；环境页的页面 / `/info` / 两类日志
+> 都用 `curl` 真取过一遍。
+
 ### 具体如何实现
 
 **1. cache_key**
@@ -1311,7 +1342,7 @@ resolveEnv(projectKey, signals):
 
 - `vendor/tree-sitter/*.wasm`（7 种语言语法文件 + LICENSE + `SHA256SUMS`）
 - `packages/control-plane/src/index/{parse,symbols,refs,worker,store}.ts`
-- `packages/control-plane/src/db/migrations/008_repo_index.sql`
+- `packages/control-plane/src/db/migrations/009_repo_index.sql`（A-39：008 给了 P7 的环境版本 / 体检）
 - `packages/control-plane/src/index/indexer.ts`（编排：增量判定 → 解析 → 落库）
 - dev 脚本：`npm run index:repo -- --local <path>`（不接 GitHub 也能建索引）
 
@@ -1964,6 +1995,17 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 | A-36 | Phase 6 · 交付物 | 只有三个模块 + 迁移 + 两个 builder 实现 | 多一个 `scripts/build-env.ts`（`npm run env:build`：推断 → 建 revision → 入队 → 打印分轮结果与 digest） | 验收标准是"人为缺一个依赖的仓库能在 ≤3 轮内构建成功"——手工验收需要一条能真连 PG、真读 `.env` 里的模型凭据的驱动；P7 的 `agent:run --rebuild-env` 要等 P7 的会话接线，先给一个独立脚本少一次等待（与 P8 的 `index:repo` 同一个定位） | `scripts/build-env.ts`、`package.json`、README §8 |
 | A-37 | Phase 6 · 构建成功之后的环境状态 | 只写了"最终失败 → `environments.status='failed'`" | 成功时**不动**状态：留在队列开始时推进过去的 `building`，等 P7 的健康检查收尾 | `ready` 的定义是"依赖装上了、构建命令跑通了"（设计文档 §C.6），而 P6 只证明了 `docker build` 成功。在这里写 ready 等于把"可能用不了"当成事实，degraded 就再也没机会出现——而 degraded 是 M2 最有价值的一个状态 | `queue.ts` 的收尾分支；集成测试断言 `status='building'`；P7 的健康检查接着推到 ready / degraded / failed |
 | A-38 | Phase 6 · 镜像 tag 与成功后的文本回写 | `-t reuben-cloud/env-<project_key>-<revision>:build`；没说自愈成功之后 `environments.dockerfile` 怎么办 | tag 变成 `reuben-cloud/env-<slug>-r<revision>:build`（`/` 与怪字符 slug 化，同一版的所有尝试共用一个 tag）；成功自愈后把**实际构建的那份文本**写回 `environments.dockerfile` | ① tag 里不能有 `/`，而 `project_key` 就是 `owner/name`；② P7 的缓存键里有一项是 `dockerfileText`：如果环境行留着规则生成的那份、而镜像是模型改过的，缓存命中就会把"用另一份文本构建的镜像"当成这一版的产物复用出去——那是最难查的一类错（本地是好的、别人那儿不对） | `build.ts` 的 `envImageTag` / `slugifyProjectKey`；`store.ts` 的 `setEnvironmentDockerfile`；`queue.ts` 的收尾；集成测试断言回写 |
+
+| A-39 | Phase 7 · 迁移号 | P8 的交付物写的是 `008_repo_index.sql` | P7 的迁移占了 `008_env_health.sql`，P8 的索引迁移顺延成 `009_repo_index.sql`（P8 落地时按这个号建） | 迁移**只增不改、按落地顺序编号**：P7 在 P8 之前落地，中间插一个更大的序号只会让"哪条先跑"这件事在文件名里失真。改名零成本（P8 还没落地），序号错乱则是永久的 |
+| A-40 | Phase 7 · §1 与 P6 §6 的"缓存命中" | "命中 → 直接复用 image_digest 与 health"；P6 §6："已有 ready 且 cache_key 没变 → 直接返回旧 digest" | **两处收窄**：① `trigger: "manual"` **跳过**缓存（另外两个触发源照吃）；② 缓存命中在**插入新 revision 之前**判断（`runtime.buildIfNeeded()` 与 `resolveEnvironment`），命中**不产生新行**——队列里那道闸只是"调用方没查 / 两个进程同时入队"时的兜底，命中时把旧 digest 与体检结论复制到本次要求的那一版上 | ① 人显式点"重建"时"缓存键没变"不是理由：缓存键看不见 Layer 1 的 tag 被重建、上游 registry 变动、docker 层缓存脏了——而那正是他要重试的对象；`first_seen`（没人要求）那条路仍然吃缓存，收益一分不少。② spec §1 说"重新构建 = 新 revision（只要不是缓存命中）"，这句话的另一半就是"命中不产生新行"；先插行再命中会让每次命中都留一版 `draft` 孤儿 | `queue.ts` 的缓存闸（含 `cached` 字段）；`runtime.ts` 的 `buildIfNeeded` / `rebuild`；`resolve.ts` 的第 ③ 步；测试要点 2 / 10 的断言改成"命中不产生新 revision" |
+| A-41 | Phase 7 · §2 "当前 revision" | "回滚 = 把 project 的 current_revision 指回旧值（不删任何行）"——没说这个指针住在哪 | 新建一张一行的小表 `project_env_state(project_key, current_revision, updated_at)`（008 迁移），`setProjectEnvState` 走 upsert；**只在构建 + 体检成功之后才动指针**（`pointForwardIfNewer` / `promoteEnvironment` 的收尾） | ① "当前是哪一版"与"这一版环境是什么"是两个事实：前者每个仓库一行、会被回滚改；后者每个 revision 一行、只追加。把指针放进 `environments` 会让"回滚"变成改一条历史证据。② 推一个新版本失败不该弄坏正在生效的那一版——指针晚一点动，Run 侧解析自然继续用旧的 | 008 迁移；`store.ts` 的 `getProjectEnvState` / `setProjectEnvState`；`revision.ts` 的 promote 与 rollback；`resolve.ts` 的命中路径会把指针指过去（"只往前走"） |
+| A-42 | Phase 7 · 交付物 | `environment/{cache,revision,health}.ts` 三个模块 | 多四个：`health-sandbox.ts`（一次性沙箱的端口实现：clone / 建沙箱 / 灌仓库 / exec / 销毁）、`resolve.ts`（Run 侧解析）、`runtime.ts`（组合根：进程级队列 + 仓库级运行时 + 体检装配）、`web/env.ts`（环境页读模型与日志只读代理） | 与 P6 的 `queue.ts`/`build.ts` 同一条切分：`health.ts` 要能在没有 docker / manager / git 的单测里逐条验证三态，所以"三段真动作"必须分开；`resolve.ts` 是 spec §5 那段伪代码的落点（Run 侧只解析不构建）；`runtime.ts` 让 `agent:run` / `env:build` / 环境页共用一个装配（否则三个地方会各自漂一个默认值）；`web/env.ts` 把"读模型 + 服务端拼日志 key"从路由里分出来（路由只管 HTTP 形状） | 纯新增；`health.ts` 只认 `open/exec/destroy` 三个动作 |
+| A-43 | Phase 7 · §3 体检沙箱 | "在用该镜像起的一次性沙箱里跑（不是宿主！）" | 那个沙箱**先灌入仓库再跑命令**——与创建会话沙箱走同一条 clone + inject 路径（`health-sandbox.ts`） | 体检要跑的正是 `npm ci` / `go build ./...` 这类**要仓库内容**的命令；而镜像是 P6 从信号生成的，它只装系统依赖、不装项目依赖。不灌仓库的话每条命令都会以"找不到 package.json"失败，于是每个环境都被判成 `failed`——那不是体检，那是误判 | `health-sandbox.ts`；`environment-build.integration.test.ts` 的真沙箱用例断言 `package.json` 与 `.git` 在沙箱里、cwd 是 `/workspace/repo` |
+| A-44 | Phase 7 · §3 体检命令 | 表里给了每类语言的健康命令（`npm ci` → `npm run build --if-present` / `pip install -e .` → `compileall` / `go build ./...`） | required 那批直接取 `candidate.buildCommands`（P5 从仓库事实推出来的那一份）；再加**一条**按语言选的轻量校验（`compileall` / `go build ./...` / `cargo check`，失败只降级）；`verifyCommands` 里的真测试（`npm test` / `pytest`）**不跑** | ① `buildCommands` 与 §C.6 表里那一列是同一件事的两个来源，再写一张表就是两份"怎么装依赖"；② 跑真测试可能几分钟、要数据库，甚至本来就是这个环境要服务的目标——health 是 smoke test（`pytest --collect-only` 那种量级） | `health.ts` 的 `healthPlanFor` / `lightCheckFor`；`environment-health.test.ts` 的计划用例 |
+| A-45 | Phase 7 · §3 "健康检查日志也落对象存储" | "构建日志与健康检查日志都落对象存储（`env_builds.log_key`）" | 体检日志落 **`environments.health_log_key`**（008 迁移新列），key 与构建日志同一个前缀与 slug 规则（`env-logs/<slug>/<rev>/<runId>.health.log`） | 体检不是一次构建尝试：`env_builds` 一行 = 一次 `docker build` 的尝试（attempt / error_class / duration 都是它的语义），把体检塞进去会多出一批"不是构建"的行，而那正是按 kind 汇总成本时最容易被当成假账的形态。落点与前缀一致，所以 UI 的只读代理是一段代码 | 008 迁移的 `health_log_key`；`health.ts` 的 `logKey`；`build.ts` 的 `envHealthLogKey`；环境页的 `?health=` 日志路由 |
+| A-46 | Phase 7 · §2 清理 | "清理：保留最近 10 个 revision；被 sandboxes 表引用过的 image_digest 永不清理" | 清理的对象**只有镜像**：`planRevisionCleanup()` 算计划（窗口 10 + 引用 + 被窗口内版本共用的 digest），`pruneRevisionImages()` 用注入的 `removeImage` 端口执行（生产 = `docker image rm`）；`environments` 的行一个都不删 | `runs.env_revision` 指向某一版——删行会让"这次执行当时用的是什么环境"变成悬空引用，而那是排障要看的第一条线索。行很小、镜像很大，所以清理只对后者动手。"被窗口内版本共用"是必须的一条：回滚 / promote 之后可能有两版指向同一个 digest，删了就把正在用的那一版一起弄坏 | `revision.ts`；`store.ts` 的 `listReferencedDigests`；`runtime.ts` 在每次新镜像建出来之后后台跑一次 |
+| A-47 | Phase 7 · §4 UI 与日志代理 | "只读路由"；观察窗的文件头写着"这个服务只有 GET" | 环境页有**一条 POST**（`POST /env/{projectKey}/build`，manual 入队，回 202 不等构建）；日志路由形如 `GET /env/{projectKey}/logs/{revision}?build=<bld_id>`（或 `?health=<run_id>`），**对象 key 由服务端用校验过的四段拼**，客户端不传 key | ① 一个 GET 不该有副作用（浏览器预取、链接重放、爬虫都会踩到"重建环境"）；这条写口的合法性来自它的位置——只绑定回环、无鉴权、单租户（M1 的真 API 面不在这里长）。② 让客户端传 key 等于开一个任意读的口（`../`、别人的仓库、别的前缀）；服务端拼 key 之后"只允许 `env-logs/` 前缀"是结构上的性质，不需要一条 if 挡着 | `web/server.ts` 的 `parseEnvRoute` / `handleEnvRoute`；`web/env.ts` 的 `readEnvironmentLog` / `logRequestOf`；`web-env.test.ts` 的路由与 400/404/503 用例 |
+| A-48 | Phase 7 · §5 Run 侧回退 | "用 Layer 1 的语言镜像" | 新增 `provider/image-ref.ts`（把 `resolveImageRef` 从 `test/support.ts` 搬过来，脚手架改成 re-export）；`runtime.ts` 缺省用它把 Layer 1 的 tag 解析成 digest，解析不到返回 null、由解析层抛出可行动的错误 | `SandboxSpec.image` 只收 digest，所以生产路径也需要"tag → digest"这一步；而产品代码 import 测试脚手架是反向依赖（AGENTS.md §1）。搬迁零成本（调用方按 `test/support.ts` 的路径 import，一行不动），留在脚手架里则意味着 P7 的 Run 侧回退要么复制一份实现、要么永远只能跑在测试里 |
 
 **已经预知的两条偏差**（实施时必须确认并回填）：
 

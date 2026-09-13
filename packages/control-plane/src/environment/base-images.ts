@@ -48,6 +48,25 @@ export function baseImageRef(kind: BaseImageKind): string {
 }
 
 /**
+ * 从一个镜像引用反查它是哪一档（不在矩阵里 / 是 `common` 就返回 null）。
+ *
+ * 【为什么需要它】P7 的 promote 拿到的是一份**人给的** Dockerfile：它的 `FROM` 决定了这一版
+ * 环境长什么样（P6 里这个决定来自推断）。没有这个反查，promote 就只能沿用推断出来的档位——
+ * 而一份把 FROM 从 node-dev 换成 fullstack 的文本会在库里被记成 node-dev。
+ *
+ * 【为什么只认 `base-<kind>` 这个名字形态】矩阵的引用只有 `baseImageRef()` 一个出处，
+ * 而它永远是 `<namespace>/base-<kind>:<tag>`。解析名字（而不是比字符串）让"同一个镜像换个 tag"
+ * 也能认出来（真发到 registry 之后 tag 会变成版本号）。
+ */
+export function baseKindOfRef(ref: string): EnvBaseKind | null {
+  const name = ref.split("@")[0]!.split(":")[0]!;
+  const last = name.split("/").pop() ?? "";
+  if (!last.startsWith("base-")) return null;
+  const kind = last.slice("base-".length);
+  return (ENV_BASE_KINDS as readonly string[]).includes(kind) ? (kind as EnvBaseKind) : null;
+}
+
+/**
  * 默认沙箱镜像的 tag。
  *
  * 【为什么默认是 fullstack 而不是某一档语言镜像】这个 tag 是"本地开发与既有测试的底座"

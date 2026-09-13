@@ -33,6 +33,8 @@ const publicDir = fileURLToPath(new URL("../public/", import.meta.url));
 
 const html = await readFile(path.join(publicDir, "index.html"), "utf8");
 const appJs = await readFile(path.join(publicDir, "app.js"), "utf8");
+const envHtml = await readFile(path.join(publicDir, "env.html"), "utf8");
+const envJs = await readFile(path.join(publicDir, "env.js"), "utf8");
 const css = await readFile(path.join(publicDir, "style.css"), "utf8");
 
 /**
@@ -63,6 +65,20 @@ const EVENT_TYPES: Record<HubEvent["type"], true> = {
   compaction: true,
   note: true,
 };
+
+/** `env.html` 里必须存在的那些 id（与 `env-render.test.ts` 的 `IDS` 同一份清单）。 */
+const ENV_IDS = [
+  "env-project",
+  "env-state",
+  "env-state-text",
+  "env-current",
+  "env-health",
+  "env-revisions",
+  "env-message",
+  "env-build-button",
+  "env-build-hint",
+  "theme",
+];
 
 /** 从前端源码里抽出它认的 SSE 通道清单（格式固定，见 `app.js` 的 `SSE_CHANNELS`）。 */
 function channelsOf(source: string): string[] {
@@ -113,6 +129,32 @@ describe("Phase 13 · 静态资源的契约", () => {
     // CSS 里的 `@import` 与 `url(...)` 也算外部依赖（哪怕是相对的，也不再是"三个文件"）。
     assert.equal(/@import/.test(css), false, "样式表不许 import");
     assert.equal(/url\(/.test(css), false, "样式表不许引外部资源");
+  });
+});
+
+describe("Phase 7 · 环境页（env.html / env.js）", () => {
+  test("env.html 引到的资源都在白名单里，结构（id / 模块脚本 / noscript）齐", () => {
+    const referenced = [...envHtml.matchAll(/(?:href|src)="([^"]+)"/g)].map((match) => match[1]!);
+    for (const url of referenced) {
+      assert.equal(STATIC_FILES[url] !== undefined, true, `${url} 不在静态白名单里，打开页面就会 404`);
+    }
+    assert.match(envHtml, /<html lang="zh-CN"/);
+    assert.match(envHtml, /<script type="module" src="\/env\.js">/);
+    for (const id of ENV_IDS) assert.match(envHtml, new RegExp(`id="${id}"`), `env.html 少了 #${id}`);
+    assert.match(envHtml, /<noscript>/);
+  });
+
+  test("env.js 语法正确、不引外部资源、不拼 HTML（仓库名 / 体检事实 / 错误分类都是外部输入）", () => {
+    assert.doesNotThrow(() => new vm.Script(envJs, { filename: "env.js" }));
+    assert.deepEqual(externalRefs(envHtml), []);
+    assert.deepEqual(externalRefs(envJs), []);
+    for (const pattern of [/\.innerHTML\s*=/, /\.outerHTML\s*=/, /insertAdjacentHTML\(/, /document\.write\(/]) {
+      assert.equal(pattern.test(envJs), false, `env.js 里出现了 ${pattern}`);
+    }
+    // 读口与写口的契约：info 是 GET、build 是 POST（写口只有这一条）。
+    assert.match(envJs, /\/info/);
+    assert.match(envJs, /method: "POST"/);
+    assert.match(envJs, /textContent/);
   });
 });
 

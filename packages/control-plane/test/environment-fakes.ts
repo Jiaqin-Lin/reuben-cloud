@@ -17,7 +17,11 @@ import type { Usage, UsageRow } from "@reuben-cloud/agent-runtime";
 import type { BuildRequest, BuildResult, BuildRunner } from "../src/environment/build.ts";
 import type { DockerfileGeneration, DockerfileGenerator, GenerateInput } from "../src/environment/generate.ts";
 import { GenerationError } from "../src/environment/generate.ts";
-import type { EnvBuildFinish, EnvBuildStore, NewEnvBuild } from "../src/environment/store.ts";
+import type { EnvironmentHealthChecker, HealthReport } from "../src/environment/health.ts";
+import { readStoredHealth } from "../src/environment/health.ts";
+import type { EnvResolverStore } from "../src/environment/resolve.ts";
+import type { RollbackStore, RevisionStore } from "../src/environment/revision.ts";
+import type { CacheHit, EnvBuildFinish, EnvBuildStore, EnvironmentRow, NewEnvBuild } from "../src/environment/store.ts";
 import type { EnvBuildStatus, EnvironmentCandidate, EnvStatus, RepoSignals } from "../src/environment/types.ts";
 
 /** 一个合法的本地镜像 digest（provider 认的两种形态之一）。 */
@@ -191,8 +195,18 @@ export class MemoryEnvBuildStore implements EnvBuildStore {
   readonly usage: UsageRow[] = [];
   readonly statuses: Array<{ projectKey: string; revision: number; status: EnvStatus }> = [];
   readonly dockerfileWrites: Array<{ projectKey: string; revision: number; dockerfile: string }> = [];
+  /** P7：`setEnvironmentImage` 写下来的镜像（与 `statuses` 一样只用于断言）。 */
+  readonly images: Array<{ projectKey: string; revision: number; imageDigest: string }> = [];
+  /** P7：体检结论的落库记录。 */
+  readonly healths: Array<{ projectKey: string; revision: number; report: HealthReport }> = [];
+  /** P7：脚本化的缓存命中（键用 `cacheHitKey()` 拼，与 PG 实现的查询条件同一口径）。 */
+  readonly cacheHits = new Map<string, CacheHit>();
   /** 设成 false 时 `setEnvironmentStatus` 返回 0（模拟"环境行不在"）。 */
   environmentExists = true;
+
+  cacheHit(projectKey: string, cacheKey: string, hit: CacheHit): void {
+    this.cacheHits.set(cacheHitKey(projectKey, cacheKey), hit);
+  }
 
   async startAttempt(row: NewEnvBuild): Promise<void> {
     this.builds.push({
@@ -224,7 +238,184 @@ export class MemoryEnvBuildStore implements EnvBuildStore {
     this.dockerfileWrites.push({ projectKey, revision, dockerfile });
   }
 
+  async setEnvironmentImage(projectKey: string, revision: number, imageDigest: string): Promise<number> {
+    this.images.push({ projectKey, revision, imageDigest });
+    return this.environmentExists ? 1 : 0;
+  }
+
+  async setEnvironmentHealth(projectKey: string, revision: number, report: HealthReport): Promise<number> {
+    this.healths.push({ projectKey, revision, report });
+    return this.environmentExists ? 1 : 0;
+  }
+
+  async findCacheHit(projectKey: string, cacheKey: string): Promise<CacheHit | null> {
+    return this.cacheHits.get(cacheHitKey(projectKey, cacheKey)) ?? null;
+  }
+
   async recordUsage(row: UsageRow): Promise<void> {
     this.usage.push(row);
   }
+}
+
+/** 替身里缓存命中的键（PG 那边是 `(project_key, cache_key)`；这里拼成一个字符串）。 */
+export function cacheHitKey(projectKey: string, cacheKey: string): string {
+  return `${projectKey}\n${cacheKey}`;
+}
+
+// ---------------------------------------------------------------- 体检的替身
+
+/** 一份体检报告的最小形态（三态各用一次；`facts` 是 degraded 的判据）。 */
+export function fakeHealthReport(
+  status: HealthReport["status"] = "ready",
+  facts: HealthReport["facts"] = [],
+): HealthReport {
+  return {
+    status,
+    reason: status === "ready" ? null : (facts[0]?.reason ?? "step_failed"),
+    detail: status === "ready" ? null : (facts[0]?.detail ?? "npm ci 退出码 1"),
+    facts,
+    steps: [{ cmd: "npm ci", required: true, exitCode: status === "failed" ? 1 : 0, timedOut: false, durationMs: 1, outputTail: "" }],
+    logKey: status === "ready" ? null : "env-logs/acme__web/1/envcheck_X.health.log",
+    checkedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+/**
+ * 体检端口的替身：只记"被问了什么、返回哪一态"。
+ * 【为什么不跑真命令】判定逻辑在 `environment-health.test.ts` 里逐条测过；队列要证明的是
+ * "体检的结论被落进了环境行 / 体检崩了不把环境判死"，与命令无关。
+ */
+export class FakeHealthChecker implements EnvironmentHealthChecker {
+  readonly calls: Array<{ projectKey: string; revision: number; image: string }> = [];
+  report: HealthReport = fakeHealthReport();
+  /** 设成一句话时 `check()` 抛这个错（模拟体检的基础设施失败）。 */
+  fail: string | null = null;
+
+  async check(input: {
+    projectKey: string;
+    revision: number;
+    image: string;
+    candidate: EnvironmentCandidate;
+    signals: RepoSignals;
+  }): Promise<HealthReport> {
+    this.calls.push({ projectKey: input.projectKey, revision: input.revision, image: input.image });
+    if (this.fail !== null) throw new Error(this.fail);
+    return this.report;
+  }
+}
+
+// ---------------------------------------------------------------- 版本 / promote 的替身
+
+/**
+ * `RevisionStore` + `RollbackStore` 的内存替身（P7 的 promote / 回滚单测用）。
+ *
+ * 【为什么不复用 `MemoryEnvBuildStore`】那一个是**队列**的存储口（attempt 行、状态推进、
+ * 账本）；这一个管的是**版本**（插新行、缓存命中、当前指针）。两个测试关心的事实不同，
+ * 混在一起会让每个断言都要先读懂另一半的字段。
+ */
+export class FakePromotionStore implements RevisionStore, RollbackStore, EnvResolverStore {
+  readonly inserted: Array<{ projectKey: string; candidate: EnvironmentCandidate; signals: RepoSignals; cacheKey: string | null }> = [];
+  readonly current: Array<[string, number]> = [];
+  readonly rows = new Map<number, EnvironmentRow>();
+  readonly cacheHits = new Map<string, CacheHit>();
+  currentRevision: number | null = null;
+
+  async insertEnvironment(input: {
+    projectKey: string;
+    candidate: EnvironmentCandidate;
+    signals: RepoSignals;
+    status?: EnvStatus;
+    cacheKey?: string | null;
+  }): Promise<EnvironmentRow> {
+    const revision = this.rows.size + 1;
+    this.inserted.push({
+      projectKey: input.projectKey,
+      candidate: input.candidate,
+      signals: input.signals,
+      cacheKey: input.cacheKey ?? null,
+    });
+    const row = fakeEnvironmentRow({
+      revision,
+      project_key: input.projectKey,
+      candidate: input.candidate,
+      signals: input.signals,
+      status: input.status ?? "draft",
+      cache_key: input.cacheKey ?? null,
+      parent_revision: revision === 1 ? null : revision - 1,
+    });
+    this.rows.set(revision, row);
+    return row;
+  }
+
+  async findCacheHit(_projectKey: string, cacheKey: string): Promise<CacheHit | null> {
+    // 显式脚本优先（promote 的用例用它造"命中"）；否则按 PG 实现的同一套条件在行里找
+    // （同键 + ready/degraded + 有 digest，取 revision 最大的那一版）。
+    const scripted = this.cacheHits.get(cacheKey);
+    if (scripted !== undefined) return scripted;
+    const candidates = [...this.rows.values()]
+      .filter(
+        (row) =>
+          row.cache_key === cacheKey &&
+          row.image_digest !== null &&
+          (row.status === "ready" || row.status === "degraded"),
+      )
+      .sort((a, b) => b.revision - a.revision);
+    const row = candidates[0];
+    if (row === undefined) return null;
+    return {
+      revision: row.revision,
+      imageDigest: row.image_digest!,
+      health: readStoredHealth(row.health),
+      status: row.status,
+      cacheKey: row.cache_key!,
+    };
+  }
+
+  async setProjectEnvState(projectKey: string, revision: number): Promise<void> {
+    this.current.push([projectKey, revision]);
+    this.currentRevision = revision;
+  }
+
+  async getEnvironmentByRevision(_projectKey: string, revision: number): Promise<EnvironmentRow | null> {
+    return this.rows.get(revision) ?? null;
+  }
+
+  /** 参数被忽略：替身只有一个"当前指针"（PG 实现按 project_key 查）。 */
+  async getProjectEnvState(_projectKey?: string): Promise<{ current_revision: number } | null> {
+    return this.currentRevision === null ? null : { current_revision: this.currentRevision };
+  }
+}
+
+/**
+ * 一行 `EnvironmentRow` 的完整工厂（缺省是一版刚落的 draft）。
+ * `candidate` 是**输入**而不是行的一列：它只是"这一版的候选长什么样"的快捷写法。
+ */
+export function fakeEnvironmentRow(
+  overrides: Partial<EnvironmentRow> & { revision: number; candidate?: EnvironmentCandidate } = { revision: 1 },
+): EnvironmentRow {
+  const { candidate: candidateOverride, ...rowOverrides } = overrides;
+  const candidate = candidateOverride ?? fakeCandidate();
+  return {
+    id: `env_test_${String(overrides.revision).padStart(4, "0")}`,
+    project_key: "acme/web",
+    kind: "project",
+    level: candidate.level,
+    status: "draft",
+    base_image: candidate.baseImage,
+    dockerfile: candidate.dockerfile,
+    signals: fakeSignals(),
+    notes: [],
+    degraded_risks: candidate.degradedRisks,
+    build_commands: candidate.buildCommands,
+    verify_commands: candidate.verifyCommands,
+    image_digest: null,
+    cache_key: null,
+    parent_revision: null,
+    health: {},
+    health_reason: null,
+    health_checked_at: null,
+    health_log_key: null,
+    created_at: new Date(0),
+    ...rowOverrides,
+  } satisfies EnvironmentRow;
 }

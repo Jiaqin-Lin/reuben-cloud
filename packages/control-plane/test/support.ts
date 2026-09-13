@@ -325,51 +325,15 @@ export async function startFakeDaemon(
 
 // ---------------------------------------------------------------- 镜像
 
-/** 集成测试默认用的本地镜像 tag（`npm run build:image` 或 `npm run check:image` 建出来的）。 */
-export const DEFAULT_IMAGE_TAG = process.env.SANDBOX_IMAGE ?? "reuben-cloud/sandbox-base:dev";
-
-/** egress-proxy 的本地镜像 tag（`npm run build:proxy-image` 建出来的）。 */
-export const DEFAULT_PROXY_IMAGE_TAG = process.env.EGRESS_PROXY_IMAGE ?? "reuben-cloud/egress-proxy:dev";
-
 /**
- * 把本地镜像解析成 **digest 引用**（`repo@sha256:…`）。
+ * 本地镜像的解析搬到了产品代码：`src/provider/image-ref.ts`。
  *
- * 为什么必须带 digest：`SandboxSpec.image` 只接受 digest（§C.1），而"本地构建的镜像"
- * 恰好没有 registry 里的 tag 可查。Docker 的经典存储与 containerd 存储都把本地镜像的
- * digest 放在 `RepoDigests` / `Id` 里（实验证明两者在这个环境下一致：
- * containerd 存储的 `.Id` 就是 manifest digest），provider 的 `#ensureImage` 又是
- * "本地命中就不拉"，所以本地开发不需要任何 registry。
- *
- * 返回的两种形态都被 `validateSpec()` 接受（`repo@sha256:…` 与裸 `sha256:…`）：
- * 经典存储（overlay2 / graphdriver）下本地构建的镜像没有 RepoDigests，只能退回 `.Id`。
- * 这不是妥协——两者都是不可变的内容寻址，tag 才是那个不该被接受的东西（见 Phase 7 备注 19）。
- *
- * @param hint 镜像不存在时告诉使用者该跑哪条命令。两个镜像的构建命令不同，所以让它可选。
- * @throws 镜像不存在时抛出，并告诉使用者先跑构建命令——比让 create 报"拉镜像失败"清楚得多。
+ * 【为什么是 re-export 而不是删掉】调用方（集成测试、`scripts/agent-run.ts`、`packages/e2e`）
+ * 全都按 `test/support.ts` 的路径 import；P7 需要同一份实现出现在生产路径上（Run 侧回退要用
+ * Layer 1 的 digest），所以实现搬走、名字留在这里，调用方一行不动。
  */
-export async function resolveImageRef(tag: string = DEFAULT_IMAGE_TAG, hint = "npm run build:image"): Promise<string> {
-  const result = await docker([
-    "image",
-    "inspect",
-    "--format",
-    "{{.Id}} {{json .RepoDigests}}",
-    tag,
-  ]);
-  if (result.code !== 0) {
-    throw new Error(
-      `本地没有镜像 ${tag}。先跑 \`${hint}\`（或用 SANDBOX_IMAGE / EGRESS_PROXY_IMAGE 指定别的镜像）。\n${result.stderr.trim()}`,
-    );
-  }
-  const [id, repoDigestsJson] = result.stdout.trim().split(" ");
-  const repoDigests = JSON.parse(repoDigestsJson ?? "[]") as string[];
-  // RepoDigests 里已经有完整的 `repo@sha256:…` 时优先用它（它和 tag 同名，最不容易搞混）。
-  const preferred = repoDigests.find((item) => item.startsWith(`${tag.split(":")[0]}@`)) ?? repoDigests[0];
-  if (preferred !== undefined) return preferred;
-  // 没有 RepoDigests（本地构建且从没 push 过）：用 Id。Id 已经是 `sha256:…` 形式，
-  // 只要不给它加 name 前缀，Docker 按 digest 就能解析到本地镜像。
-  if (id !== undefined && /^sha256:[0-9a-f]{64}$/.test(id)) return id;
-  throw new Error(`无法从 ${tag} 解析出 digest 引用：${result.stdout.trim()}`);
-}
+export { resolveImageRef } from "../src/provider/image-ref.ts";
+export { DEFAULT_IMAGE_TAG, DEFAULT_PROXY_IMAGE_TAG } from "../src/provider/image-ref.ts";
 
 // ---------------------------------------------------------------- agent HTTP / SSE
 
