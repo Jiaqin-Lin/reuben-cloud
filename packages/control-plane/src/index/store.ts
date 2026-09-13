@@ -1,9 +1,11 @@
 /**
- * `index/store.ts` —— 009 迁移那四张表的读写（spec Phase 8 §1/§5，以及增量需要的 `repo_file_refs`）。
+ * `index/store.ts` —— 009 迁移那四张表（符号 / 边 / 候选 / 每次索引的统计）与 010 的 `repo_maps`
+ * 缓存的读写（spec Phase 8 §1/§5、Phase 9 §4）。
  *
- * 【谁写、谁只读】写入方只有 `indexer.ts` 一个（它把"解析 → 边 → 落库"包在一次事务里）；
- * 读取方是增量重建（上一版的符号 / 候选 / 边）、P9 的排名与渲染、以及"某个符号定义在哪几个文件里"
- * 这类查询。**其它模块不许自己拼这四张表的 SQL**——SQL 只放在这里，与 §0.3 的边界同一条理由。
+ * 【谁写、谁只读】写入方只有 `indexer.ts`（它把"解析 → 边 → 落库"包在一次事务里）与
+ * `repo-map.ts`（渲染完写一条缓存）；读取方是增量重建（上一版的符号 / 候选 / 边）、P9 的排名与渲染、
+ * 以及"某个符号定义在哪几个文件里"这类查询。**其它模块不许自己拼这几张表的 SQL**——
+ * SQL 只放在这里，与 §0.3 的边界同一条理由。
  *
  * 【为什么"先删后插 + 整段复制"是最小写入】增量重建里，没变化的那几千个文件的行**一个字节都不该动**：
  * 从 PG 读回 JS 再插回去，等于把"复制"变成"一次全表往返"。所以增量走的是
@@ -73,6 +75,18 @@ export interface RepoFileRefRow {
 }
 
 /** 一行 `repo_maps`（010）。`index_built_at` 是索引指纹，见 010 迁移的文件头。 */
+export interface RepoMapRow {
+  repo_key: string;
+  commit_sha: string;
+  personalization_hash: string;
+  budget_tokens: number;
+  text: string;
+  hash: string;
+  tokens: number;
+  index_built_at: Date;
+  built_at: Date;
+}
+
 // ---------------------------------------------------------------- 写入
 
 /**
@@ -368,6 +382,78 @@ export async function listRepoRefs(
   );
 }
 
+// ---------------------------------------------------------------- Repo Map 缓存（010）
+
+/** 取一条地图缓存（键是全主键，见 010 迁移的文件头）。 */
+export async function getRepoMap(
+  q: Queryable,
+  input: { repoKey: string; commitSha: string; personalizationHash: string; budgetTokens: number },
+): Promise<RepoMapRow | null> {
+  return maybeOne<RepoMapRow>(
+    q,
+    `SELECT * FROM repo_maps
+      WHERE repo_key = $1 AND commit_sha = $2 AND personalization_hash = $3 AND budget_tokens = $4`,
+    [input.repoKey, input.commitSha, input.personalizationHash, input.budgetTokens],
+  );
+}
+
+/** 写一条地图缓存（upsert：同一份输入重算出来也是同一份文本，覆盖就行）。 */
+export async function putRepoMap(q: Queryable, row: Omit<RepoMapRow, "built_at">): Promise<void> {
+  await q.query(
+    `INSERT INTO repo_maps (repo_key, commit_sha, personalization_hash, budget_tokens, text, hash, tokens, index_built_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (repo_key, commit_sha, personalization_hash, budget_tokens) DO UPDATE
+       SET text = EXCLUDED.text, hash = EXCLUDED.hash, tokens = EXCLUDED.tokens,
+           index_built_at = EXCLUDED.index_built_at, built_at = now()`,
+    [
+      row.repo_key,
+      row.commit_sha,
+      row.personalization_hash,
+      row.budget_tokens,
+      row.text,
+      row.hash,
+      row.tokens,
+      row.index_built_at,
+    ],
+  );
+}
+
+/**
+ * 这个 (repo, commit) 上一次渲染地图是什么时候（`mapRefreshDue` 的输入）。
+ *
+ * 与 `getRepoMap` 分开：前者要四个键都相等，而"距上次重建 > 5 分钟"问的是**任意任务**
+ * 在这个 commit 上渲染过没有。
+ */
+export async function latestRepoMapBuiltAt(q: Queryable, repoKey: string, commitSha: string): Promise<Date | null> {
+  const row = await maybeOne<{ built_at: Date }>(
+    q,
+    `SELECT built_at FROM repo_maps
+      WHERE repo_key = $1 AND commit_sha = $2
+      ORDER BY built_at DESC LIMIT 1`,
+    [repoKey, commitSha],
+  );
+  return row?.built_at ?? null;
+}
+
+/**
+ * 保留最近 `keep` 个 commit 的地图，更老的整段删掉（理由见 010 迁移的文件头）。
+ *
+ * 【为什么按 commit 而不是按 built_at】一个 commit 上会有多条（不同任务词 / 不同预算），
+ * 它们是一起变旧的：commit 换了下一版，上一版整组都没有增量价值。
+ */
+export async function pruneRepoMaps(q: Queryable, repoKey: string, keep = 2): Promise<number> {
+  const deleted = await q.query(
+    `DELETE FROM repo_maps
+      WHERE repo_key = $1 AND commit_sha NOT IN (
+        SELECT commit_sha FROM (
+          SELECT commit_sha, max(built_at) AS built_at FROM repo_maps WHERE repo_key = $1 GROUP BY commit_sha
+        ) AS recent ORDER BY built_at DESC, commit_sha DESC LIMIT $2
+      )`,
+    [repoKey, keep],
+  );
+  return deleted.rowCount ?? 0;
+}
+
 // ---------------------------------------------------------------- 保留策略
 
 /**
@@ -431,7 +517,7 @@ export interface WriteIndexInput {
  *
  * 【为什么是端口，而不是把 `Queryable` 交给编排】单测要在没有 Postgres 的情况下验证增量——
  * 那是 P8 最难的一段逻辑（受影响集、排除集、以及"增量 == 全量"这条不变量）。
- * 端口只有 8 个方法，其中 `writeIndex` 把"复制 → 插入 → 计数 → 状态 → 清理"包成**一次**调用：
+ * 端口的方法不多，其中 `writeIndex` 把"复制 → 插入 → 计数 → 状态 → 清理"包成**一次**调用：
  * 那正是"它必须是一个事务"的意思。拆成几个方法让调用方拼，两个实现迟早会漂。
  *
  * 【为什么没有"删一半"的方法】`start` 与 `fail` 是两次独立的写入（独立事务）：
@@ -451,6 +537,15 @@ export interface RepoIndexStore {
   fileRefsInSymbols(repoKey: string, commitSha: string, symbols: readonly string[]): Promise<RepoFileRefRow[]>;
   /** 某一类候选的全部行（增量时要检查 import 解析是否变了）。 */
   fileRefsOfKind(repoKey: string, commitSha: string, kind: "identifier" | "import"): Promise<RepoFileRefRow[]>;
+  /**
+   * 全量符号（P9 的地图：节点集与个性化都要它）。
+   *
+   * 【为什么不用 `symbolsInPaths` 拼】地图要的是整个快照，分片读只会让调用方写一个
+   * "先拿路径再批量查"的循环——而它每次都会多一次往返。
+   */
+  allSymbols(repoKey: string, commitSha: string): Promise<RepoSymbolRow[]>;
+  /** 全量边（P9 的 PageRank 输入）。 */
+  allRefs(repoKey: string, commitSha: string): Promise<RepoRefRowRow[]>;
   writeIndex(input: WriteIndexInput): Promise<void>;
   fail(input: { repoKey: string; commitSha: string; files: number; languages: Record<string, number>; error: string; durationMs: number }): Promise<void>;
 }
@@ -468,6 +563,8 @@ export function postgresRepoIndexStore(db: Db): RepoIndexStore {
     fileRefsInSymbols: (repoKey, commitSha, symbols) =>
       symbols.length === 0 ? Promise.resolve([]) : listRepoFileRefs(db, repoKey, commitSha, { symbols }),
     fileRefsOfKind: (repoKey, commitSha, kind) => listRepoFileRefs(db, repoKey, commitSha, { kind }),
+    allSymbols: (repoKey, commitSha) => listRepoSymbols(db, repoKey, commitSha),
+    allRefs: (repoKey, commitSha) => listRepoRefs(db, repoKey, commitSha),
 
     async writeIndex(input) {
       await db.withTransaction(async (tx) => {
@@ -501,5 +598,39 @@ export function postgresRepoIndexStore(db: Db): RepoIndexStore {
     },
 
     fail: (input) => failRepoIndex(db, input),
+  };
+}
+
+/**
+ * `repo-map.ts` 对 010 那张表的全部需要（去掉一个方法就能少一条路径）。
+ *
+ * 【为什么 `get` 要把索引指纹一起返回】命中判断不只在 `repo-map.ts` 里：索引重建过
+ * （同一个 commit、新的 `built_at`）而地图没重算，缓存里的文本就是错的。
+ * 指纹随行走，调用方比一下就行，不用再多一次查询。
+ *
+ * 【为什么 `prune` 在写入口而不是一个定时任务】写入是唯一会让行变多的动作（与 009 的
+ * `pruneRepoIndexes` 同一条理由：处理时机就放在问题发生的地方）。
+ */
+export interface RepoMapStore {
+  get(input: {
+    repoKey: string;
+    commitSha: string;
+    personalizationHash: string;
+    budgetTokens: number;
+  }): Promise<RepoMapRow | null>;
+  put(row: Omit<RepoMapRow, "built_at">): Promise<void>;
+  /** 这个 (repo, commit) 上一次渲染是什么时候（`mapRefreshDue` 的输入）。 */
+  latestBuiltAt(repoKey: string, commitSha: string): Promise<Date | null>;
+  /** 只保留最近 `keepCommits` 个 commit 的地图。 */
+  prune(repoKey: string, keepCommits: number): Promise<number>;
+}
+
+/** 生产实现。SQL 仍然只在这个文件里。 */
+export function postgresRepoMapStore(db: Db): RepoMapStore {
+  return {
+    get: (input) => getRepoMap(db, input),
+    put: (row) => putRepoMap(db, row),
+    latestBuiltAt: (repoKey, commitSha) => latestRepoMapBuiltAt(db, repoKey, commitSha),
+    prune: (repoKey, keepCommits) => pruneRepoMaps(db, repoKey, keepCommits),
   };
 }

@@ -718,7 +718,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 
 **第三部分 · 索引与上下文**
 - [x] P8 仓库符号索引（**四张表** `009_repo_index.sql`：`repo_indexes`（每个 commit 一行统计与状态）+ `repo_symbols`（符号：名字 / kind（六种）/ 单行签名 / 1 起行号）+ `repo_refs`（文件级边：唯一同名 1.0、歧义 1/n、`n>5` 丢弃、import 2.0）+ `repo_file_refs`（候选引用，增量精确重建边的输入，A-49）；CP 侧 `index/{symbols,refs,parse,worker,git-port,store,indexer,vendor}.ts`——**九种语言**（TS/TSX/JS/Python/Go/Rust/Java/Ruby/PHP）的定义节点表 + 通用遍历器（签名截到 body 之前、压单行、200 字符），`vendor/tree-sitter/*.wasm` **vendored 8.3 MB**（来源 `@vscode/tree-sitter-wasm@0.3.1` + SHA256SUMS，`npm run vendor:tree-sitter --check` 校验摘要，A-51）；解析在**子进程 worker** 里跑（一批文件一个、NDJSON 协议、`--max-old-space-size=1024`、单文件 200ms 事后判定、总预算 90s 主进程硬杀、崩溃只落一行 `failed` 不动 CP，A-52）；**增量** = 只解析变化的 A/M + 从上一版复制没变化的行 + 只重算三类边（变化文件的全部边 / "候选名字定义集变了"的边 / "import 解析结果变了"的边），与全量共用同一段 `edgesFor()`，所以"增量 == 全量"是结构性质（单测 + 集成两层哈希断言）；只留最近两版（A-49）；手工验收 `npm run index:repo -- --local <path> [--dry-run] [--rebuild]`；单测（含 9 语言符号金标准 / 边与歧义 / worker 崩溃隔离 / 增量==全量）+ 集成（真 PG + 真 git + 真 WASM）；5k 文件合成仓库解析 + 算边 **678ms**（预算 90s、验收线 60s）
-- [ ] P9 **仓库地图（Repo Map）**（PageRank + 个性化 + token 预算 + 确定性）
+- [x] P9 仓库地图（Repo Map）（`010_repo_map.sql` 的 `repo_maps` 缓存表：主键 `(repo, commit, 任务词哈希, 预算)` + **索引指纹** `index_built_at`（同一个 commit 重新索引后旧地图自动失效，A-57）+ 按 commit 只留两版；CP 侧 `index/{personalize,rank,render,repo-map,repo-key}.ts`——任务词切词 / 停用词表 → 符号名精确命中（1.0）+ 目录名与文件名命中（0.5）→ 文件级 **个人化 PageRank**（damping 0.85、L1 1e-7 或 100 轮、悬挂节点按 p 再分配）→ 按排名渲染签名（每文件 top-8、预算缺省 1500 / 硬上限 3000、不截半行、被切的那个文件补 `…`、末尾附"本次 Run 已改动"）；**词汇名闸**：被 20 个以上不同文件引用的名字不进图（P8 的 A-55 在 P9 落地：本仓库实测丢 1104/4785 条边，fixture 从第 3 名掉出前 12、issue 相关文件一个没掉，A-58）；缓存命中**零重算**（符号表 / 边一个字节不读），索引不可用（missing / 非 ready / 读失败 / 空）降级成文件树且**不写缓存**；`mapRefreshDue`（改动 > 20 或 5 分钟）是留给 P10 的重建判据（A-60）；手工验收 `npm run map:repo -- --local <path> --issue-file <f> [--budget/--changed/--rebuild/--no-index/--out]`（没索引就顺手建一次）；单测 54 条（确定性 / 预算 / 个性化 / Unicode / 标注 / 缓存命中 / 降级 / 词汇名闸 / 九语言金标准）+ 真 PG 集成（`RepoMapStore` 四条契约 + 真索引→真地图→命中→重新索引失效）；5k 文件 / 2 万条边的排名 + 渲染 **30ms**（验收线 200ms）
 - [ ] P10 ContextCompiler（分区预算 + 缓存前缀 + 可回放）
 - [ ] ~~向量索引~~：**移出 M2**（没有需求驱动，也没有评估集；先有实测案例再单独立项）
 
@@ -1070,3 +1070,31 @@ npm run vendor:tree-sitter --check
   也是"增量 == 全量"这条不变量的全部论证。
 
 
+### 跑一次仓库地图（Phase 9）
+
+```bash
+npm run dev:up && export DATABASE_URL=$(npm run --silent db:url)
+
+# ① 给一个 issue 渲染地图（这个 commit 没有 ready 索引就顺手建一次；同一个任务第二次是缓存命中）
+npm run map:repo -- --local ~/code/my-project --issue-file /tmp/issue.md
+
+# ② 常用开关
+npm run map:repo -- --local ~/code/my-project --issue-file /tmp/issue.md --budget 800
+npm run map:repo -- --local ~/code/my-project --changed src/a.ts,src/b.ts   # 末尾的"已改动"那一行
+npm run map:repo -- --local ~/code/my-project --issue-file /tmp/issue.md --rebuild   # 忽略缓存重算
+npm run map:repo -- --local ~/code/my-project --no-index                   # 不建索引，直接看降级文件树
+npm run map:repo -- --local ~/code/my-project --issue-file /tmp/issue.md --out /tmp/map.txt
+```
+
+- 地图缓存在 `repo_maps` 上，键是 `(repo, commit, 任务词哈希, 预算)`；命中时**不读符号表与边**
+  （"零重算"），行里带着**索引指纹**——同一个 commit 重新索引过之后旧地图自动失效（A-57）；
+- 预算缺省 1500 token、硬上限 3000；地图只有**签名**没有实现；同样的输入逐字节相同
+  （它要进提示词的缓存前缀）；每个文件最多 8 条签名，被切的文件末尾标 `…`；
+- 索引不可用（没建 / 不是 ready / 读索引失败 / 索引为空）时给的是**文件树**（目录 + 文件名，
+  按目录大小排序），而且**不写缓存**；
+- 排名 = 文件级 PageRank + 任务词个性化（符号名命中 1.0、目录/文件名命中 0.5）；
+  被 20 个以上不同文件引用的名字不进图（**词汇名闸**，A-58——本仓库实测丢掉 1104/4785 条边）；
+- "关掉地图跑同一批任务"（§J.2 那条对照实验）的开关随 P10 的 `REUBEN_CLOUD_REPO_MAP_TOKENS`
+  一起接；P9 只有可独立调用的 `buildRepoMap()` 与这个脚本；
+- 为什么地图是从 base commit 建的、改动只做标注不即时重建：设计文档 §D.3；
+  `mapRefreshDue()`（改动 > 20 或距上次渲染 > 5 分钟）是留给 P10 的重建判据（A-60）。

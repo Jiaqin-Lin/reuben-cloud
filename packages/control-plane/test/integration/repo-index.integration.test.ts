@@ -1,16 +1,19 @@
 /**
- * P8 的持久层集成测试（`npm run test:integration`，**需要一个一次性 Postgres 容器**）。
+ * P8/P9 的持久层集成测试（`npm run test:integration`，**需要一个一次性 Postgres 容器**）。
  *
- * 【它覆盖什么】spec P8 里"只有真库 / 真 git / 真 WASM 能回答"的那几条：
- *  1. `009_repo_index.sql` 的四张表在真 PG 上建得出来，迁移可重跑；
+ * 【它覆盖什么】spec P8/P9 里"只有真库 / 真 git / 真 WASM 能回答"的那几条：
+ *  1. `009_repo_index.sql` 的四张表与 `010_repo_map.sql` 在真 PG 上建得出来，迁移可重跑；
  *  2. `repo_symbols` 能回答验收标准里那句"某个符号定义在哪几个文件里"；
  *  3. **增量 == 全量**：真 git 的 `diff --name-status` + 真 worker 解析 + 真 PG 的
  *     `INSERT … SELECT` 复制与 `unnest` 排除，两边算出来的行集合摘要逐字节相同；
  *  4. 幂等（同一个 commit 索引两次不产生重复行）与保留策略（只留最近两版）；
- *  5. `gitIndexPort` 的三条命令在真的仓库上给出预期的 A/M/D 与祖先判断。
+ *  5. `gitIndexPort` 的三条命令在真的仓库上给出预期的 A/M/D 与祖先判断；
+ *  6. P9：`repo_maps` 的 upsert / 索引指纹 / 保留策略（`RepoMapStore` 契约），以及
+ *     "真索引 → 真地图 → 命中缓存 → 重新索引后缓存失效"这条端到端。
  *
  * 【它不替代什么】增量逻辑的分支（受影响集、import 解析变化、崩溃、超时）在 `index-incremental`
- * 里用假 store 逐条覆盖——那些是"逻辑对不对"，这里是"SQL 与内存实现是不是同一件事"。
+ * 里用假 store 逐条覆盖，地图的排名 / 排版 / 降级在 `repo-map-*` 三个单测里——那些是"逻辑对不对"，
+ * 这里是"SQL 与内存实现是不是同一件事"。
  */
 
 import assert from "node:assert/strict";
@@ -23,13 +26,24 @@ import { after, before, describe, test } from "node:test";
 import { Db } from "../../src/db/client.ts";
 import { runMigrations } from "../../src/db/migrate.ts";
 import { indexRepository } from "../../src/index/indexer.ts";
+import { buildRepoMap } from "../../src/index/repo-map.ts";
 import { gitIndexPort } from "../../src/index/git-port.ts";
-import { listRepoFileRefs, listRepoRefs, listRepoSymbols, postgresRepoIndexStore } from "../../src/index/store.ts";
+import { discoverFiles } from "../../src/index/parse.ts";
+import {
+  getRepoMap,
+  listRepoFileRefs,
+  listRepoRefs,
+  listRepoSymbols,
+  postgresRepoIndexStore,
+  postgresRepoMapStore,
+} from "../../src/index/store.ts";
+import { repoMapStoreContract } from "../repo-map-store-contract.ts";
 import { startPostgres } from "../support.ts";
 import type { TestPostgres } from "../support.ts";
 
 const REPO = "owner/integration";
 const REPO_FULL = "owner/integration-full";
+const REPO_MAP = "owner/integration-map";
 
 let pg: TestPostgres;
 let db: Db;
@@ -275,3 +289,73 @@ describe("Phase 8 · 索引落到真 Postgres", () => {
     assert.deepEqual(await port.diff(shas.c1!, shas.c1!), []);
   });
 });
+
+// ---------------------------------------------------------------- P9
+
+repoMapStoreContract("真 Postgres", () => postgresRepoMapStore(db), "contract-pg");
+
+describe("Phase 9 · 地图缓存与真索引", () => {
+  test("真索引 → 真地图：地图里有 issue 涉及的模块；重复渲染命中缓存；重新索引后缓存失效", async () => {
+    await index(REPO_MAP, shas.c1!);
+    const indexStore = postgresRepoIndexStore(db);
+    const maps = postgresRepoMapStore(db);
+    const files = (await discoverFiles(workDir)).all;
+    const ask = { repoKey: REPO_MAP, commitSha: shas.c1!, task: "helper 的返回值不对，修一下", index: indexStore, maps, files };
+
+    const first = await buildRepoMap(ask);
+    assert.equal(first.degraded, null);
+    assert.equal(first.cached, false);
+    assert.equal(first.truncated, false);
+    assert.ok(first.matchedSymbols.includes("helper"), first.matchedSymbols.join(","));
+    assert.ok(first.text.includes("src/util.ts:"), first.text);
+    assert.ok(first.text.includes("export function helper(value: string): string"), first.text);
+
+    // 缓存：键（repo, commit, 任务词, 预算）都在真库里对上了，第二次不该重算。
+    const second = await buildRepoMap(ask);
+    assert.equal(second.cached, true);
+    assert.equal(second.text, first.text);
+    assert.equal(second.hash, first.hash);
+
+    // 同一个 commit 重新索引（built_at 前进）→ 索引指纹变了 → 旧地图不算命中。
+    await sleep(10);
+    await index(REPO_MAP, shas.c1!, true);
+    const third = await buildRepoMap(ask);
+    assert.equal(third.cached, false, "重新索引过就必须重算（附录 A-57）");
+    assert.equal(third.text, first.text, "符号没变，重算出来还是同一份地图");
+
+    // 换个任务词是另一条缓存（同一个 commit 上共存）。
+    const other = await buildRepoMap({ ...ask, task: "修一下 main.ts 里的 run" });
+    assert.equal(other.cached, false);
+    assert.notEqual(other.personalizationHash, first.personalizationHash);
+  });
+
+  test("降级：没有索引的 commit → 文件树，且不往 repo_maps 里写任何行", async () => {
+    const maps = postgresRepoMapStore(db);
+    const files = (await discoverFiles(workDir)).all;
+    const result = await buildRepoMap({
+      repoKey: REPO_MAP,
+      commitSha: "deadbeefdeadbeef",
+      task: "随便什么任务",
+      index: postgresRepoIndexStore(db),
+      maps,
+      files,
+    });
+    assert.equal(result.degraded, "index_missing");
+    assert.ok(result.text.startsWith("# 仓库文件树"), result.text);
+    assert.ok(result.text.includes("src/"), result.text);
+    assert.equal(
+      await getRepoMap(db, {
+        repoKey: REPO_MAP,
+        commitSha: "deadbeefdeadbeef",
+        personalizationHash: result.personalizationHash,
+        budgetTokens: result.budgetTokens,
+      }),
+      null,
+      "降级结果不进缓存（索引修好后必须能拿到真地图）",
+    );
+  });
+});
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

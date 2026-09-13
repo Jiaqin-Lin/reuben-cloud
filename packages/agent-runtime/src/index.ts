@@ -123,7 +123,14 @@ export type {
   CompactionPreparation,
   CompactionSettings,
 } from "./compaction/index.ts";
-export { REPO_DIR, ROLE_PROMPT, DEFAULT_EGRESS_NOTE, buildSandboxSection, buildSystemPrompt } from "./prompt/system.ts";
+export {
+  REPO_DIR,
+  ROLE_PROMPT,
+  DEFAULT_EGRESS_NOTE,
+  buildSandboxSection,
+  buildChangedFilesSection,
+  buildSystemPrompt,
+} from "./prompt/system.ts";
 export type { SandboxFacts, SystemPromptSections } from "./prompt/system.ts";
 export { buildTaskPrompt, initialMessages } from "./prompt/task.ts";
 export type { TaskPromptOptions } from "./prompt/task.ts";

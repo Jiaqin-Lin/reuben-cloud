@@ -1496,6 +1496,7 @@ PageRank（幂法）：
   r = 1/N 起步；damping = 0.85；迭代到 |Δ| < 1e-7 或 100 次
   个性化向量 p：命中任务词的文件权重高（见 personalize.ts），否则均匀
   悬挂节点（无出边）的权重按 p 重新分配（标准做法）
+进图的边：repo_refs 的 import 边 + "名字被不超过 20 个不同文件引用"的标识符边（A-58）
 ```
 
 **2. 个性化（`personalize.ts`）**
@@ -1514,8 +1515,12 @@ PageRank（幂法）：
 每个文件：取它的 top-K 符号（K=8，按符号重要性：被引用次数多者优先，其次 start_line 升序）
 输出格式（缩进树 + 签名），达到 token 预算（默认 1500，硬上限 3000）就停
 每个文件块之间留空行；被截断的文件在末尾标 "…"（不截断半行）
-末尾追加一行："# 本次 Run 已改动（地图可能过期）：a.ts, b.ts"（P10 提供该列表）
+末尾追加一行："# 本次 Run 已改动（仓库地图可能过期）：a.ts, b.ts"（P10 提供该列表）
 ```
+
+> 那一行的措辞与 P1 的 system 分区**共用** agent-runtime 的 `buildChangedFilesSection`（同一个事实
+> 在同一段上下文里出现两次，两个措辞会读成两件事）——**计划本身的修正，正文已同步**；
+> 详情见下面的实现备注。
 
 **4. 缓存（`repo_maps`）**
 
@@ -1525,6 +1530,7 @@ CREATE TABLE repo_maps (
   personalization_hash text NOT NULL,   -- 任务词的哈希（同一任务命中）
   budget_tokens integer NOT NULL,
   text text NOT NULL, hash text NOT NULL, tokens integer NOT NULL,
+  index_built_at timestamptz NOT NULL,   -- 索引指纹（与 repo_indexes.built_at 比对）——多的一列，见 A-57
   built_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (repo_key, commit_sha, personalization_hash, budget_tokens)
 );
@@ -1534,6 +1540,27 @@ CREATE TABLE repo_maps (
 
 已改动文件列表（来自 `tool_invocations` 里 `edit`/`write` 的 `details.changedFiles`）拼在末尾；
 **增量重建**只在"改动文件 > 20 或距上次重建 > 5 分钟"时触发。
+
+> **实现备注**：P9 落地时有 5 条有意偏差，逐条记在附录 A-56 … A-60——
+> 多两个文件 `index/repo-map.ts`（缓存 / 降级 / 标注的编排）与 `index/repo-key.ts`
+> （`repo_key` 的推导从 `scripts/index-repo.ts` 抽出来，`index:repo` 与 `map:repo` 共用，A-56）；
+> `repo_maps` 多一列 `index_built_at`（索引指纹）并按 commit 只留最近两版，降级结果不写缓存（A-57）；
+> 排名之前先过一道**词汇名闸**（被 20 个以上不同文件引用的名字，它的标识符边一条都不进图；
+> P8 的 A-55 留的杠杆，带实测数字与"为什么不用 1/df 连续衰减"，A-58）；
+> token 预算只管正文，"已改动"那一行不占预算也不进缓存（A-59）；
+> 过期判据 `mapRefreshDue` 只提供不接线（地图是从 base commit 建的，要让"重建"产生新结果
+> 得先把沙箱里的改动拉回 CP 重新索引，那是 P10/M3 的事，A-60）。
+>
+> 另外几处把 spec 没说死的地方写死：① 收敛判据是整张图的 L1 变化（不是单点），到 100 轮就停，
+> `PageRankResult` 里如实带回 `iterations / converged`；② "不截半行"的做法是先把预算换算成
+> 字符上限（`tokens × 4`，于是 `ceil(chars/4) ≤ tokens` 等价于 `chars ≤ tokens × 4`）再整行进出；
+> 被切的文件补一行 `  …`，整块被丢的文件只体现在返回值的 `omittedFiles / truncated` 里
+> （不往文本里写"还有 N 个文件没显示"：那段话每轮都要花 token，而模型能不能正确利用它是不确定的）；
+> ③ 降级文件树是"目录头 + 文件名"（不重复目录前缀，省 token），目录按文件数降序、目录内按名字升序；
+> ④ 符号重要性的第三级键是 `name` 升序（同一行声明两个符号时才用得到）；⑤ 缓存命中时
+> `matchedSymbols / rank` 是空 / null（那些数没被缓存，不编一个像真的值），`files` 从正文里数
+> （`repo_maps` 不存派生数字）；⑥ `map:repo` 多 `--budget / --changed / --rebuild / --no-index / --out`，
+> 且没有 ready 索引时顺手建一次（与 `index:repo --dry-run` 同一个定位：手工验收要一条命令跑通）。
 
 ### 技术边界
 
@@ -2032,6 +2059,11 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 | A-54 | Phase 8 · dev 脚本 | `npm run index:repo -- --local <path>`（不接 GitHub 也能建索引） | 多两个开关：`--dry-run`（不连 PG，只跑发现 + 解析 + 算边并打印符号与边）、`--repo owner/name`（缺省时从 clone 的 `origin` 推，推不出来才退回目录名）；`--top <n>` 控制打印条数 | ① `--dry-run` 是"第一次在一台干净机器上验证"的最短路径（不需要 `dev:up`），也是排障时回答"这个仓库解析出来长什么样"的第一句话。② `repo_key` 是索引的键：手工跑用目录名、生产用 `owner/name`，同一次索引会变成两份互不相干的数据；从 remote 读一次就避免了这个人人都可能踩的不一致 | `scripts/index-repo.ts`；`package.json` 的 `index:repo` 与 `vendor:tree-sitter`；README §8 |
 
 | A-55 | Phase 8 · §4 引用边的候选 | "对每个文件：收集标识符（去掉语言关键字与局部变量名的最佳努力：只取'出现在成员访问左侧 或 作为调用目标'的名字）" | 收窄成三类：**裸调用目标**（`helper(x)` / `new Store()` / JSX 组件名）、**成员链的根**（`a.b.c` → `a`）、**import 路径**；`a.b.c()` 里的 `c` 与 `console.error` 里的 `error` 都不再是候选；另外过滤掉测试框架注入的全局名（`describe` / `test` / `it` / `expect` / `assert` / `before` / `after` / …），并把匿名函数（箭头函数 / lambda / 闭包 / Ruby 块）当作遍历边界（局部定义不再进符号表） | ① 属性名会与**任何**同名函数挂钩，而它给出的依赖信息（"用了某个对象/模块"）已经由成员链的根给出了——在本仓库自身上量过：`console.log` / `res.text` / `stream.end` / `container.destroy` 这类属性名贡献了 7.6% 的边（`log` 一个名字 212 条）；② 框架全局名撞上"恰好同名的一个定义"是 1/N 衰减救不了的那一类（`describe` 命中两个 interface 上的同名方法、`assert` 命中一个脚本里的局部 helper，共 265 条）；③ 匿名函数不是定义节点，遍历会走进去，测试回调里的 `const input = …` 会被当成模块级常量收下来——这条直接制造了几百条假边（实测 8630 → 4424 条边，第 ② 条修完之后剩下的噪声换成"局部变量名撞上顶层定义"，属于名字匹配法的固有代价，见设计文档 §D.3 的"宁可少边"）。**留一个 P9 的杠杆**：如果地图里仍被 `path` / `store` / `log` 这类"词汇名"占位，可以在 `edgesFor()` 上加一条文档频率闸（被 20 个以上文件引用的名字不产生边）——那需要把"变化文件引用过的名字"也纳入增量的受影响集（现在的受影响集只覆盖"定义集变了的名字"） | `refs.ts` 的 `RefRules` / `calleeName` / `FRAMEWORK_GLOBALS` / `KEYWORDS`；`symbols.ts` 的 `FUNCTION_BOUNDARIES`；`index-refs.test.ts` 的四条"候选提取的收窄"用例与 `index-symbols.test.ts` 的匿名函数边界用例 |
+| A-56 | Phase 9 · 交付物 | `index/{rank,render,personalize}.ts` + `010_repo_map.sql` + `npm run map:repo` | 多两个文件：`index/repo-map.ts`（编排：索引状态 → 缓存 → 排名渲染 → 降级 → 标注）与 `index/repo-key.ts`（`owner/name` 的推导从 `scripts/index-repo.ts` 抽出来，`index:repo` 与 `map:repo` 共用） | ① 交付物里那三个是**纯函数**（无 IO / 无时钟 / 无库），而"缓存命中读了几行、索引不可用时给什么、重算的判据是什么"必须有地方放——放进 `render.ts` 会让它的"字节确定性"多一个能被破坏的入口；② 两个手工验收脚本各写一份 `repo_key` 推导，就会出现"同一个仓库两份互不相干的数据"（A-54 踩过），且抽走之后 `scripts/index-repo.ts` 只少了 8 行 | `index/repo-map.ts`（`RepoMapDegraded` / `mapRefreshDue` / `buildRepoMap`）、`index/repo-key.ts`；`scripts/index-repo.ts` 改用 `repoKeyOf`；`repo-map-build.test.ts` 15 条 |
+| A-57 | Phase 9 · §4 `repo_maps` | 8 列，主键 `(repo_key, commit_sha, personalization_hash, budget_tokens)`；§4 没提保留策略 | 多一列 `index_built_at`（**索引指纹**，与 `repo_indexes.built_at` 比对，不等就不算命中）；写完按 commit 只留最近 2 版（`pruneRepoMaps`）；**降级（文件树）结果不写缓存** | ① 缓存键里没有索引的身份：同一个 commit 跑一次 `index:repo --rebuild`（或先失败后修好）之后，四个键一模一样，于是"地图永远停在旧符号表上"——它本地看着是对的，是最难查的那类错；指纹一比就失效，不需要动主键；② 每条地图几 KB，活跃仓库每个 commit 会有好几条（不同任务词 / 不同预算），留两版与 009 的符号表同一口径（A-49）；③ 文件树是降级产物，索引修好后同一个键必须能拿到真地图 | 010 迁移；`store.ts` 的 `RepoMapStore` / `postgresRepoMapStore` / `latestRepoMapBuiltAt` / `pruneRepoMaps`；`repo-map-store-contract.ts` 四条契约（内存 + 真 PG 各跑一遍）；`repo-map-build.test.ts` 的指纹用例 |
+| A-58 | Phase 9 · §1 图与排名 | "节点 = 文件；边 = repo_refs 的 (from,to,weight)"，PageRank 直接用它们 | 进图之前过一道**词汇名闸**（`rank.ts` 的 `dropVocabularyEdges`）：一个候选名字被**超过 20 个不同文件**引用时，它的标识符边一条都不进图；import 边不动（靠 `repo_file_refs` 的 kind 判，不靠字符串猜） | P8 的 A-55 明确留了这个杠杆（"如果地图里仍被 `path` / `store` / `log` 这类'词汇名'占位"），P9 落地前先在本仓库自身上量了一遍：`path` 出现在 74 个文件里，而全仓库只有一个文件定义了叫 `path` 的常量（P8 的 fixture）→ 那 74 条边把它顶到地图第 3 名（一共 12 个名额）；同类的还有 `result`(80) / `text`(47) / `row`(36) / `readFile`(36)。加闸后本仓库丢掉 1104/4785 条边，前 12 名从"混着一个 fixture"变成全是真源码模块，而 issue 相关的 `render.ts` / `indexer.ts` / `parse.ts` 一个没掉。**试过但没用**：按 `1/df` 连续衰减——PageRank 按每个文件的出边权重和归一化，一个文件的所有出边被等比例缩小之后衰减被完全抵消（单测里复现：30 条通用名边 vs 3 条 import 边，衰减后排名不变）；要让它生效得在循环里加"被衰减的质量退回跳转池"的概念，比一道闸贵得多 | `rank.ts` 的 `MAX_REFERENCING_FILES` / `dropVocabularyEdges` / `edgeKey`；`repo-map.ts` 重算路径上多读一次 `fileRefsOfKind(…, "import")`（缓存命中的路径不读）；`repo-map-rank.test.ts` 三条 + `repo-map-build.test.ts` 一条（30 vs 3 的场景） |
+| A-59 | Phase 9 · §3/§5 预算与标注 | "达到 token 预算就停"；"末尾追加一行：'# 本次 Run 已改动（地图可能过期）…'" | 预算只管**正文**：标注不占预算、不进正文哈希、不进缓存键；措辞改用 agent-runtime 的 `buildChangedFilesSection`（"**仓库**地图可能过期"，与 P1 的 system 分区同一份实现，正文已同步） | 缓存键是 `(repo, commit, 任务词, 预算)`，而标注依赖本次 Run 的动作（`changedFiles`）——进正文就会让"一份缓存"对应多份文本，回放比对立刻不成立；它本身只有一行（≤ 20 个路径 + 总数），由 P10 的分区预算兜底。措辞统一是因为同一个事实会在 system 与地图两处出现：两个措辞会让模型读成两件事，而 P10 若要只留一处，删一个调用点就够了 | `render.ts` 的 `withChangedFiles` / `CHANGED_FILES_LIMIT`；`repo-map.ts` 的 `text`（含标注）/ `body` / `hash`（只算正文）；agent-runtime `index.ts` 多导出 `buildChangedFilesSection` |
+| A-60 | Phase 9 · §5 过期处理 | "增量重建只在'改动文件 > 20 或距上次重建 > 5 分钟'时触发" | P9 只提供判据（`mapRefreshDue`，带单测），**不接线**；`RepoMapStore.latestBuiltAt` 是给它准备的读口 | 地图是从 **base commit** 建的：agent 在沙箱里改代码不会让 CP 的 clone 变化，所以"重建"要产生新结果，必须先把沙箱里的改动拉回 CP 重新索引（或换 commit）——那是 P10/M3 的接线，不是 P9 能凭空实现的。给出判据是为了接线时不会随手写成"每轮重建"，也不会在"改动 < 20 且 5 分钟内"时白白重算 | `repo-map.ts` 的 `mapRefreshDue` / `MAP_REFRESH_CHANGED_FILES` / `MAP_REFRESH_INTERVAL_MS`（目前没有生产调用方）；`repo-map-build.test.ts` 一条边界用例 |
 
 **已经预知的两条偏差**（实施时必须确认并回填）：
 
@@ -2089,9 +2121,9 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 
 | fixture | 位置 | 用于 |
 |---|---|---|
-| `node-ts-basic` | `test/fixtures/repos/` | P5（signals 级）、P8（TS 符号）、P9（地图金标准） |
+| `node-ts-basic` | `test/fixtures/repos/` | P5（信号级）、P8（TS 符号） |
 | `python-poetry` | 同上 | P5（dockerfile 级）、P8（Python 符号） |
 | `monorepo-devcontainer` | 同上 | P5（devcontainer 级 + degraded）、P8（增量） |
 | `dockerfiles/*.Dockerfile` | `test/fixtures/dockerfiles/` | P6（错误分类与硬约束校验） |
 | `build-logs/*.log` | 同上 | P6（错误分类样本） |
-| `index/*.{ts,py,go,rs,java,rb,php}` | `test/fixtures/index/` | P8（每语言符号金标准） |
+| `index/sample.{ts,tsx,js,py,go,rs,java,rb,php}` | `test/fixtures/index/` | P8（每语言符号金标准）、P9（地图金标准：真解析 → 边 → 渲染的逐字节文本） |

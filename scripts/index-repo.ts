@@ -26,9 +26,9 @@ import { consoleLog } from "../packages/control-plane/src/log.ts";
 import { indexRepository } from "../packages/control-plane/src/index/indexer.ts";
 import { discoverFiles, parseBatch } from "../packages/control-plane/src/index/parse.ts";
 import { computeEdges } from "../packages/control-plane/src/index/refs.ts";
+import { repoKeyOf } from "../packages/control-plane/src/index/repo-key.ts";
 import { postgresRepoIndexStore, listRepoSymbols } from "../packages/control-plane/src/index/store.ts";
 import { VENDOR_TREE_SITTER_DIR } from "../packages/control-plane/src/index/vendor.ts";
-import { runGit } from "../packages/control-plane/src/repo/git.ts";
 
 const log = consoleLog("index");
 
@@ -77,18 +77,11 @@ function parseArgs(argv: string[]): Args {
 }
 
 /**
- * `owner/name`：优先 `--repo`，其次 clone 自己的 origin，最后退回目录名。
- *
- * 【为什么值得读一次 remote】`repo_key` 是索引的键：本地手工跑一次用了目录名，
- * 而生产里用的是 `owner/name`，那两次索引就会变成两份互不相干的数据。
- * 读得出来就用真的那个（读不出来——没有 remote、不是 git 仓库——才退回目录名）。
+ * `owner/name` 的来源见 `index/repo-key.ts`（P9 把这份实现从本文件抽走了：`map:repo` 也要它），
+ * 这里只留一个读参数的壳。
  */
-async function repoKeyOf(dir: string, explicit: string | null): Promise<string> {
-  if (explicit !== null) return explicit;
-  const result = await runGit(["remote", "get-url", "origin"], { cwd: dir }).catch(() => null);
-  const remote = result !== null && result.code === 0 ? result.stdout.toString("utf8").trim() : "";
-  const match = /github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/.exec(remote);
-  return match === null ? path.basename(path.resolve(dir)) : `${match[1]}/${match[2]}`;
+async function repoKeyFromArgs(args: Args): Promise<string> {
+  return repoKeyOf(path.resolve(args.local!), args.repo);
 }
 
 async function dryRun(args: Args): Promise<void> {
@@ -139,7 +132,7 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  const repoKey = await repoKeyOf(args.local!, args.repo);
+  const repoKey = await repoKeyFromArgs(args);
   const db = new Db({ connectionString: resolveDatabaseUrl(), log });
   try {
     await runMigrations(db, { log });

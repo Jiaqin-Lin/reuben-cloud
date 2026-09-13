@@ -1,23 +1,28 @@
 /**
- * P8 单测的替身：内存版 `RepoIndexStore`、脚本化的假 parser、假 git 端口。
+ * P8/P9 单测的替身：内存版 `RepoIndexStore` 与 `RepoMapStore`、脚本化的假 parser、假 git 端口。
  *
- * 【为什么值得写这三个】P8 最难的一段逻辑是**增量**：受影响集怎么算、哪些旧行不复制、
- * 以及"增量结果 == 全量结果"这条不变量。把这三样都留到集成测试里验，等于每次改一行增量逻辑
- * 都要起一次 Postgres 容器；而这几件事本身没有一处需要真库（需要的是"能读回上一版的行"）。
- * 真库要验的是另一件事：SQL 的复制/排除与内存实现的行为一致（见集成测试）。
+ * 【为什么值得写这几个】P8 最难的一段逻辑是**增量**：受影响集怎么算、哪些旧行不复制、
+ * 以及"增量结果 == 全量结果"这条不变量。P9 最难的一段是**缓存与降级**：命中时到底读了几次库、
+ * 索引不可用时输出什么、指纹变了之后旧地图算不算命中。把这两样都留到集成测试里验，
+ * 等于每次改一行逻辑都要起一次 Postgres 容器；而它们本身没有一处需要真库。
+ * 真库要验的是另一件事：SQL 的复制/排除/upsert 与内存实现的行为一致（见集成测试）。
  *
- * 【它不替代什么】`memoryRepoIndexStore` 是**照 SQL 语义写的**，不是 SQL 的证明：
- * `INSERT … SELECT`、`unnest(pairs)` 这些只有真库能证。所以集成测试会用同一组场景再跑一遍。
+ * 【它不替代什么】这两个内存实现是**照 SQL 语义写的**，不是 SQL 的证明：
+ * `INSERT … SELECT`、`unnest(pairs)`、`ON CONFLICT DO UPDATE` 这些只有真库能证。
+ * 所以集成测试会用同一组场景再跑一遍。
  */
 
 import { readFile } from "node:fs/promises";
 import type { BatchParser, DiffEntry, IndexGitPort } from "../src/index/indexer.ts";
 import type { ParseOutcome, ParsedFile, ParseFileStatus } from "../src/index/parse.ts";
+import type { LanguageId } from "../src/index/symbols.ts";
 import type {
   FileRefRowInput,
   RepoFileRefRow,
   RepoIndexRow,
   RepoIndexStore,
+  RepoMapRow,
+  RepoMapStore,
   RepoRefRowRow,
   RepoSymbolRow,
   WriteIndexInput,
@@ -123,6 +128,16 @@ export function memoryRepoIndexStore(): MemoryRepoIndexStore {
       return (fileRefs.get(key(repoKey, commitSha)) ?? []).filter((row) => row.kind === kind);
     },
 
+    async allSymbols(repoKey, commitSha) {
+      count("allSymbols");
+      return [...(symbols.get(key(repoKey, commitSha)) ?? [])];
+    },
+
+    async allRefs(repoKey, commitSha) {
+      count("allRefs");
+      return [...(refs.get(key(repoKey, commitSha)) ?? [])];
+    },
+
     async writeIndex(input: WriteIndexInput) {
       count("writeIndex");
       const entryKey = key(input.repoKey, input.commitSha);
@@ -221,6 +236,139 @@ export function memoryRepoIndexStore(): MemoryRepoIndexStore {
     symbols: (repoKey, commitSha) => [...(symbols.get(key(repoKey, commitSha)) ?? [])],
     refs: (repoKey, commitSha) => [...(refs.get(key(repoKey, commitSha)) ?? [])],
     fileRefs: (repoKey, commitSha) => [...(fileRefs.get(key(repoKey, commitSha)) ?? [])],
+  };
+}
+
+// ---------------------------------------------------------------- 手摆一份快照
+
+/** 往内存索引库里塞一份"已经索引好"的快照（`writeIndex` 的参数太多，单测里只关心内容）。 */
+export interface SeedRepoIndexSymbol {
+  path: string;
+  name: string;
+  kind?: "function" | "class" | "method" | "interface" | "type" | "const";
+  signature?: string;
+  startLine?: number;
+  endLine?: number;
+  lang?: LanguageId;
+}
+
+export async function seedRepoIndex(
+  store: MemoryRepoIndexStore,
+  input: {
+    repoKey: string;
+    commitSha: string;
+    symbols?: readonly SeedRepoIndexSymbol[];
+    edges?: readonly { fromPath: string; toPath: string; symbol: string; weight: number }[];
+    fileRefs?: readonly { path: string; symbol: string; kind: "identifier" | "import" }[];
+    languages?: Record<string, number>;
+    files?: number;
+    status?: "ready" | "unsupported";
+  },
+): Promise<void> {
+  const symbols = input.symbols ?? [];
+  const languages = input.languages ?? (symbols.length === 0 ? {} : { typescript: new Set(symbols.map((symbol) => symbol.path)).size });
+  await store.start({ repoKey: input.repoKey, commitSha: input.commitSha, files: input.files ?? 0, languages });
+  await store.writeIndex({
+    repoKey: input.repoKey,
+    commitSha: input.commitSha,
+    copyFromCommitSha: null,
+    excludeSymbolPaths: [],
+    excludeFileRefPaths: [],
+    excludeRefPaths: [],
+    excludeRefPairs: [],
+    symbols: symbols.map((symbol) => ({
+      path: symbol.path,
+      lang: symbol.lang ?? "typescript",
+      name: symbol.name,
+      kind: symbol.kind ?? "function",
+      signature: symbol.signature ?? `export function ${symbol.name}()`,
+      startLine: symbol.startLine ?? 1,
+      endLine: symbol.endLine ?? (symbol.startLine ?? 1) + 1,
+    })),
+    fileRefs: input.fileRefs ?? [],
+    edges: (input.edges ?? []).map((edge) => ({ ...edge })),
+    status: input.status ?? "ready",
+    files: input.files ?? 0,
+    languages,
+    durationMs: 1,
+    error: null,
+    keepCommits: 2,
+  });
+}
+
+// ---------------------------------------------------------------- 内存地图缓存
+
+/** 内存版 `RepoMapStore` 多出来的口：看行、调用计数、以及“故意坏一下”（降级的 warn 路径要能测）。 */
+export interface MemoryRepoMapStore extends RepoMapStore {
+  rows(): RepoMapRow[];
+  readonly calls: Record<string, number>;
+  /** 置 true 之后对应方法抛错（验证“缓存坏了不影响地图”这条）。 */
+  readonly failing: { get: boolean; put: boolean };
+}
+
+/**
+ * 与 `postgresRepoMapStore` 逐条对应：get / upsert / latestBuiltAt / prune。
+ *
+ * `built_at` 用一个自增计数代替时钟（P8 的内存 store 同一条理由：断言里要比先后，
+ * `Date.now()` 在同一个毫秒里会给出相同的值）。
+ */
+export function memoryRepoMapStore(): MemoryRepoMapStore {
+  const rows = new Map<string, RepoMapRow>();
+  const calls: Record<string, number> = {};
+  const failing = { get: false, put: false };
+  let clock = 0;
+
+  const count = (name: string): void => {
+    calls[name] = (calls[name] ?? 0) + 1;
+  };
+  const rowKey = (input: { repoKey: string; commitSha: string; personalizationHash: string; budgetTokens: number }): string =>
+    [input.repoKey, input.commitSha, input.personalizationHash, String(input.budgetTokens)].join("\u0000");
+
+  return {
+    calls,
+    failing,
+
+    async get(input) {
+      count("get");
+      if (failing.get) throw new Error("scripted cache read failure");
+      return rows.get(rowKey(input)) ?? null;
+    },
+
+    async put(row) {
+      count("put");
+      if (failing.put) throw new Error("scripted cache write failure");
+      const stored: RepoMapRow = { ...row, built_at: new Date(clock++) };
+      rows.set(rowKey({ repoKey: row.repo_key, commitSha: row.commit_sha, personalizationHash: row.personalization_hash, budgetTokens: row.budget_tokens }), stored);
+    },
+
+    async latestBuiltAt(repoKey, commitSha) {
+      count("latestBuiltAt");
+      const mine = [...rows.values()].filter((row) => row.repo_key === repoKey && row.commit_sha === commitSha);
+      mine.sort((a, b) => b.built_at.getTime() - a.built_at.getTime());
+      return mine[0]?.built_at ?? null;
+    },
+
+    async prune(repoKey, keepCommits) {
+      count("prune");
+      const mine = [...rows.values()].filter((row) => row.repo_key === repoKey);
+      const byCommit = new Map<string, number>();
+      for (const row of mine) byCommit.set(row.commit_sha, Math.max(byCommit.get(row.commit_sha) ?? -1, row.built_at.getTime()));
+      const keep = new Set(
+        [...byCommit.entries()]
+          .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? 1 : -1))
+          .slice(0, keepCommits)
+          .map(([commitSha]) => commitSha),
+      );
+      let deleted = 0;
+      for (const row of mine) {
+        if (keep.has(row.commit_sha)) continue;
+        rows.delete(rowKey({ repoKey: row.repo_key, commitSha: row.commit_sha, personalizationHash: row.personalization_hash, budgetTokens: row.budget_tokens }));
+        deleted += 1;
+      }
+      return deleted;
+    },
+
+    rows: () => [...rows.values()],
   };
 }
 
