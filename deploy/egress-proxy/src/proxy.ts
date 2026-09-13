@@ -618,6 +618,40 @@ async function main(): Promise<void> {
   const config = loadProxyEnv();
   // createEgressProxy 构造时就会读白名单：文件缺失、语法错、裸 `*` 全部在这里变成启动失败。
   const proxy = createEgressProxy({ ...config, log: defaultLog });
+
+  // ---------------------------------------------------------------- 信号处理
+  //
+  // 【顺序：必须在对外宣布就绪之前装好】这是一条被 CI 抓出来的真 bug（Phase 7 实现备注 18）：
+  // banner 一旦写进管道，父进程（docker stop / 测试）读到它就可能立刻发 SIGTERM——而那一刻
+  // 内核里 SIGTERM 还挂着**默认动作**（杀死进程），于是进程以"被信号打死"收场、退出码是 null。
+  // 这个窗口在 macOS 上跑几十次不露头，Linux CI 上第一次真跑就翻了
+  // （control-plane 的 egress-proxy-server.test.ts 「正常启动 + SIGTERM 优雅退出」）。
+  // sandbox-agent 的 index.ts 是同一天修的同一条 bug（它俩的入口形状本来就一样）。
+  let shuttingDown = false;
+  const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[egress-proxy] ${signal} received, closing`);
+    await proxy.close();
+    process.exit(0);
+  };
+
+  /**
+   * 信号回调是同步接口，而 shutdown 是 async——所以这里必须自己接住它的拒绝：
+   * 未处理的 Promise 拒绝在 Node 24 里默认是堆栈 + 非 0 退出，那就变成了"SIGTERM 导致代理崩溃"。
+   * 收尾里出错也仍然 exit(0)（在 Docker 的信号路径上，0 表示"我按你的要求停了"），
+   * 细节写在 stderr 里。
+   */
+  const onSignal = (signal: NodeJS.Signals): void => {
+    void shutdown(signal).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[egress-proxy] shutdown failed: ${message}`);
+      process.exit(0);
+    });
+  };
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+  process.on("SIGINT", () => onSignal("SIGINT"));
+
   const address = await proxy.listen();
   console.log(
     `[egress-proxy] v${VERSION} listening on ${address.host}:${address.port} allowlist=${config.allowlistPath}`,
@@ -634,17 +668,6 @@ async function main(): Promise<void> {
       console.error(`[egress-proxy] reload failed, keeping the current allowlist: ${message}`);
     }
   });
-
-  let shuttingDown = false;
-  const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log(`[egress-proxy] ${signal} received, closing`);
-    await proxy.close();
-    process.exit(0);
-  };
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
-  process.on("SIGINT", () => void shutdown("SIGINT"));
 }
 
 if (import.meta.main) {

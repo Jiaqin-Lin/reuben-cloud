@@ -368,6 +368,12 @@ Phase 1 里 `status` 只取值 `ready`（`starting` 用不到、`error` 保留�
 3. **用例 9 的断言改了形式**：`printf '\x00\x01\xff'` 里的 `\xff` 单独出现就是非法 UTF-8，StringDecoder 必然给出一个 U+FFFD，所以「无替换字符」对这个输入不可满足。改测「有效字节原样送达 + 恰好一个替换字符」，而多字节边界由用例 10 负责。
 4. **终态事件的触发条件写清楚了**：直接子进程退出 **且** 两路管道 EOF，**或** 退出后 250ms 宽限期到（后台进程继承管道写端时管道永远不会 EOF，死等会让 `completed` 永不发出——而 §C.2 要求 `nohup ./dev-server &` 这种模式必须能用）。宽限期后的输出丢弃，清理交给 destroy。
 5. **路径包含性只判「符号链接解析之后」的路径**，没有单独的字面前缀检查：root 本身是符号链接时（macOS `/var` → `/private/var`）字面前缀检查会把 root 之内、尚未落盘的路径误判成越界；而真正要拦的是解析后的落点。
+6. **入口的顺序：信号处理必须在"对外宣布就绪"之前装好**（Phase 7 的 CI 回来改的，见 Phase 7 备注 18）：
+   原来是 `listen()` → 打 banner → `process.on("SIGTERM", …)`。banner 一进管道，父进程（docker stop / 测试）
+   读到就可能立刻发 SIGTERM，而那一刻内核里 SIGTERM 还是**默认动作**（杀死进程）——实测在 Linux 上
+   100 轮里 76 轮以"被信号打死"收场（退出码 null，不是 0）。修法：把 handler 注册提到 `listen()` 之前。
+   同一次还接住了 `shutdown()` 的 Promise 拒绝（未处理拒绝 = Node 24 默认非 0 退出，
+   那就变成"SIGTERM 导致容器崩溃"，比出错本身更难查）。
 
 **完成标记：**
 - [x] **Phase 1 完成** — exec 内核在裸机上跑通全部 18 个用例
@@ -1112,6 +1118,11 @@ security.debian.org
 14. **集成测试会短暂接管 `reuben-cloud-proxy` 这个容器名**：沙箱里注入的 `HTTP_PROXY` 指向的就是这个名字，
     换个名字测的就不是同一条链路。`after()` 会用仓库里那份清单把它恢复回去；大部分策略用例走一个本地 origin 容器，
     只有 1/6/8/9 真的出网。
+15. **代理入口的 SIGTERM 竞态**（Phase 7 的 CI 回来改的，见 Phase 7 备注 18）：与 sandbox-agent 的
+    `index.ts` 是同一条 bug——banner 打在 `process.on("SIGTERM")` 之前，父进程读到 banner 就发信号时，
+    内核里还是默认动作，进程被直接打死（退出码 null）。这条 bug 把 `egress-proxy-server.test.ts` 的
+    「入口：正常启动 + SIGTERM 优雅退出（exit 0）」在 Linux CI 上打红了，macOS 上几十次都没露头。
+    修法同样是：handler 先装、banner 后打；顺带接住 `shutdown()` 的拒绝。
 
 ---
 
@@ -1249,13 +1260,16 @@ CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**
 
 ### 验收标准
 
-- [x] CI 上 `npm run smoke` 全绿 —— 前三轮的真实经历（每一轮都抓到真的东西）：
+- [x] CI 上 `npm run smoke` 全绿 —— 四轮的真实经历（每一轮都抓到真的东西，前六轮 Phase 从没在 CI 上跑过）：
       ① 第一次跑（`8a20b2a`）两个 job 都在 10 秒内红：`npm ci` 直接 `EUSAGE`——
       `package-lock.json` 从 Phase 5 起就没同步过（实现备注 16）；
-      ② 修完 lockfile 之后 `smoke` job 又在 `npm run smoke` 之前的那步 `npm test` 上红了：
-      Phase 3 两条内存断言量的是 RSS，在 Linux 上必然输（实现备注 17）；
-      ③ 修完内存断言后本地把整个 Linux 路径搬进容器重跑了一遍：`npm run smoke` **26/26 全绿**
-      （含 I1–I10 红线在 Linux 语义下的首跑）、`npm test` 101+56 连跑 3 次全绿。
+      ② 修完 lockfile 之后 `smoke` job 红在 `npm test` 上：Phase 3 两条内存断言量的是 RSS，
+      在 Linux 上必然输（实现备注 17）；
+      ③ 修完内存断言之后 `smoke` job 又红在同一步：`egress-proxy` 入口的 SIGTERM 竞态——
+      banner 打在装 handler 之前，对照实验 76/100 → 0/100（实现备注 18）；
+      ④ 修完入口顺序后本地把整个 Linux 路径搬进容器重跑：`npm test` 101+56 **连跑 3 次全绿**、
+      `npm run smoke` **26/26 全绿**（含 I1–I10 红线在 Linux 语义下的首跑）、两个入口用例
+      Linux 25 轮 / macOS 20 轮零失败
       本地另已验：macOS 全量 26/26、`tsc --noEmit`、Phase 5/6 集成测试 24/24
 - [x] **反向验证 job 红了**（证明脚本有牙齿）—— 本地用 `SMOKE_ANY_PLATFORM=1 SMOKE_NEGATIVE_CONTROL=1` 跑 `--tag=isolation`：
       10 条里**只有 I10 变红**，且断言消息里含 `CapDrop`（CI 的 job 断言的就是这两件事）
@@ -1356,6 +1370,23 @@ CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**
     门槛改成传输量的一半，归档用例的客户端从 `fetch` 换成 `http.request`）。
     教训值得单独写一行：**这两条用例在 CI 上从未跑过**——Phase 3 到 Phase 6 的验收全是本机 macOS 跑的，
     而"本机能过"与"Linux 上能过"在这两件事上真的不一样（allocator 行为 + 同进程 client/server 的排队）。
+18. **CI 第三轮：`egress-proxy` 入口有一个真的 SIGTERM 竞态**（修完内存断言之后抓到的那条）。
+    `npm test` 挂在 `control-plane/test/unit/egress-proxy-server.test.ts` 的「入口：正常启动 + SIGTERM
+    优雅退出（exit 0）」上——这正是"冒烟进 CI"的价值：一条 Phase 6 写的用例，在 macOS 上反复跑都绿，
+    Linux 上第一次真跑就翻了。根因是**入口的顺序**：`listen()` → 打 banner → `process.on("SIGTERM")`。
+    banner 一写进管道父进程就可能读到并发信号，而那一刻内核里 SIGTERM 还挂着默认动作（杀死进程），
+    于是进程的退出码是 null（被信号打死）而不是 0。
+    对照实验（同一台 Linux 容器，父进程**收到 banner 就同步发 SIGTERM**，100 轮）：
+    修前 `退出码0=24 / 被SIGTERM打死=76`，修后 `退出码0=100 / 打死=0`。
+    改动两处（形状一样）：
+    - `packages/sandbox-agent/src/index.ts`（Phase 1 的文件，见 Phase 1 备注 6）
+    - `deploy/egress-proxy/src/proxy.ts`（Phase 6 的文件，见 Phase 6 备注 15）
+    两处都把 handler 注册提到 `listen()` 之前，并且把 `void shutdown(...)` 换成接住拒绝的形式：
+    未处理的 Promise 拒绝在 Node 24 里默认是"堆栈 + 非 0 退出"，那等于把一次收尾出错伪装成
+    "SIGTERM 把容器打死了"——比出错本身更难查。收尾出错仍然 exit(0)（在 Docker 的信号路径上，
+    0 的意思是"我按你的要求停了"），细节写进 stderr。
+    验证：Linux 容器里那两个入口用例连跑 25 轮、macOS 连跑 20 轮，全绿；全量单测（101+56）与
+    冒烟的 exec+flow 组（含 destroy 的 SIGTERM 路径）也都重跑过。
 
 ---
 ---

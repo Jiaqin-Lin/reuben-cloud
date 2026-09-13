@@ -42,24 +42,14 @@ async function main(): Promise<void> {
   const registry = new ExecutionRegistry(config, roots);
   const server = createAgentServer(config, registry, roots);
 
-  // 把“监听成功/失败”包成 Promise：否则代码会直接跑到底，
-  // 连端口被占了都发现不了（listen 是异步的）。
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(config.port, config.host, () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-
-  // address() 在监听成功之后必然有值；TS 推不出来（它可能是 string，比如 Unix socket），
-  // 所以这里用 `as` 断言成 AddressInfo 才能读 .address / .port。
-  const address = server.address() as AddressInfo;
-  console.log(
-    `[sandbox-agent] v${VERSION} listening on http://${address.address}:${address.port} ` +
-      `workspace=${roots.realRoot} read=${roots.realReadRoots.join(",")} logs=${config.logRoot}`,
-  );
-
+  // ---------------------------------------------------------------- 信号处理
+  //
+  // 【顺序：必须在对外宣布就绪之前装好】这是一条被 CI 抓出来的真 bug（Phase 7 实现备注 18）：
+  // banner 一旦写进管道，父进程（docker stop / 测试）读到它就可能立刻发 SIGTERM——而那一刻
+  // 内核里 SIGTERM 还挂着**默认动作**（杀死进程），于是进程以"被信号打死"收场、退出码是 null。
+  // 实测：macOS 上跑几十次不露头，Linux CI 上第一次真跑就翻了（EgressProxy 入口的同一条用例）。
+  // 修法就是把它提到 listen() 之前：Docker stop 在启动途中到达也应该被优雅处理。
+  //
   // shuttingDown 是个防重入锁：SIGTERM 和 SIGINT 几乎同时到（或者手贱连按两次 Ctrl-C）
   // 不能让收尾流程跑两遍。
   let shuttingDown = false;
@@ -86,10 +76,42 @@ async function main(): Promise<void> {
     process.exit(0);
   };
 
+  /**
+   * 信号回调。信号回调是同步接口，而 shutdown 是 async——所以这里必须自己接住它的拒绝：
+   * 未处理的 Promise 拒绝在 Node 24 里默认是**堆栈 + 非 0 退出**，那就变成了"SIGTERM
+   * 导致容器崩溃"，比出错本身更难查。
+   *
+   * 收尾里出错也仍然 exit(0)：在 Docker 的信号路径上，退出码 0 的意思是"我按你的要求停了"，
+   * 不是"一切顺利"——出错的细节已经写在 stderr 里了。
+   */
+  const onSignal = (signal: NodeJS.Signals): void => {
+    void shutdown(signal).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[sandbox-agent] shutdown failed: ${message}`);
+      process.exit(0);
+    });
+  };
   // 两个信号都接。/docker stop/ 发的是 SIGTERM；Ctrl-C 是 SIGINT。
-  // 外面的 `void` = “这是 async 函数，我知道它返回 Promise，故意不管”。
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
-  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+  process.on("SIGINT", () => onSignal("SIGINT"));
+
+  // 把"监听成功/失败"包成 Promise：否则代码会直接跑到底，
+  // 连端口被占了都发现不了（listen 是异步的）。
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(config.port, config.host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+
+  // address() 在监听成功之后必然有值；TS 推不出来（它可能是 string，比如 Unix socket），
+  // 所以这里用 `as` 断言成 AddressInfo 才能读 .address / .port。
+  const address = server.address() as AddressInfo;
+  console.log(
+    `[sandbox-agent] v${VERSION} listening on http://${address.address}:${address.port} ` +
+      `workspace=${roots.realRoot} read=${roots.realReadRoots.join(",")} logs=${config.logRoot}`,
+  );
 }
 
 /** sleep 用的小工具（Promise 化的 setTimeout）。 */
