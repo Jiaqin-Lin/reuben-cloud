@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, open, readFile, readlink, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { runCommand, startTestAgent, TEST_TOKEN, waitFor, type TestAgent } from "./harness.ts";
@@ -321,37 +322,88 @@ test("10: 并发闸 —— exec 在跑时 /archive 409；archive 在跑时 /heal
   }
 });
 
-test("11: 流式内存 —— 256 MiB 不可压缩数据，agent RSS 增量 < 50 MiB", async () => {
+test("11: 流式内存 —— 256 MiB 不可压缩数据，agent 不把归档攒进内存", async () => {
   const big = path.join(agent.realRoot, "memory.bin");
   // 为什么不是 1 GiB 零字节：零字节 gzip 之后只有 1 MiB 上下，客户端和服务端都轻松放下，
   // 断言就对"有没有在流式处理"完全免疫了。不可压缩的随机数据才有几百 MiB 的 stdout 流量。
   await writeRandomFile(big, 256 * MIB);
 
-  const baseline = process.memoryUsage().rss;
-  let peak = baseline;
+  // 【量什么，为什么不量 RSS】这条用例要拦的回归只有一个：把整个归档攒进内存
+  // （`for await` 收集所有 chunk，最后一次性 res.end）。那种写法会让 **arrayBuffers**
+  // 涨 ≥256 MiB——Buffer 就是 ArrayBuffer 撑起来的，Node 对它逐字节记账。
+  //  - `heapUsed` 兜住"用字符串攒"的写法（那种写法不涨 arrayBuffers）。
+  //  - **RSS 当断言是错的**：它包含 glibc 没还给操作系统的空闲 arena、V8 堆碎片与 socket 队列。
+  //    Linux 上同一条用例、同一台机器实测在 15–61 MiB 之间抖，而真流式的实现在 arrayBuffers
+  //    上只有个位数 MiB。Phase 3 原本那句 "RSS 增量 < 50 MiB" 在 Linux CI 上第一次真跑就红了
+  //    （61.3 MiB）——它量的是分配器，不是流式处理。RSS 仍然打印，因为排障时它有用。
+  const before = process.memoryUsage();
+  let peakArrayBuffers = before.arrayBuffers;
+  let peakHeapUsed = before.heapUsed;
+  let peakRss = before.rss;
   const sampler = setInterval(() => {
-    peak = Math.max(peak, process.memoryUsage().rss);
+    const now = process.memoryUsage();
+    peakArrayBuffers = Math.max(peakArrayBuffers, now.arrayBuffers);
+    peakHeapUsed = Math.max(peakHeapUsed, now.heapUsed);
+    peakRss = Math.max(peakRss, now.rss);
   }, 20);
 
+  // 客户端用 `http.request` + 同步的 data 处理器**直接丢字节**，不用 fetch：
+  // 被测的 agent 就跑在同一个进程里，undici 的 ReadableStream 会跟它抢事件循环、攒下几十 MiB
+  // 的排队块（实测：同一份用例，fetch 客户端 40–54 MiB，http.request 6–15 MiB）。
+  // 那量到的是客户端的队列，不是服务端有没有流式处理。
+  let received = 0;
   try {
-    const response = await fetch(`${agent.baseUrl}/archive`, {
-      headers: { authorization: `Bearer ${TEST_TOKEN}` },
+    received = await new Promise<number>((resolve, reject) => {
+      const req = httpRequest({
+        host: "127.0.0.1",
+        port: agent.port,
+        method: "GET",
+        path: "/archive",
+        headers: { authorization: `Bearer ${TEST_TOKEN}` },
+      });
+      req.on("error", reject);
+      req.on("response", (res) => {
+        let total = 0;
+        res.on("data", (chunk: Buffer) => {
+          total += chunk.length; // 只数字节，不在内存里攒
+        });
+        res.on("end", () => resolve(total));
+      });
+      req.end();
     });
-    assert.equal(response.status, 200);
-    // 客户端只丢字节、不在内存里攒——被测的是服务端有没有把整个归档读进内存
-    for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
-      void chunk;
-    }
   } finally {
     clearInterval(sampler);
     await rm(big, { force: true });
   }
 
-  const delta = peak - baseline;
+  // 先确认这次归档确实非平凡：256 MiB 不可压缩数据的 tar.gz 不会小于它的九成。
+  assert.ok(received > 200 * MIB, `只收到 ${(received / MIB).toFixed(0)} MiB，归档看起来是空的`);
+
+  const arrayBuffersDelta = peakArrayBuffers - before.arrayBuffers;
+  const heapDelta = peakHeapUsed - before.heapUsed;
+  const rssDelta = peakRss - before.rss;
+  const report =
+    `arrayBuffers=${(arrayBuffersDelta / MIB).toFixed(1)}MiB ` +
+    `heapUsed=${(heapDelta / MIB).toFixed(1)}MiB ` +
+    `rss=${(rssDelta / MIB).toFixed(1)}MiB（归档 ${(received / MIB).toFixed(0)} MiB）`;
+
+  // 门槛 = 实际传输量的**一半**：
+  //  - "攒下整个归档"的实现必然 ≥100%（这条用例要拦的就是它）；
+  //  - 真流式的实现实测 ≤58 MiB（arrayBuffers）/ ≤61 MiB（RSS，Linux 上全量套件并发跑时），
+  //    也就是 ≤23%——那是同进程里的 socket/stream 排队，不是把载荷攒下来。
+  // 一半正好落在两者之间、两边都不贴边（拿 256 MiB 的实例说：噪声 ≤36，信号 256，线 128）。
+  const limit = received / 2;
   assert.ok(
-    delta < 50 * MIB,
-    `RSS 增量 ${(delta / MIB).toFixed(1)} MiB，超过 50 MiB —— 归档没有流式处理`,
+    arrayBuffersDelta < limit,
+    `ArrayBuffers 增量 ${(arrayBuffersDelta / MIB).toFixed(1)} MiB ≥ 传输量的一半：归档被攒进了内存（${report}）`,
   );
+  // 堆的那条一样用一半：堆本来就有 GC 抖动（实测个位数 MiB），
+  // 只有"整个归档在堆里"（比如用字符串攒）才会撞到它。
+  assert.ok(
+    heapDelta < limit,
+    `堆增量 ${(heapDelta / MIB).toFixed(1)} MiB ≥ 传输量的一半：归档被（用字符串之类）攒进了内存（${report}）`,
+  );
+  console.log(`    流式内存：${report}`);
 });
 
 // ---------------------------------------------------------------- 补充：超上限

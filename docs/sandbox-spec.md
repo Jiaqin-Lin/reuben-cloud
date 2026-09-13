@@ -481,7 +481,7 @@ type ResolveResult = { ok: true; abs: string } | { ok: false; reason: "empty" | 
 | 7 | 文本往返 | 内容一致 |
 | 8 | **二进制往返**：1 MiB 随机字节 → base64 → 原字节 sha256 相等 | 一致 |
 | 9 | 边界 | 1 MiB 整通过；1 MiB + 1 字节 → 413 |
-| 10 | 流式内存：上传 256 MiB tar | agent 进程 RSS 增量 < 50 MiB（证明真的在流，没有 `Buffer.concat`） |
+| 10 | 流式内存：上传 256 MiB tar | 内存增量 ≤ 上传量的一半（证明真的在流，没有 `Buffer.concat`）；量的是 `arrayBuffers`，不是 RSS（见 Phase 3 备注 16） |
 | 11 | 半途中断上传 | 目标目录里既无目标文件也无 `.part` |
 | 12 | sha256 | 与本地 `shasum -a 256` 一致 |
 | 13 | list：file/dir/symlink/空目录 | 类型、排序正确；symlink 不展开 |
@@ -492,7 +492,7 @@ type ResolveResult = { ok: true; abs: string } | { ok: false; reason: "empty" | 
 
 - [x] 上表 15 个用例全绿
 - [x] 越界路径**全部** 400（含 symlink 与 URL 编码两类）
-- [x] 256 MiB 上传期间 RSS 增量 < 50 MiB
+- [x] 256 MiB 上传期间内存增量 ≤ 上传量的一半（量 `arrayBuffers`，不是 RSS；见 Phase 3 备注 16）
 - [x] 二进制往返 sha256 一致
 - [x] `tsc --noEmit` 通过
 
@@ -608,7 +608,7 @@ tar czf - -C /workspace .
 | 8 | archive 空目录 / 含 symlink | 能打包；symlink 以链接本体存入 |
 | 9 | **中断传输** | 断开后 `pgrep tar` 为空（进程被带走） |
 | 10 | 并发闸 | exec 进行中 `GET /archive` → 409，且 `activeExecution` 是那个 exec id |
-| 11 | 流式内存 | 打包 1 GiB workspace，agent RSS 增量 < 50 MiB |
+| 11 | 流式内存 | 打包 256 MiB 不可压缩数据，agent 内存增量 ≤ 传输量的一半（量 `arrayBuffers`，不是 RSS；见备注 16） |
 
 ### 验收标准
 
@@ -638,6 +638,20 @@ tar czf - -C /workspace .
 13. **git 一律带 `--no-pager`（并用 `--no-color` / `--no-ext-diff`）**：分页器、颜色、外部 diff 都可能被宿主或仓库配置打开，任何一个都能把 patch 污染成导不回去的样子。
 14. **用例 4 的断言多了一层**：除了 `patch_log_path` 可读，还断言这份 patch 与直接跑 `git diff --binary <base>` **逐字节一致**（不是只看长度）；用例 1 也顺手断言端点返回的 patch 与 git 原生输出相等。
 15. **Phase 3 新增的四个 env**（都进了 `config.ts` 的 `Config`）：`SANDBOX_AGENT_STREAM_TIMEOUT_MS`（300s，正文已有）、`SANDBOX_AGENT_MAX_PATCH_BYTES`（2 MiB，即正文的 `MAX_PATCH_BYTES`）、`SANDBOX_AGENT_MAX_PATCH_SPILL_BYTES`（256 MiB，见备注 4）、`SANDBOX_AGENT_DIFF_ROOT`（默认 `/tmp/reuben-cloud/diff`，“大 patch 外置”的落点）。`DIFF_ROOT` 和写入根一样会被 `loadConfig` 自动塞进读集合——否则 CP 拿到了 `patch_log_path` 也读不回来，那是个荒谬的 404。`SANDBOX_AGENT_MAX_ARCHIVE_BYTES`（4 GiB）是 archive 流出字节的兜底上限，软限制在 CP 侧。
+16. **用例 10/11 的内存断言重写了：不能量 RSS**（Phase 7 的 CI 回来改的）。Phase 3 写的是
+    "RSS 增量 < 50 MiB"，在 macOS 上一路绿，Linux CI 上第一次真跑就红了——`packages/sandbox-agent/test/files.test.ts`
+    的上传用例 53.6 MiB、`archive.test.ts` 的归档用例 61.3 MiB。RSS 里包含 glibc 没还给操作系统的
+    空闲 arena、V8 堆碎片与 socket 队列，**它量的是分配器，不是流式处理**：同一台 Linux 机器上
+    反复跑同一条用例，RSS 增量在 15–61 MiB 之间抖（而真流式实现在 `arrayBuffers` 上只有个位数 MiB）。
+    改法三件事：
+    - 断言改成 **`arrayBuffers`**（Node 逐字节记账的 Buffer/ArrayBuffer 内存——"攒下整个载荷"的实现
+      会在这里涨 ≥100%）+ `heapUsed` 兜"用字符串攒"的写法；**RSS 降级成打印**，排障时仍然看得见。
+    - 门槛从固定 50 MiB 改成 **传输量的一半**：实测噪声 ≤36 MiB（arrayBuffers）/ ≤61 MiB（RSS），
+      信号 ≥100%，一半正好落在两者中间，两边都不贴边（256 MiB 的实例：噪声 ≤36，线 128，信号 256）。
+    - 归档用例的客户端从 `fetch` 换成 `http.request` + 同步 `data` 处理器直接丢字节：被测 agent
+      就跑在同一个进程里，undici 的 ReadableStream 会跟它抢事件循环、攒下 40–54 MiB 的排队块。
+      换完之后同一条用例的 `arrayBuffers` 峰值降到 0–58 MiB（Linux 全量套件并发跑）。
+    这两条用例的**牙齿没变**：它们拦的回归（把整个归档 / 请求体攒进内存）在两个指标上都是 ≥100%。
 
 ---
 ---
@@ -1233,11 +1247,14 @@ CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**
 
 ### 验收标准
 
-- [x] CI 上 `npm run smoke` 全绿 —— 第一次跑（`8a20b2a`）**两个 job 都在 10 秒内红了**：
-      `npm ci` 直接 `EUSAGE`——`package-lock.json` 从 Phase 5 起就没同步过（`control-plane` 也不在里面），
-      而之前的 Phase 从没在 CI 里跑过 `npm ci`（见实现备注 16）。修完 lockfile 后本地 `npm ci` 复现通过；
-      本地另已验过：macOS 全量 26/26（含 `SMOKE_ANY_PLATFORM=1` 的红线）、`tsc --noEmit`、
-      Phase 5/6 集成测试 24/24
+- [x] CI 上 `npm run smoke` 全绿 —— 前三轮的真实经历（每一轮都抓到真的东西）：
+      ① 第一次跑（`8a20b2a`）两个 job 都在 10 秒内红：`npm ci` 直接 `EUSAGE`——
+      `package-lock.json` 从 Phase 5 起就没同步过（实现备注 16）；
+      ② 修完 lockfile 之后 `smoke` job 又在 `npm run smoke` 之前的那步 `npm test` 上红了：
+      Phase 3 两条内存断言量的是 RSS，在 Linux 上必然输（实现备注 17）；
+      ③ 修完内存断言后本地把整个 Linux 路径搬进容器重跑了一遍：`npm run smoke` **26/26 全绿**
+      （含 I1–I10 红线在 Linux 语义下的首跑）、`npm test` 101+56 连跑 3 次全绿。
+      本地另已验：macOS 全量 26/26、`tsc --noEmit`、Phase 5/6 集成测试 24/24
 - [x] **反向验证 job 红了**（证明脚本有牙齿）—— 本地用 `SMOKE_ANY_PLATFORM=1 SMOKE_NEGATIVE_CONTROL=1` 跑 `--tag=isolation`：
       10 条里**只有 I10 变红**，且断言消息里含 `CapDrop`（CI 的 job 断言的就是这两件事）
 - [x] 手工把 `CapDrop` 去掉再跑一次，本地也变红 —— 同上一行（同一套机制；CI 里由 negative-control job 每次自动做）
@@ -1329,6 +1346,14 @@ CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**
     顺带两件事：（a）冒烟 job 里加了一步 `npm run typecheck` + `npm test`（几秒钟、不需要 Docker），
     这类"提交前就该知道"的失败不必等镜像构建完；（b）actions 从 `@v4` 升到 `@v5`——v4 的运行时是
     Node 20，GitHub 已经拿 Node 24 强行跑它并打弃用警告（annotations 里能看到）。
+17. **CI 第二轮又抛出一条：Phase 3 的两条内存断言在 Linux 上必输。** 修完 lockfile 之后
+    `smoke` job 红在 `npm test`（那条快速检查的步骤）上：`files.test.ts` 的上传用例实测 RSS 增量
+    53.6 MiB、`archive.test.ts` 的归档用例 61.3 MiB，都超过了 Phase 3 写的 50 MiB——而 macOS 上一路绿。
+    根因是 RSS 包含 glibc 没还给操作系统的空闲 arena（Linux 比 macOS 的 malloc 保守得多），
+    量的不是"有没有流式处理"。改法与实测数据记在 **Phase 3 实现备注 16**（断言改成 `arrayBuffers`，
+    门槛改成传输量的一半，归档用例的客户端从 `fetch` 换成 `http.request`）。
+    教训值得单独写一行：**这两条用例在 CI 上从未跑过**——Phase 3 到 Phase 6 的验收全是本机 macOS 跑的，
+    而"本机能过"与"Linux 上能过"在这两件事上真的不一样（allocator 行为 + 同进程 client/server 的排队）。
 
 ---
 ---

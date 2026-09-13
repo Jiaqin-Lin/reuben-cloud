@@ -275,16 +275,25 @@ test("补充: raw=1 流式读 —— 不受 1 MiB 上限，也不做 base64 膨�
 
 // ---------------------------------------------------------------- 10–11：流式与中断
 
-test("10: 256 MiB 上传期间 RSS 增量 < 50 MiB（证明确实在流式）", async () => {
+test("10: 256 MiB 上传期间不把 body 攒进内存（arrayBuffers 增量 < 64 MiB）", async () => {
   const total = 256 * MIB;
   // 复用同一个 1 MiB buffer：客户端自己也不要在内存里攒 256 MiB
-  const chunk = Buffer.alloc(MIB, 0x42);
+  const chunk = Buffer.alloc(MIB/16, 0x42);
   const target = inRoot("streaming/large.tar");
 
-  const baseline = process.memoryUsage().rss;
-  let peak = baseline;
+  // 【量什么，为什么不量 RSS】与 archive 用例 11 同一条理由：要拦的回归是"把整个 body 攒进
+  // 内存"（那种写法 arrayBuffers 涨 ≥256 MiB），而 RSS 会被 glibc 的空闲 arena 顶高几十 MiB
+  // （实测 15–61 MiB 的抖动，Phase 3 那个 50 MiB 的 RSS 阈值在 Linux 上偶发变红）。
+  // RSS 仍然打印，因为排障时它有用。
+  const before = process.memoryUsage();
+  let peakArrayBuffers = before.arrayBuffers;
+  let peakHeapUsed = before.heapUsed;
+  let peakRss = before.rss;
   const sampler = setInterval(() => {
-    peak = Math.max(peak, process.memoryUsage().rss);
+    const now = process.memoryUsage();
+    peakArrayBuffers = Math.max(peakArrayBuffers, now.arrayBuffers);
+    peakHeapUsed = Math.max(peakHeapUsed, now.heapUsed);
+    peakRss = Math.max(peakRss, now.rss);
   }, 20);
 
   try {
@@ -296,11 +305,27 @@ test("10: 256 MiB 上传期间 RSS 增量 < 50 MiB（证明确实在流式）", 
     clearInterval(sampler);
   }
 
-  const delta = peak - baseline;
+  const arrayBuffersDelta = peakArrayBuffers - before.arrayBuffers;
+  const heapDelta = peakHeapUsed - before.heapUsed;
+  const rssDelta = peakRss - before.rss;
+  const report =
+    `arrayBuffers=${(arrayBuffersDelta / MIB).toFixed(1)}MiB ` +
+    `heapUsed=${(heapDelta / MIB).toFixed(1)}MiB ` +
+    `rss=${(rssDelta / MIB).toFixed(1)}MiB（上传 256 MiB）`;
+
+  // 门槛 = 上传体积的一半（与 archive 用例 11 同一条规则）：
+  // "攒下整个 body"的实现必然 ≥100%（这条用例要拦的就是它），真流式的实现实测 ≤21 MiB。
+  // 一半落在两者之间，两边都不贴边。
+  const limit = total / 2;
   assert.ok(
-    delta < 50 * MIB,
-    `RSS 增量 ${(delta / MIB).toFixed(1)} MiB，超过 50 MiB —— 上传没有流式处理`,
+    arrayBuffersDelta < limit,
+    `ArrayBuffers 增量 ${(arrayBuffersDelta / MIB).toFixed(1)} MiB ≥ 上传量的一半：上传没有流式处理（${report}）`,
   );
+  assert.ok(
+    heapDelta < limit,
+    `堆增量 ${(heapDelta / MIB).toFixed(1)} MiB ≥ 上传量的一半：请求体被（用字符串之类）攒进了内存（${report}）`,
+  );
+  console.log(`    上传内存：${report}`);
 
   await rm(target, { force: true }); // 别把 256 MiB 留到测试结束
 });
