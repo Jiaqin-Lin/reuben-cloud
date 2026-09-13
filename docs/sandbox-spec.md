@@ -1212,8 +1212,10 @@ npm run smoke -- --list          # 只列出会跑的文件
 actions 用 `actions/checkout@v5` / `actions/setup-node@v5`：v4 的运行时是 Node 20，GitHub 已经在用
 Node 24 强行跑它并打弃用警告（第一次跑 CI 时就看到了，见实现备注 16）。
 
-两个 job 都带一个 `if: failure()` 的诊断步骤（`docker ps -a` + 代理与各沙箱的 `docker logs`），
-因为冒烟失败时第一件要做的事永远是"先看容器"。触发条件是 `pull_request` + **push 到 main** +
+两个 job 都带一个 `if: failure()` 的诊断步骤：它把 `docker ps -a`、代理与各沙箱的 `docker logs`
+打出来，并且**把挂掉的用例名变成 `::error::` annotation**（`tests` 与冒烟的输出各自 tee 到文件再 grep）——
+GitHub 的 annotations 框里默认只显示 job 名，"哪一条用例挂了"才是第一眼要看到的东西，
+而 CI 失败的第一轮往往只能拿到一张截图。触发条件是 `pull_request` + **push 到 main** +
 `workflow_dispatch`：push 到 main 是为了让仓库第一次推送/每次合并都能看到完整结果（实现备注 15），
 `workflow_dispatch` 是红线出问题时的手工复跑（不必为了跑一次 CI 推一个空 commit）。
 

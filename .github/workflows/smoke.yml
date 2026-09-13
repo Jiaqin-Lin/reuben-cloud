@@ -47,10 +47,13 @@ jobs:
 
       # 几秒钟就能跑完的那两类检查，放在最前面：类型与单元测试一旦挂了，
       # 没必要先花几分钟建镜像才知道。它们不需要 Docker、不需要网络。
+      # 输出 tee 到文件：失败时下面那个诊断步骤会把**挂掉的用例名**变成 annotation
+      # （GitHub 的 annotations 框里默认只有 job 名，"哪一条用例挂了"才是一眼要看的东西）。
       - name: 快速检查（类型 + 单元测试，不需要 Docker）
         run: |
+          set -o pipefail
           npm run typecheck
-          npm test
+          npm test 2>&1 | tee /tmp/unit.log
 
       - name: 构建沙箱镜像与出网代理镜像
         run: |
@@ -68,11 +71,25 @@ jobs:
       # 这一条是 CI 里唯一允许跑的冒烟命令：不带 --tag，即全部标签、无任何跳过。
       # （`npm run smoke` 自己也会幂等地把代理 ensureRunning 起来，上面那一步是显式的记录。）
       - name: 冒烟（全部）
-        run: npm run smoke
+        run: |
+          set +e
+          npm run smoke 2>&1 | tee /tmp/smoke.log
+          exit ${PIPESTATUS[0]}
 
       - name: 失败时收集诊断信息
         if: failure()
         run: |
+          # 挂掉的用例名 → annotation。annotations 框里默认只有 job 名，
+          # 而"哪一条用例挂了"才是第一眼要看到的（截图/粘贴也就说得清）。
+          for log in /tmp/unit.log /tmp/smoke.log; do
+            if [ -f "$log" ]; then
+              echo "===== $log 里失败的用例 ====="
+              grep -E "^[[:space:]]*(✖|not ok)" "$log" | head -20 | while IFS= read -r line; do
+                echo "::error::$line"
+              done
+            fi
+          done
+
           docker ps -a
           docker network inspect reuben-cloud-internal || true
           docker logs reuben-cloud-proxy --tail 200 || true
@@ -80,6 +97,8 @@ jobs:
             echo "===== docker logs $container ====="
             docker logs "$container" --tail 100 || true
           done
+          echo "===== 冒烟日志尾部 ====="
+          tail -80 /tmp/smoke.log 2>/dev/null || true
 
   negative-control:
     name: 反向验证（拿掉 CapDrop，红线必须变红）
