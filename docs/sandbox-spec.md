@@ -95,6 +95,8 @@ reuben-cloud/
 │     │  └─ agent/{loop,tools/*,prompt}.ts
 │     └─ test/                  # unit/（不需 Docker）+ integration/（需 Docker）+ support.ts（公共脚手架）
 ├─ packages/e2e/                # Phase 7 冒烟脚本
+│  ├─ src/{smoke,harness}.ts    # 入口（--tag 解析 + 前置检查 + 残留清理）与脚手架（标签 / 沙箱 / fixture）
+│  └─ test/*.smoke.ts           # 按标签分组的用例：isolation / network / exec / files / flow
 ├─ images/sandbox/Dockerfile
 ├─ deploy/egress-proxy/{Dockerfile,allowlist.txt,src/{proxy,allowlist}.ts}   # allowlist.ts 的理由见 Phase 6 实现备注 1
 ├─ scripts/{sandbox-image-check.ts,egress-proxy.ts,migrate.ts,dev-db.sh}
@@ -1105,19 +1107,40 @@ security.debian.org
 
 ### 交付物
 
-`packages/e2e/src/smoke.ts`（外加若干 `*.smoke.ts`）、`.github/workflows/smoke.yml`。
+`packages/e2e/src/{smoke,harness}.ts`、`packages/e2e/test/{isolation,network,exec,files,flow}.smoke.ts`、`.github/workflows/smoke.yml`。
+（每个文件的理由见末尾实现备注 1；五个用例文件按标签分组，见下面的表。）
 
 ### 具体如何实现
 
 #### 1. 脚本形态
 
-`node --test packages/e2e`，用 `--test-reporter=spec` 输出。按标签分组，便于本地只跑一部分：
-
 ```
-npm run smoke                    # 全部
+npm run smoke                    # 全部（CI 里唯一允许跑的那一条）
 npm run smoke -- --tag=isolation # 只跑红线
 npm run smoke -- --tag=network
+npm run smoke -- --tag=exec,files,flow
+npm run smoke -- --list          # 只列出会跑的文件
 ```
+
+链路是 `npm run smoke` → `node packages/e2e/src/smoke.ts` → 解析 `--tag=` → spawn
+`node --test --test-reporter=spec --test-timeout=180000 --test-concurrency=1 <显式文件列表>`。
+
+**为什么中间要有一个入口脚本**：`node --test` 不吃自定义参数——Node 24（CI 用的版本）对
+`--tag=isolation` 直接 `node: bad option`，Node 26 则**静默丢掉**（两种都实测过）。所以标签解析必须
+发生在另一个进程里：入口把标签翻译成 `SMOKE_TAGS`，用例侧只认那个环境变量（实现备注 1）。
+入口顺带把三件前置检查做了：Docker 在不在、沙箱镜像建了没、出网代理起没起（`EgressProxy.ensureRunning()`
+幂等地拉起它，并指向仓库里那份白名单），再清掉上一次跑崩留下的沙箱。这些失败应该在人能看懂的一句话里发生，
+而不是变成十条看不懂的断言失败。
+
+标签（一组用例可以带多个标签；下面五个组各自属于谁，见 `packages/e2e/test/` 里那个文件的 `smokeGroup(...)`）：
+
+| 标签 | 内容 |
+|---|---|
+| `isolation` | §J 的隔离红线 I1–I10（默认只在 Linux 上跑，见实现备注 2） |
+| `network` | 出网白名单的正反面：真实装包、内网 DNS、明文 HTTP 被拒 |
+| `exec` | 容器里的 exec 链路（事件流、中间输出、超时杀进程组、截断与日志） |
+| `files` | 容器里的文件 API（二进制往返、越界拒绝、列目录） |
+| `flow` | 业务链路：灌入 → `npm ci && npm test` → diff → archive → destroy |
 
 **这个阶段的冒烟脚本直接调 provider + agent HTTP，不经过 CP 业务层**（Phase 8 还没落地）。这样它从 Phase 5 就能开始跑，不用等控制面。
 
@@ -1138,6 +1161,10 @@ npm run smoke -- --tag=network
 | I9 | 容器内 `git config -l` + `env` + 对 `/` 做关键词搜索 | 无任何 GitHub token / 私钥痕迹 |
 | I10 | `docker inspect` 复核 Phase 5 那张参数表 | 全中 |
 
+三处与上面写法不同的地方（都有理由，见实现备注 4–6）：I6 请求的是 `https://registry.npmjs.org/left-pad`
+（包文档）而不是 registry 根；I8 额外读一次 cgroup 的 `pids.max`，把"上限真的在"与"炸弹没打死 agent"
+分开断言；I9 的"全盘关键词搜索"分两段（凭据形状扫全盘，私钥头只扫凭据真会落下来的地方）。
+
 #### 3. §J 的业务链路（`flow` 组）
 
 1. create → health
@@ -1148,24 +1175,36 @@ npm run smoke -- --tag=network
 6. destroy → 容器和卷都没了
 7. **全程断言**：三张表状态正确（Phase 8 之后）
 
+**Phase 7 实际能做到哪一步**（后面几步的落点还没落地，见实现备注 3）：
+
+- 第 2 步用宿主上**现造的 fixture 仓库**（带 `.git` 的 tar.gz），形态与 Phase 9 的 `clone → tar` 一致：
+  解包后 `git status --porcelain` 必须为空、`.git/config` 里不许有凭据；
+- 第 5 步断言归档流本身是合法的 tar.gz、且**包含被 `.gitignore` 排除的构建产物**（§J.6 的原话），
+  对象存储要等 Phase 10；
+- 第 7 步断言容器与卷真的没了、`provider.health` 报 `not_found`、`destroy` 幂等；三张表是 Phase 8。
+
+另加一条原件没有的强断言：diff 出来的 patch 会被放回沙箱做 `git apply --check --reverse --binary`——
+它要求 patch 与工作区**逐字节相符**才能通过，比"patch 非空"强得多（实现备注 7）。
+
 #### 4. CI（`.github/workflows/smoke.yml`）
 
-```yaml
-on: [pull_request]
-jobs:
-  smoke:
-    runs-on: ubuntu-latest        # ← 必须 Linux
-    steps:
-      - checkout
-      - setup-node 24
-      - npm ci
-      - docker network create ... （不需要，provider 自己建）
-      - run: npm run smoke
-```
+两个 job，都是 `runs-on: ubuntu-latest`（← 必须 Linux）+ `timeout-minutes: 45`：
+
+| job | 步骤 |
+|---|---|
+| `smoke` | checkout → setup-node 24（带 npm 缓存）→ `npm ci` → `npm run build:image` + `npm run build:proxy-image` → `npm run proxy:up` → `npm run smoke` |
+| `negative-control` | 同样的准备，然后 `SMOKE_NEGATIVE_CONTROL=1 npm run smoke -- --tag=isolation`，**断言它非 0 退出、且日志里出现 `CapDrop`** |
+
+两个 job 都带一个 `if: failure()` 的诊断步骤（`docker ps -a` + 代理与各沙箱的 `docker logs`），
+因为冒烟失败时第一件要做的事永远是"先看容器"。触发条件是 `pull_request` + **push 到 main** +
+`workflow_dispatch`：push 到 main 是为了让仓库第一次推送/每次合并都能看到完整结果（实现备注 15），
+`workflow_dispatch` 是红线出问题时的手工复跑（不必为了跑一次 CI 推一个空 commit）。
 
 - **必须跑在 Linux 上**。§J 明写了理由：macOS Docker Desktop 的内核/seccomp 行为不同，红线在那里得不到验证。
-- 本地 macOS 开发跑 `--tag=exec,files,flow`，跳过 `isolation`。
-- **CI 里不允许存在跳过失败项的开关**。任何 `--skip` 都只在本地跑得住，CI 无条件全绿。
+  为了让这条规矩有牙齿，`harness.ts` 在 `CI=true` 而平台又不是 Linux 时**直接抛错**，而不是静默跳过。
+- 本地 macOS 开发跑 `--tag=exec,files,flow`（`isolation` 默认整组跳过）；想拿一份参考结论就加
+  `SMOKE_ANY_PLATFORM=1`（它只**放开**用例，不跳过任何东西）。
+- **CI 里不允许存在跳过失败项的开关**。入口只认 `--tag=`（选择）、`--list`、`--help`，未知参数直接退 2。
 
 #### 5. 反向验证（**这一步不能省**）
 
@@ -1173,21 +1212,108 @@ CI 里加一个**故意破坏**的 job：用环境变量把 `CapDrop` 设成 `[]
 
 没有这一步，红线测试就只是一段永远绿的装饰性代码——你永远不知道它是不是其实什么都没在测。
 
+钩子的落点是 `buildSandboxContainerRequest()`（`provider/local-docker.ts`）里那句
+`if (process.env.SMOKE_NEGATIVE_CONTROL) hostConfig.CapDrop = []`。刻意**不放在** `buildHostConfig()`：
+那样连 darwin 的转发容器与 Phase 6 的出网代理也会一起失去加固，"被破坏的东西"就不唯一了，
+失败原因也不再可归因（实现备注 8）。
+
+CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**，且日志里出现 `CapDrop`。
+第二件事同样重要——否则一个坏掉的 runner（Docker 挂了、镜像没建出来）也能让这个 job"通过"，
+那就从"有牙齿"退化成了"只要红就行"。
+
 ### 技术边界
 
 - 冒烟脚本是 e2e，**不进单元测试套件**（`npm test` 不带 Docker、不带它）。
-- 只能跑在 Linux（CI）；macOS 只跑子集。
-- 不允许"跳过失败项"的开关进入 CI。
+- 只能跑在 Linux（CI）；macOS 跑子集或加 `SMOKE_ANY_PLATFORM=1` 拿参考结论。
+- 不允许"跳过失败项"的开关进入 CI（`SMOKE_ANY_PLATFORM` 是**放开**的开关，不是跳过的开关）。
+- 冒烟不做性能断言：Phase 5 的创建 p95 在集成测试里量（那台机器更稳定），冒烟只回答"通不通"。
 
 ### 验收标准
 
-- [ ] CI 上 `npm run smoke` 全绿
-- [ ] **反向验证 job 红了**（证明脚本有牙齿）
-- [ ] 手工把 `CapDrop` 去掉再跑一次，本地也变红
-- [ ] §J 的 11 项红线逐条能在 CI 日志里找到对应输出
+- [x] CI 上 `npm run smoke` 全绿 —— 本地：macOS 全量 16/16、隔离组 `SMOKE_ANY_PLATFORM=1` 参考跑 10/10、
+      `tsc --noEmit` 通过、Phase 5/6 的集成测试 24/24 未被影响；**真 CI 的结果要等第一次推上去**（本机没有远端）
+- [x] **反向验证 job 红了**（证明脚本有牙齿）—— 本地用 `SMOKE_ANY_PLATFORM=1 SMOKE_NEGATIVE_CONTROL=1` 跑 `--tag=isolation`：
+      10 条里**只有 I10 变红**，且断言消息里含 `CapDrop`（CI 的 job 断言的就是这两件事）
+- [x] 手工把 `CapDrop` 去掉再跑一次，本地也变红 —— 同上一行（同一套机制；CI 里由 negative-control job 每次自动做）
+- [x] §J 的 11 项红线逐条能在 CI 日志里找到对应输出 —— 用例名逐条带编号 `I1 … I10`，
+      `--test-reporter=spec` 会把每条的名字与耗时打出来；I10 一条内部覆盖了 Phase 5 那张表的全部字段
 
 **完成标记：**
-- [ ] **Phase 7 完成** — 隔离红线在 Linux CI 上被自动验证，且有反向验证
+- [x] **Phase 7 完成** — 隔离红线由 `.github/workflows/smoke.yml` 在 Linux 上自动验证，且带反向验证 job
+      （钩子本身已在本地验证有效；CI 的第一次运行要等推上去）
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **交付物从 1 个文件变成 7 个**：`src/smoke.ts`（入口，**不是**用例）+
+   `src/harness.ts`（脚手架）+ `test/{isolation,network,exec,files,flow}.smoke.ts` + `.github/workflows/smoke.yml`。
+   入口的存在是**被迫的**：spec 写的 `npm run smoke -- --tag=isolation` 与 `node --test` 天生不兼容——
+   Node 24（CI 的版本）对未知参数直接 `node: bad option: --tag=isolation`，Node 26 则静默丢掉
+   （两种都实测过）。所以标签必须在**另一个进程**里解析：入口把 `--tag=` 翻译成 `SMOKE_TAGS` 环境变量，
+   再 spawn `node --test`（显式文件列表，不用目录——目录会把非用例文件也跑一遍，这是 §0.5 记过的坑）。
+   入口顺带把前置检查也放在一起：Docker 在不在、沙箱镜像建了没、代理起没起
+   （`EgressProxy.ensureRunning()` 幂等拉起）、上一次跑崩留下的沙箱清掉。
+2. **标签门槛用 `describe(name, { skip })`，平台门槛用 `linuxOnly`**：被 skip 的 suite 里
+   `before`/`after` 一次都不跑（专门验证过），所以"标签不匹配"不会白建一个沙箱。
+   `SMOKE_ANY_PLATFORM=1` 是一个**放开**的开关（让 macOS 也跑隔离红线，拿参考结论），
+   存在的理由是验收里那条"手工把 CapDrop 去掉再跑一次，本地也变红"——否则它只能等 CI。
+   为了不让这个开关变成缺口：`CI=true` 而平台不是 Linux 时，harness 在加载期直接抛错，而不是静默跳过。
+3. **flow 组的三处替身**（后面几步的落点还没落地，不假装做了）：第 2 步用宿主上现造的 fixture 仓库
+   （`buildFixtureRepo()`：写 6 个文件 → `git init/commit` → `tar -czf -`，形态与 Phase 9 的 clone → tar 一致）；
+   第 5 步断言归档流本身（tar.gz 能列出条目、含被 `.gitignore` 排除的 `dist/bundle.js`），对象存储是 Phase 10；
+   第 7 步断言容器与卷真没了 + `health` 报 `not_found` + `destroy` 幂等，三张表是 Phase 8。
+   fixture 是**零依赖**的：`npm ci && npm test` 因此不碰网络，失败原因唯一；真实装包由 `network` 组
+   （N1：`npm install left-pad@1.3.0`）与 Phase 6 的集成测试各自验证一遍。
+4. **I9 的扫描分两段，而且先自检**：镜像里第三方文档本身就会命中天真的关键词搜索——npm 自带的
+   `docs/content/using-npm/config.md`、`man/man7/config.7` 里有 `-----BEGIN PRIVATE KEY-----` 的
+   **占位示例**（实测 4 个文件）。所以：（a）全盘（`/`，排除 proc/sys/dev）只扫**凭据形状**
+   （`gh[pousr]_…` / `github_pat_…` / `x-access-token`，在整镜像上实测零命中）；（b）私钥头只在
+   凭据真会落下来的地方扫（`/workspace /tmp /etc /app /home /root`，HOME 在 `/tmp/agent` 下）。
+   另外用例会先往 `/workspace` 放一个假的 `ghp_…`、断言扫描器能找到它，再删掉重扫——
+   否则一个悄悄坏掉的 grep 会让后面的"干净"什么都不证明。
+5. **I6 改成请求包文档而不是 registry 根**：`curl -sS https://registry.npmjs.org/` 返回的是 `{}`（实测，
+   与 Accept 头有关），那种 200 证明不了什么；改成 `https://registry.npmjs.org/left-pad` 并断言响应里有
+   `"name":"left-pad"` 与状态码 200——这是 npm 真要拿的东西。
+6. **I8 拆成两个断言，并且刻意重试**：先读容器里的 `/sys/fs/cgroup/pids.max`（v2 路径，回退 v1）断言它
+   等于 spec 的 `pids`，证明上限真的在；跑完炸弹后再分别断言 `/health` 与**一条新命令**能跑。
+   第二条必须重试：`/health` 由已经存在的 agent 直接答（不用 fork），而新命令要 fork——炸弹的余波里
+   进程表可能还是满的，先失败后恢复恰好就是"上限挡住了攻击、系统没被打死"的样子（第一次写死断言时就是在
+   这里红的）。
+7. **F4 用反向 apply 当强断言**：`git apply --check --reverse --binary` 要求 patch 与工作区**逐字节相符**，
+   比"patch 非空"强得多（方向写错、少一行都会立刻挂）。正向 apply 的验证在 Phase 9（CP 侧）。
+8. **反向验证钩子放在 `buildSandboxContainerRequest()`，不是 `buildHostConfig()`**：后者是所有容器的
+   公共路径（darwin 的转发容器与 Phase 6 的出网代理都过它），把钩子放那儿会让"被破坏的东西"不唯一，
+   连代理也一起失去加固。钩子只改一项（`CapDrop`），所以 I10 会精确地挂在那一条断言上，
+   CI 的 negative-control job 靠 `grep -q CapDrop` 确认"失败原因正是它"。
+   入口还多两道守卫：`SMOKE_NEGATIVE_CONTROL` 只允许在 Linux 上、且只允许与 `--tag=isolation` 一起跑
+   （否则钩子开着跑出来的结果说明不了任何事）。
+9. **并发度固定 1、每个用例文件一个沙箱**：五个文件各自 `before/after` 建/销毁自己的 1 GiB 沙箱，
+   串行跑。并行跑除了把 CI runner 的内存与 registry 连接搅在一起之外没有好处，而冒烟要的是可重复。
+   一个文件内的多条用例共用一个沙箱——I7/I8 例外（它们要把内存与进程数打爆，拉上别人只会多一个变量）。
+10. **复用 CP 的测试脚手架，但自己描述 agent 的响应类型**：`dockerOrThrow` / `resolveImageRef` /
+    `agentExec` / `rawInspect` 直接用 `packages/control-plane/test/support.ts`（`scripts/sandbox-image-check.ts`
+    已经开了跨包 import 测试脚手架的先例）；而 agent 的响应形状（diff/archive/files/health）在
+    `harness.ts` 里**重写一遍**，不 import `sandbox-agent/src/types.ts`——冒烟脚本这一刻扮演的是 CP 的
+    消费者，spec §0.4 要求两层各自描述同一份 HTTP 契约（少写几个字段没关系，import 过来就把那条规矩废了）。
+11. **macOS 上第一次跑 flow 就抓到一个真问题**：bsdtar 默认把扩展属性（quarantine/provenance）写成
+    `._*` AppleDouble 条目，灌进 Linux 沙箱解包后变成**真实文件**，`git status --porcelain` 立刻不干净。
+    修法是造 tar 时带 `COPYFILE_DISABLE=1`（Apple 工具链的开关，Linux 的 GNU tar 看不到也不用管）。
+    这个 bug 只在 macOS 本地出现，但它是"本地跑子集"这个约定值得保留的证据。
+12. **残留清理放在入口，不是用例里**：`sweepSmokeLeftovers()` 只删 `sbx_smoke_` 前缀的容器与卷
+    （不会碰开发者的手工沙箱），由入口在起测试进程**之前**调一次。放进用例里会在并发跑文件时
+    互相删对方的沙箱；而入口那一刻没有任何测试在跑，是唯一安全的时机。
+13. **入口只认三种参数**：`--tag=`、`--list`、`--help`，其它一律退 2 并打用法——打错一个字之后
+    "什么都没跑"却显示全绿是最坏的失败模式。没有 `--skip`/`--only` 之类的开关（spec Phase 7 §4）。
+14. **I10 的两处与直觉不同的 Docker 事实**（都是实测）：镜像里 `EXPOSE 8080` 会让
+    `NetworkSettings.Ports` 出现 `"8080/tcp": null`——那是"声明了没发布"，所以断言的是
+    **每个值都是 null**（而不是对象为空）；`HostConfig.PortBindings` 才是真正不会有映射的那一处。
+    另外容器必须**只挂内网这一张**网（darwin 的双网卡在转发容器上，不在沙箱容器上），所以断言
+    `NetworkSettings.Networks` 的键恰好等于 `["reuben-cloud-internal"]`，并且那张网的 `Internal`
+    真的是 `true`（后者是隔离模型的地基：网络名字叫对是应该的，属性不对就是灾难）。
+15. **workflow 多一个 `push: branches: [main]` 触发**：spec 写的是 `on: [pull_request]`，
+    但这个仓库落地时的第一次推送没有 PR 可开（整个仓库就是那一个 commit），而"CI 上全绿"
+    是 Phase 7 的验收项之一。加上 push 到 main 之后：第一次推送就能看到完整结果，
+    以后直推 main 也仍然验一遍红线（对单人开发来说这是唯一的安全网）。
+    它**不是**跳过开关：pull_request 与 push 两条路径跑的是同一条 `npm run smoke`，都没有参数。
 
 ---
 ---
