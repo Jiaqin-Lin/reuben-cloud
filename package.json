@@ -15,6 +15,7 @@
     "build:image": "docker build -f images/sandbox/Dockerfile -t reuben-cloud/sandbox-base:dev .",
     "build:proxy-image": "docker build -f deploy/egress-proxy/Dockerfile -t reuben-cloud/egress-proxy:dev .",
     "check:image": "node scripts/sandbox-image-check.ts",
+    "smoke": "node packages/e2e/src/smoke.ts",
     "proxy:up": "node scripts/egress-proxy.ts up",
     "proxy:down": "node scripts/egress-proxy.ts down",
     "proxy:status": "node scripts/egress-proxy.ts status"

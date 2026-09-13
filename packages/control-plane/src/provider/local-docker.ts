@@ -349,20 +349,38 @@ export function buildSandboxContainerRequest(input: {
   proxyUrl: string;
 }): DockerCreateContainerRequest {
   const { spec } = input;
+  const hostConfig = buildHostConfig({
+    networkName: input.networkName,
+    memoryMb: spec.limits.memMb,
+    nanoCpus: Math.round(spec.limits.cpu * 1_000_000_000),
+    pids: spec.limits.pids,
+    binds: [`${input.volumeName}:/workspace`],
+    tmpfsMb: SANDBOX_TMPFS_MB,
+  });
+
+  // ---------------------------------------------------------------- 反向验证钩子（Phase 7）
+  //
+  // 隔离红线测试最容易变成一段永远绿的装饰性代码：没人知道它到底在测什么。所以
+  // Phase 7 的 CI 里有一个 job **故意**把这里打开，然后断言 `--tag=isolation` 必须变红。
+  //
+  // 几条自我约束：
+  //  - 普通路径上这个 env 永远不存在，所以这行代码跑不到（`grep SMOKE_NEGATIVE_CONTROL`
+  //    一眼能看出它是个测试钩子，不是一个隐藏配置）。
+  //  - 钩子只落在**沙箱容器**上：`buildHostConfig` 本身没被动，所以 darwin 的转发容器
+  //    与 Phase 6 的出网代理都不会因此失去加固——被破坏的正是"沙箱被加固了吗"这一条。
+  //  - 只破坏一项（CapDrop），失败原因才唯一：I10 的 `docker inspect` 复核会精确地
+  //    在 CapDrop 那一行断言失败，CI 的反向验证 job 靠这个字符串确认"失败原因是它"。
+  if (process.env.SMOKE_NEGATIVE_CONTROL) {
+    hostConfig.CapDrop = [];
+  }
+
   return {
     Image: spec.image,
     User: "1000:1000",
     WorkingDir: "/workspace",
     Env: buildContainerEnv(spec.env, input.token, input.proxyUrl),
     Labels: buildLabels(spec, "sandbox"),
-    HostConfig: buildHostConfig({
-      networkName: input.networkName,
-      memoryMb: spec.limits.memMb,
-      nanoCpus: Math.round(spec.limits.cpu * 1_000_000_000),
-      pids: spec.limits.pids,
-      binds: [`${input.volumeName}:/workspace`],
-      tmpfsMb: SANDBOX_TMPFS_MB,
-    }),
+    HostConfig: hostConfig,
   };
 }
 

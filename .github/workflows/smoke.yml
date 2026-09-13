@@ -1,0 +1,129 @@
+# Phase 7 · 冒烟与隔离红线（spec `docs/sandbox-spec.md` 的 Phase 7）
+#
+# 【为什么这个文件必须存在，而且必须跑在 Linux 上】§J 末尾那句话是这个 workflow 的
+# 唯一理由："macOS 的 Docker Desktop 使用不同的内核和 seccomp 行为，本机通过不代表生产通过。"
+# 本地跑冒烟是开发者的便利，**红线只有在 Linux 内核上跑出来的绿才算数**。
+#
+# 【两个 job，第二个是"有牙齿"的证据】
+#   smoke            正常跑全套。CI 里**没有任何跳过失败项的开关**——spec Phase 7 §4 的硬要求。
+#   negative-control 故意把 `CapDrop` 清空（`SMOKE_NEGATIVE_CONTROL=1`，钩子在
+#                    provider/local-docker.ts 的 buildSandboxContainerRequest 里，一眼可见），
+#                    再跑 `--tag=isolation`，然后**断言它必须失败**，且失败原因正是 CapDrop。
+# 少了第二个 job，第一个 job 就只是一段永远绿的装饰性代码——你永远不知道它是不是其实
+# 什么都没在测（这一句也是 spec 的原话）。
+#
+# 【触发条件】pull_request（每个 PR 都跑）+ push 到 main（合并/直推之后仍然验一遍，
+# 也是这个仓库第一次推送就能看到结果的原因）+ workflow_dispatch（要单独复跑一遍时用，
+# 不必为了跑一次 CI 推一个空 commit）。
+
+name: smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一个分支上新的 push 取消上一次没跑完的冒烟：镜像构建几分钟，没必要排队浪费时间。
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: 冒烟（Linux · 全部标签）
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建沙箱镜像与出网代理镜像
+        run: |
+          npm run build:image
+          npm run build:proxy-image
+
+      - name: 记录镜像 digest（排障时要能对上"跑的到底是哪个镜像"）
+        run: |
+          docker image inspect --format 'sandbox-base: {{.Id}}' reuben-cloud/sandbox-base:dev
+          docker image inspect --format 'egress-proxy: {{.Id}}' reuben-cloud/egress-proxy:dev
+
+      - name: 起出网代理
+        run: npm run proxy:up
+
+      # 这一条是 CI 里唯一允许跑的冒烟命令：不带 --tag，即全部标签、无任何跳过。
+      # （`npm run smoke` 自己也会幂等地把代理 ensureRunning 起来，上面那一步是显式的记录。）
+      - name: 冒烟（全部）
+        run: npm run smoke
+
+      - name: 失败时收集诊断信息
+        if: failure()
+        run: |
+          docker ps -a
+          docker network inspect reuben-cloud-internal || true
+          docker logs reuben-cloud-proxy --tail 200 || true
+          for container in $(docker ps -a --filter 'label=reuben-cloud.managed=true' --format '{{.Names}}'); do
+            echo "===== docker logs $container ====="
+            docker logs "$container" --tail 100 || true
+          done
+
+  negative-control:
+    name: 反向验证（拿掉 CapDrop，红线必须变红）
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建沙箱镜像与出网代理镜像
+        run: |
+          npm run build:image
+          npm run build:proxy-image
+
+      - name: 起出网代理
+        run: npm run proxy:up
+
+      - name: 故意破坏 CapDrop → --tag=isolation 必须失败
+        env:
+          SMOKE_NEGATIVE_CONTROL: "1"
+        run: |
+          set +e
+          npm run smoke -- --tag=isolation 2>&1 | tee /tmp/negative-control.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "::error::红线没有牙齿：把 CapDrop 清空之后 --tag=isolation 仍然全绿。"
+            echo "::error::去 packages/e2e/test/isolation.smoke.ts 的 I10 看看那条断言是不是被改坏了。"
+            exit 1
+          fi
+
+          # 失败必须是**我们故意的那个原因**。否则一个坏掉的 runner（Docker 挂了、镜像没建出来）
+          # 也会让这个 job"通过"，那就从"有牙齿"退化成了"只要红就行"。
+          if ! grep -q "CapDrop" /tmp/negative-control.log; then
+            echo "::error::isolation 确实失败了，但失败原因不是 CapDrop 那条断言——见上面日志，"
+            echo "::error::先确认不是环境问题（Docker daemon / 镜像 / 代理）。"
+            exit 1
+          fi
+
+          echo "反向验证通过：拿掉 CapDrop 之后红线变红，且失败原因正是 CapDrop。"
+
+      - name: 反向验证失败时收集诊断信息
+        if: failure()
+        run: |
+          docker ps -a || true
+          cat /tmp/negative-control.log 2>/dev/null | tail -200 || true

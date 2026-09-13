@@ -1,0 +1,9 @@
+{
+  "name": "@reuben-cloud/e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "node src/smoke.ts",
+    "typecheck": "tsc --noEmit"
+  }
+}
