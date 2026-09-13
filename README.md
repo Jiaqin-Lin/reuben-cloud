@@ -608,9 +608,10 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 - [x] 沙箱镜像：多语言运行时 + git + 非 root 用户
 - [x] `LocalDockerProvider`：加固参数 + internal 网络 + named volume（`packages/control-plane/src/provider/`，集成测试 `npm run test:integration`；macOS 上多一个端口转发容器，见 spec Phase 5 实现备注 2）
 - [x] egress-proxy：全局常驻，静态白名单只开依赖源，**不含 github.com**（`deploy/egress-proxy/` + `packages/control-plane/src/provider/egress-proxy.ts`；起停：`npm run proxy:up|down|status`，集成测试 `npm run test:integration`；从沙箱里 `curl https://github.com` 确实 403）
+- [x] CP 持久层：三张表 + 状态机（唯一写入口）+ 审计轨迹 + 启动对账 + TTL 清扫（`packages/control-plane/src/db/`、`manager/`、`client/`；本地：`npm run db:up` → `DATABASE_URL=… npm run db:migrate`；集成测试 `npm run test:integration`，含真容器丢失/孤儿容器/kill -9 三条对账场景，见 spec Phase 8）
 - [ ] CP 侧仓库进出：clone → tar → 灌入沙箱；diff → apply → push（**凭据只在 CP**）
 - [ ] `GET /diff` + `GET /archive` + 落对象存储
-- [ ] 冒烟脚本 + 隔离红线测试（**必须在 Linux 上跑**）
+- [x] 冒烟脚本 + 隔离红线 CI：`packages/e2e/` + `.github/workflows/smoke.yml`（含一个反向验证 job：拿掉 CapDrop 之后红线必须变红；**只在 Linux 上算数**）
 
 **Agent 侧**（沙箱跑通之后再开始）：
 

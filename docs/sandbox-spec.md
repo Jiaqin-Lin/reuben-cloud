@@ -87,9 +87,10 @@ reuben-cloud/
 │     ├─ src/
 │     │  ├─ provider/{types,docker-api,local-docker}.ts   # Phase 5（docker-api 的理由见 Phase 5 实现备注 1）
 │     │  ├─ provider/egress-proxy.ts      # Phase 6：代理容器的生命周期（理由见 Phase 6 实现备注 3）
-│     │  ├─ db/{client,sandboxes,executions,artifacts,migrations/*.sql}
+│     │  ├─ db/{client,migrate,sandboxes,executions,artifacts,migrations/*.sql}   # migrate 与 ulid/log 的理由见 Phase 8 实现备注 1
 │     │  ├─ manager/{sandbox-manager,reconcile,sweeper}.ts
 │     │  ├─ client/{sandbox-api,sse}.ts   # 手写 SSE 客户端
+│     │  ├─ log.ts ulid.ts                # 日志接法 + CP 自己的 ULID（Phase 8）
 │     │  ├─ repo/{github-app,clone,pack,push}.ts
 │     │  ├─ artifacts/{store,offload}.ts
 │     │  └─ agent/{loop,tools/*,prompt}.ts
@@ -1550,13 +1551,103 @@ CP 起来时跑一次，全部动作走 `transition()`：
 
 ### 验收标准
 
-- [ ] 上表 11 项全绿
-- [ ] 手工 `docker kill` 掉一个沙箱容器，重启 CP，状态自愈为 ERROR
-- [ ] 手工 `docker run` 一个带标签的孤儿容器，重启 CP，它被删掉
-- [ ] 审计表里能看到一次完整的 CREATING→READY→BUSY→READY→DESTROYED 轨迹
+- [x] 上表 11 项全绿
+- [x] 手工 `docker kill` 掉一个沙箱容器，重启 CP，状态自愈为 ERROR
+      （自动化了：`test/integration/sandbox-flow.integration.test.ts` 里的
+      「验收标准 2：手工删掉容器 → 对账把它标成 ERROR(container_lost)」——真的
+      `docker rm -f` 一个真沙箱，再跑一次 `reconcile()`；手工做一遍与它逐字等价，
+      但可重复、失败能定位到行。）
+- [x] 手工 `docker run` 一个带标签的孤儿容器，重启 CP，它被删掉
+      （同文件的「验收标准 3」：直接用 provider 建一个**不写 DB 行**的沙箱，
+      那就是"上一次 CP 崩在 create 中途"留下的那种容器。）
+- [x] 审计表里能看到一次完整的 CREATING→READY→BUSY→READY→DESTROYED 轨迹
+      （同文件的「真容器全链路」用例逐条断言了 `sandbox_state_transitions` 的五个节点，
+      含创建那条 `NULL → CREATING`。）
 
 **完成标记：**
-- [ ] **Phase 8 完成** — 状态机、审计、对账、看门狗全部可用
+- [x] **Phase 8 完成** — 状态机、审计、对账、看门狗全部可用
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **多四个文件**（`src/db/migrate.ts` / `src/log.ts` / `src/ulid.ts` / `scripts/dev-db.sh`）：
+   `migrate.ts` 是迁移执行器，`scripts/migrate.ts` 只是它的薄壳——集成测试也要跑迁移
+   （测试自己起一个一次性 Postgres），逻辑写在脚本里就没法被 import。
+   `log.ts` 是 `(level, message, details?) → void` 这个接法的最小公共定义：
+   provider / manager / sweeper / migrate 都要能注入日志，各写一份类型就是四处改。
+   `ulid.ts` 是 CP 自己的 ULID：**不做 `packages/shared`**（§0.4），所以这 40 行
+   在两层各有一份，契约测试（`test/unit/ulid.test.ts`）只盯"前缀 + 时间序"。
+   `dev-db.sh` 让「本地起一个一次性 Postgres」变成 `npm run db:up`（§0.5 的落地）。
+2. **状态机多了一道"边"的检查**（`002_transition.sql`）。§3 只写了"校验旧状态在 `from` 里"，
+   但用例 2 要求 `READY→CREATING`、`DESTROYED→BUSY` 被拒——只查 `from` 时前者会成功
+   （调用方说"我以为它是 READY"，而它确实是 READY）。所以 SQL 函数里加了第二道检查：
+   §D 生命周期图的九条边（`CREATING>READY|ERROR|DESTROYED` / `READY>BUSY|ERROR|DESTROYED` /
+   `BUSY>READY|ERROR|DESTROYED` / `ERROR>DESTROYED`），不在表里就返回
+   `{ok:false, current, illegal:true}`——一个字节也不改。**没有 `ERROR→READY`**：
+   §D 说 ERROR 是"需人工处理"，自动复活会让故障悄悄消失。
+3. **`executions` 多一个 `reason` 列**。§5 第 3 步要求"写一条 executions 行标 killed，
+   reason 记 cp_restart"，而 §G.2 的字段表里没有 reason。在表上加一列比把原因塞进
+   `state` 或丢掉它都诚实。
+4. **`sandbox_state_transitions.from_state` 可空**。创建那一条审计行是 `NULL → CREATING`
+   （没有前驱），它让"这个沙箱什么时候出现的"不用去读 `created_at`，也让"只读审计表
+   就能看到完整轨迹"成立。
+5. **多一个 `container_exited` 原因**。spec 的表格只区分"容器不在"与"agent error"，
+   但"容器在、只是退出了"（`exited`/`dead`）标成 READY 是撒谎：下一次 exec 只会拿到
+   一次 connection refused。它与 `container_lost` 在排障时是两条完全不同的线索。
+6. **agent `unreachable` 时不动状态**。"agent 还没起来"与"agent 挂了"在这一刻无法区分，
+   而猜错的代价是风险登记表里的"对账误伤"。保持原状、记进报告的 `unreachable` 列表；
+   真正的兜底是 sweeper 的 TTL（到点无条件销毁）。这一条也是"对账幂等"的一部分。
+7. **看门狗触发的结局是 ERROR（无论 `/kill` 成不成功）**。§D 的生命周期表写的是
+   「BUSY ──看门狗触发──► ERROR」，§4 第 5 步只写了"`/kill` 也失败 → ERROR"，两处有张力。
+   这里取 §D：能接受 `/exec` 却不发终态事件，本身就是 agent 病了的证据；回 READY 只会让
+   下一条命令再等一次 `timeoutMs + 30s`，把故障拖成看不见的性能问题。
+   执行记录按 `/kill` 的结果分：成功记 `killed`，失败记 `failed`（都带 `watchdog_timeout`）。
+   事件流断且重连用尽（看门狗没触发）走同一条路，reason 是 `stream_failed`。
+8. **`POST /exec` 失败时分两种**。agent 回 `409 busy`：沙箱真的在跑别的命令
+   （多半是上一个 CP 残留的），DB **保持 BUSY**——这是诚实的，清理交给对账/ TTL。
+   其余失败（400 / 连不上）：命令根本没起来，`BUSY → READY`。
+9. **执行记录在终态时才写**（§5 第 6 步就是这个意思），所以 `executions.state` 目前
+   不会真的出现 `running`（CHECK 保留它，因为它是 §G.2 词汇表的一部分）。代价是
+   "CP 崩在 exec 中途"时那条记录由对账补写——那时命令本体已经随进程消失了，
+   所以 `cmd` 存空数组、`started_at` 用 `last_active_at`、`reason` 记 `cp_restart`。
+10. **执行记录用 `ON CONFLICT (id) DO UPDATE` 幂等重写**：对账补的记录与正常路径
+    可能重叠（同一个 execution_id 写两次），第二次写进来的是更完整的信息。
+11. **`executions.env_keys` 的插入是 `Object.keys(env)`，且 `recordExecution()` 的 API
+    只有 `envKeys: string[]`**——结构上就没有传 value 的位置；`assertEnvKeys()` 再挡一次
+    形状不对的输入（`"HTTP_PROXY=http://…"` 这种）。表上还有 `jsonb_typeof = 'array'` 的 CHECK。
+12. **`--test-concurrency=1`**（`packages/control-plane/package.json` 的 `test:integration`）。
+    集成测试文件默认并行跑，而 `egress-proxy.integration.test.ts` 会按需**重建全局共享的
+    代理容器**——并行时 Phase 6 的 3 条用例会随机失败（真实装包、内网 DNS、SIGHUP 重载），
+    单独跑那个文件则 13 条全绿。串行之后 59 条一起全绿（~75s）。这一条只影响本地/CI 的
+    集成层，`npm test` 的快照（无 Docker、无网络）不受影响。
+13. **grep 测试换了两条规则**（`test/unit/state-write.test.ts`）。原话"`SET state` 只允许
+    出现在 `db/sandboxes.ts` 里"在本实现下会空转：UPDATE 已经整个搬进了 SQL 函数，
+    任何 TS 文件里都没有这句话了。改成 ①`UPDATE sandboxes` 只允许出现在一个文件里
+    ②`sandbox_transition(` 的调用点只允许在那个文件里，并**断言那个文件里确实有这次调用**
+    （防止改名让规则静默失效）。不能写成"全仓库不许有 `SET state`"：`executions` 表有自己的
+    状态列，它的 `ON CONFLICT … DO UPDATE SET state = …` 与沙箱状态机无关。
+14. **数据库层的"真的会拦"怎么验证**。迁移里创建应用角色 `reuben_cloud_app`（`NOLOGIN`，
+    密码由部署时 `ALTER ROLE … PASSWORD` 补，**迁移里不写死凭据**），把除 `state` 之外的列
+    授给它。集成测试用 `SET LOCAL ROLE reuben_cloud_app`（超级用户可以切到任何角色）证明：
+    直改 `state` → `42501`；改 `endpoint`/`state_reason` → 可以；调函数 → 可以；
+    `DELETE` → `42501`。生产用哪个角色连库是部署决策，但机制在那里，而且被跑过了。
+15. **sweeper 的 TTL 是逐行的**（`limits.ttlSec` 优先，缺省 6h），候选状态含 `ERROR`：
+    一个反复销毁失败的沙箱靠下一轮 TTL 重试。`archive` 钩子抛异常时**这一轮不销毁**——
+    "先删后归档"会永久丢掉那份产出（§G.3）。`start()` 的定时器 `unref()`。
+16. **对账扫描的行数上限会被如实报告**（`report.truncated`），而孤儿判定改成**逐个 id 查 DB**
+    而不是 `SELECT *`：一次被截断的查询会把"其实有记录"的容器当孤儿删掉——
+    那是对账能造成的最坏伤害。
+17. **`executions.sandbox_id` 有外键，`sandboxes.task_id`/`run_id` 没有**（§G.1 的要求）。
+    前者保证执行记录不会悬空；后者是 M3 的 tasks/runs 还没建，对账必须能处理"归属未知"的行。
+18. **用例 9 的 `ttlSec=5` 改成"把 `last_active_at` 往回拨 2 小时"**。provider 的
+    `LIMIT_MIN_TTL_SEC` 是 60（Phase 5），所以 `ttlSec=5` 的沙箱根本建不出来；
+    而 `limits.ttlSec` 是逐行读的，拨钟之后走的是**同一条 SQL 路径**（`make_interval(secs =>
+    limits->>'ttlSec')`），只是不必等 60 秒。非过期的那一行留着做对照（它必须不被扫到）。
+19. **测试脚手架新增三件东西**（都在 `test/support.ts`）：`startPostgres()`（一次性容器 +
+    随机宿主端口，因为文件级并行会让固定端口 55432 碰撞）、`FakeSandboxAgent`（**真 HTTP**
+    的假 agent，默认"永不给终态"，所以看门狗那条路是真的被跑到的）、`FakeProvider`
+    （只实现 inspect/listManaged/destroy，让对账的四条规则可以在只有 Postgres 时逐条测）。
+    `sandbox-flow.integration.test.ts` 另有一个真 SIGKILL 的子进程夹具
+    （`test/integration/fixtures/dangling-cp.ts`，它不是测试文件，不会被 glob 选中）。
 
 ---
 
