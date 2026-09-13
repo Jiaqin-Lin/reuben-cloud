@@ -2252,14 +2252,14 @@ MVP 版本要讲清楚的事：
 
 ### 验收标准
 
-- [x] 上表 16 项里 **15 项**自动跑绿（`npm test` 覆盖 12–16 与 1–7、9；集成测试覆盖 5、11）。第 8 项（`@live` 真模型）与第 10 项（缓存命中）需要 `ANTHROPIC_API_KEY`，本地没有可用的 Anthropic 端点，留在备注 15 里写了跑法
-- [ ] §K 第 9 步：给一个真实 issue，跑完产出一个 patch（入口与流程已就绪并跑通到"无模型"为止：`npm run agent:run`，见备注 12；真模型那一步待凭据）
+- [x] 上表 16 项**全部**跑绿（`npm test` 覆盖 12–16 与 1–7、9；集成测试覆盖 5、11）。第 8 项（`@live` 真模型 smoke）与第 10 项（缓存命中）用**第二家 provider**（DeepSeek，见备注 16）真跑过：`npm run test:live -w @reuben-cloud/control-plane` 里 `provider=deepseek model=deepseek-flash turns=5 cache_read=5376`
+- [x] §K 第 9 步：给一个真实 issue，跑完产出一个 patch（`npm run agent:run` 对着一个真仓库跑通；真沙箱那一条在集成测试里 `RUN_LIVE_AGENT=1`，实测 `turns=7 tools=11 patch_bytes=202`）
 - [x] transcript 能在不重跑的情况下还原出每一轮的输入输出（`test/unit/agent-loop.test.ts` 的用例 9：JSONL 里含 system / tools / 每轮 usage / 完整 messages）
-- [ ] `cache_read_input_tokens` 在多轮时确实非 0（`@live` 用例断言了它，见备注 15）
+- [x] `cache_read_input_tokens` 在多轮时确实非 0（`@live` 用例断言了它：DeepSeek 的自动缓存命中 `5376`；Anthropic 那条断言的 `cache_creation > 0` 只对 Anthropic 生效，见备注 16）
 - [x] 单条 `tool_result` 永远 ≤ 2000 行 / 50 KiB（含模型自带 offset/limit 的情况——`limit` 只能往小了调）
 
 **完成标记：**
-- [x] **Phase 11 完成** — Agent 循环 + 4 个工具全部落地；16 项测试要点里 15 项真跑过（含 §F.3 的"沙箱内搜不到 API key"红线），剩两项是需要真实模型凭据的 `@live` 检查（跑法见备注 15）
+- [x] **Phase 11 完成** — Agent 循环 + 4 个工具全部落地；16 项测试要点全部真跑过（含 §F.3 的"沙箱内搜不到 API key"红线），`@live` 与 `RUN_LIVE_AGENT=1` 两条凭据相关的检查用 DeepSeek 跑绿（跑法见备注 16）
 
 #### 实现备注（与本文的有意偏差，都写了理由）
 
@@ -2310,22 +2310,48 @@ MVP 版本要讲清楚的事：
 13. **工具描述里写清了"什么时候用"与失败后的下一步**：`description` 里带 2000 行 / 50 KiB 的
     上限、`Full output:` 的续读办法、`offset` 是**行号**、`cwd`/`path` 相对仓库根、`cmd` 是 argv
     数组——模型看不到本文，只看得到这段话（§3 提到触发条件对 should-call 率有明显影响）。
-14. **`@live` 是单独一层**：`npm run test:live -w @reuben-cloud/control-plane`（没有
-    `ANTHROPIC_API_KEY` 就整层跳过）。集成测试里另有一条 `RUN_LIVE_AGENT=1` 的端到端
-    （真模型 + 真沙箱 → 真的产出 patch），默认跳过。
-15. **两条需要凭据的检查没跑成**（本机没有可用的 Anthropic 端点）：测试要点 8（真模型 smoke）
-    与 10（`cache_read_input_tokens > 0`）。跑法：
+14. **`@live` 是单独一层**：`npm run test:live -w @reuben-cloud/control-plane`（环境里没有任何
+    provider 的 key 就整层跳过；脚本带 `--env-file-if-exists=../../.env`）。集成测试里另有一条
+    `RUN_LIVE_AGENT=1` 的端到端（真模型 + 真沙箱 → 真的产出 patch），默认跳过。
+    Phase 12 又加了第三条同形状的：`test/live/pr-live.live.ts`（`RUN_LIVE_PR=1`，对着真 GitHub
+    建一条 draft PR）。
+15. **两条需要凭据的检查**（测试要点 8 与 10）：`@live` 层与 `RUN_LIVE_AGENT=1` 的端到端。跑法：
     ```bash
-    ANTHROPIC_API_KEY=sk-... REUBEN_CLOUD_MODEL=claude-haiku-4-5 \
-      npm run test:live -w @reuben-cloud/control-plane
+    npm run test:live -w @reuben-cloud/control-plane          # 脚本自带 --env-file-if-exists=../../.env
     # 端到端（真沙箱 + 真模型 → patch）：
     npm run dev:up && export DATABASE_URL=$(npm run --silent db:url)
     npm run build:image && npm run proxy:up
-    RUN_LIVE_AGENT=1 ANTHROPIC_API_KEY=sk-... npm run test:integration -w @reuben-cloud/control-plane
+    RUN_LIVE_AGENT=1 npm run test:integration -w @reuben-cloud/control-plane
     ```
-    新增的 env（都只在 CP 侧）：`ANTHROPIC_API_KEY`（必填）、`REUBEN_CLOUD_MODEL`（默认
-    `claude-opus-4-8`）、`REUBEN_CLOUD_EFFORT`（默认 `high`）、`REUBEN_CLOUD_MAX_TOKENS`
-    （默认 64000，硬顶同值）、`RUN_LIVE_AGENT`（只被测试读）。
+    相关 env（都只在 CP 侧）：`ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY`（至少一个）、`REUBEN_CLOUD_PROVIDER`
+    （`anthropic` | `deepseek`；两个 key 都在时才需要它）、`REUBEN_CLOUD_MODEL`（默认按 provider：
+    `claude-opus-4-8` / `deepseek-flash`）、`REUBEN_CLOUD_EFFORT`（默认 `high`）、
+    `REUBEN_CLOUD_MAX_TOKENS`（默认 64000，硬顶同值）、`RUN_LIVE_AGENT`（只被测试读）。
+16. **第二家 provider（DeepSeek）接在同一个客户端里，不做注册表**：DeepSeek 提供的是**同一套
+    Messages API**（`https://api.deepseek.com/anthropic`），字段名、`stop_reason`、`usage`
+    （含 `cache_read_input_tokens`）与工具调用形状都一致。所以接第二家 = **换 baseURL + 换 key**，
+    不是再写一个客户端——手写 OpenAI 格式要多一层 `reasoning_content ↔ thinking`、
+    `tool_calls ↔ tool_use` 的翻译，而那层翻译正是会出错的地方。差异只写在两处注释里：
+    DeepSeek 的缓存是**自动**的（`cache_control` 被忽略，`cache_creation_input_tokens` 恒为 0）、
+    它不会返回 `refusal`。`selectProvider()` 的选择顺序是：显式 `REUBEN_CLOUD_PROVIDER` →
+    模型名前缀 → 哪个 key 在（Anthropic 在前，它是 §2 的文档默认值）→ 都没有就 `config_missing`。
+    没有注册表、没有工厂（§2 的边界：第二个 provider 出现之前不建）。
+17. **凭据走 `.env` + `--env-file-if-exists`，不把 key 写进命令行**：`npm run agent:run` /
+    `test:live` / `test:integration` 三个脚本都带 `--env-file-if-exists=.env`（根目录 / 两个 `../`）。
+    理由：key 进 shell history 或 `ps` 输出是一条真实且很容易养成的坏习惯；而 `.env` 已在
+    `.gitignore` 里，不会跟着提交走。加第二个 provider 之后 `npm test` 仍然不需要任何 key
+    （单测用脚本化模型）。
+18. **集成测试里一个被哨兵 key 掩盖的 bug**（真模型那条第一次真跑时才可能发现）：
+    `before()` 会把 CP 的 `ANTHROPIC_API_KEY` 换成随机哨兵（用来证明"沙箱里搜不到它"），
+    而真模型用例在它之后跑——于是 `anthropicFromEnv()` 读到的其实是哨兵，`RUN_LIVE_AGENT=1`
+    只会 401。修法：模块加载时先把真 key 捕获到一个变量，真模型用例开头再换回来（`liveRealKey`）。
+    同时哨兵改成**两个 provider 的变量都设**，容器里的搜不到了覆盖到实际在用的那把 key。
+19. **§K 第 9 步手工验收抓到的第一个真 bug**：`scripts/agent-run.ts` 灌入时**没传
+    `workspaceDir: REPO_DIR`**，仓库被解到 `/workspace` 而不是 `/workspace/repo`。后果不是立刻
+    报错，而是模型只能用绝对路径"绕"过去、最后 `GET /diff?path=/workspace/repo` 以
+    `spawn_failed` 失败——因为提示词、工具层的相对路径、diff 的 `path` 三处都按 `REPO_DIR` 说话。
+    这暴露的是**编排写在脚本里就测不到**：Phase 12 把收尾搬进 `agent/run.ts` 之后，脚本与集成
+    测试走同一个函数，这一类的漏传就不会再有盲区（见 Phase 12 备注 1）。
 
 ---
 
@@ -2335,13 +2361,13 @@ MVP 版本要讲清楚的事：
 
 ### 交付物
 
-`packages/control-plane/src/repo/pr.ts` + 接进 Run 的收尾流程。
+`packages/control-plane/src/repo/pr.ts` + 接进 Run 的收尾流程（`packages/control-plane/src/agent/run.ts` 的 `finishRun()`；多一个文件的理由见末尾实现备注 1）。
 
 ### 具体如何实现
 
 #### 1. Token 与推送
 
-复用 Phase 9 的 `github-app.ts`。推送已在 Phase 9 完成，这里只多一件事：**推送前确认工作区干净**（`git status --porcelain` 为空），避免把 CP 临时目录里的垃圾带上去。
+复用 Phase 9 的 `github-app.ts`。推送已在 Phase 9 完成，这里只多两件事：**推之前确认分支 tip 是我们自己的**（见 §3 与实现备注 3）、**提交之后确认工作区干净**（`git status --porcelain` 为空；时机与理由见实现备注 4），避免把 CP 临时目录里的垃圾带上去。
 
 #### 2. 创建 PR
 
@@ -2368,6 +2394,9 @@ PR 正文要有的东西（这是 README 说的"可信度报告"的雏形）：
 
 - 同 Task 重复 Run：分支被 `--force-with-lease` 覆盖，PR 已存在 → `PATCH` 更新标题/正文，**不新建**。
 - 分支名冲突：`reuben-cloud/*` 是我们自己的命名空间。`--force-with-lease` 会在"远端那个分支不是我们上次推的 sha"时拒绝——这时候报告并停止，**绝不 `--force`**。用户手动改过的分支不能被静默覆盖。
+  **“我们上次推的 sha”不由持久化提供，而是由 tip 的 committer 身份判断**：fetch 那个 tip，
+  committer 不是 bot 身份 → `branch_owned_by_others`，报告并停止；是 → 拿这个 sha 做 lease
+  （仍然防读与推之间的并发写）。理由见实现备注 3。
 - 触发条件判定：`GET /repos/{owner}/{repo}/pulls?head=owner:reuben-cloud/<taskId>&state=open` → 有就更新，没有就创建。
 
 #### 4. 失败模式
@@ -2391,25 +2420,117 @@ PR 正文要有的东西（这是 README 说的"可信度报告"的雏形）：
 
 ### 测试要点
 
-| # | 用例 | 断言 |
-|---|---|---|
-| 1 | 端到端 | issue → patch → PR（对着 fixture 仓库） |
-| 2 | PR 是 draft | API 返回 `draft: true` |
-| 3 | 正文含实数 | 文件数、+/−、测试结果、transcript 链接都在 |
-| 4 | 重复 Run | 不产生第二个 PR，正文的 attempt 序号递增 |
-| 5 | 权限不足 | 用缺 `pull_requests:write` 的 installation → 结构化错误 |
-| 6 | **force-with-lease 保护** | 模拟远端分支被第三方改动 → 拒绝覆盖并报告 |
-| 7 | token 过期 | 把缓存 TTL 调成 0 秒 → 自动重新签发，流程不中断 |
-| 8 | rate limit | mock 一个 403 + `retry-after` → 等待后重试 |
+| # | 用例 | 断言 | 状态 |
+|---|---|---|---|
+| 1 | 端到端 | issue → patch → PR（对着 fixture 仓库） | [x] 真沙箱 + 真 smart-HTTP 远端 + 假 GitHub（`test/integration/pr-flow.integration.test.ts`）；**真 GitHub 也跑了**：`RUN_LIVE_PR=1` 对着 `Jiaqin-Lin/reuben-agent` 建/更新了一条 draft PR，另外用真 issue 跑通了 issue → patch → PR（见备注 11） |
+| 2 | PR 是 draft | API 返回 `draft: true` | [x] 单测（默认值）+ 集成测试（create 收到的 `draft`） |
+| 3 | 正文含实数 | 文件数、+/−、测试结果、transcript 链接都在 | [x] 单测逐项正则 + 集成测试读真 body |
+| 4 | 重复 Run | 不产生第二个 PR，正文的 attempt 序号递增 | [x] 单测（假列表）+ 集成测试（真 push，同一条 PR 被更新） |
+| 5 | 权限不足 | 用缺 `pull_requests:write` 的 installation → 结构化错误 | [x] 单测（`pr_permission_denied` + `details.required`） |
+| 6 | **force-with-lease 保护** | 模拟远端分支被第三方改动 → 拒绝覆盖并报告 | [x] 单测（`branch_owned_by_others` / `push_lease_rejected`，真裸仓库）+ Phase 9 集成用例 5 |
+| 7 | token 过期 | 把缓存 TTL 调成 0 秒 → 自动重新签发，流程不中断 | [x] 单测：真 RSA 密钥 + `earlyRefreshMs: 0`，`publishRun` 两次重签全程无中断 |
+| 8 | rate limit | mock 一个 403 + `retry-after` → 等待后重试 | [x] 单测：`sleep` 注入，断言等待时长 = `retry-after`；重试用尽/超过等待上限/非限流错误三条分支都覆盖 |
 
 ### 验收标准
 
-- [ ] 上表 8 项全绿
-- [ ] §K 第 10 步：端到端 issue → patch → PR
-- [ ] 手工看一次 PR：正文如实、draft、分支名正确
+- [x] 上表 8 项全绿（第 1 项除假 GitHub 的集成测试外，也真跑了一遍真 GitHub）
+- [x] §K 第 10 步：端到端 issue → patch → PR（真 issue“新增一个文件” → DeepSeek 改代码 → `--verify` 真跑 → `/diff` 忠实效验 → commit → force-with-lease push → **draft PR #2**；同一 task 第二次跑（attempt 2 + 对象存储）是**更新同一条 PR**，没建第二条）
+- [x] 手工看一次 PR：正文如实（文件数 / +− / 验证命令与退出码 / 模型与 run / attempt / transcript 链接）、draft=True、分支名 `reuben-cloud/<taskId>` → 已核对
 
 **完成标记：**
-- [ ] **Phase 12 完成** — 端到端跑通并产出 PR（M0 完成）
+- [x] **Phase 12 完成** — 端到端跑通并产出 PR（M0 完成）
+
+#### 实现备注（与本文的有意偏差，都写了理由）
+
+1. **多一个文件 `src/agent/run.ts`（`finishRun()`）——把收尾编排从脚本搬进模块**。
+   Phase 11 把这段逻辑写在 `scripts/agent-run.ts` 里，后果是"手工能跑、测试只能另抄一份"，
+   而 `workspaceDir` 漏传那个 bug 就是这么漏掉的（Phase 11 备注 19）。现在脚本与集成测试
+   走**同一个函数**：验证 → 取改动 → （发布或落 patch）。这个文件**不碰沙箱生命周期**
+   （建/销毁是 `SandboxManager` 的事，调用方在取完改动之后才销毁）。
+2. **PR 那一侧有一个 `PullRequestApi` port，Octokit 实现不到 100 行**。理由不是"可插拔"：
+   ① 单测要在没有网络、没有 App 的情况下把幂等 / base 变更 / 限流重试 / 权限分类跑完；
+   ② "什么时候调 API"（幂等判定、重试、正文）与"怎么调"（HTTP 细节、token 放哪）是两类
+   会各自演进的东西。port 只有四个方法（list / create / update / getDefaultBranch）。
+3. **推之前多一步「分支归属校验」（`branch_owned_by_others`）——补上 lease 默认值的洞**。
+   `push.ts` 的缺省行为是"推之前现读一次远端，拿它当 lease 期望值"，那只防**读与推之间的
+   并发写**；重复 Run 时真正的问题是更早的：分支 tip 可能根本不是我们上次推的（用户手工推了
+   commit），而现读一次会把它当成合法预期值、**静默覆盖**。所以 `publishRun` 现在先 `ls-remote` +
+   `fetch` 那个 tip，看 committer 是不是 bot 身份：不是就拒绝并报告，是就拿这个 sha 做 lease。
+   **不查"上次推的 sha"是因为那个值需要跨 Run 持久化**（`sandboxes` 表里没有它，tasks/runs 是 M3），
+   而身份判断不需要任何持久化，还多盖住一种情况：用户**非 force** 地在我们推完之后 commit 上来
+   （分支仍能 fast-forward，光靠 lease 拦不住）。`push_lease_rejected` 仍然保留——它管的是读与推
+   之间那一段（测试用显式过时的 `expectedRemoteSha` 模拟）。
+4. **`assertCleanWorktree` 的时机在 commit **之后**，理由写进代码注释了**：正文那句
+   "`git status --porcelain` 为空"的字面含义是"提交完就没有剩下的东西"。`commitAndPush` 是
+   `git add -A` + commit，它提交的正是我们要推的改动；此时还脏只有一个解释——提交之后又有东西
+   改了这棵树（CP 临时文件、残留进程、外部写入），那种状态下建出来的 PR 描述的是一个已经
+   不成立的 commit。推之前那一半由 `git apply` 与忠实效验守着（`apply.ts`）。
+5. **验证命令（`verifyInSandbox`）再跑一次，不采信 agent 的自述**。PR 正文里"测试通过"必须
+   是一份可复查的证据，所以收尾时在沙箱里真跑一遍（`--verify`）。它默认在 `REPO_DIR` 下跑
+   （沙箱的默认 cwd 是 workspace 根，`node test.js` 在那里会报 MODULE_NOT_FOUND——Phase 11
+   备注 4 抓过一次的东西）；`passed` 只认"跑完了且退出码 0"，被超时杀掉不算通过。输出是
+   **头部捕获 + 尾部呈现**（`execAndWait` 按事件流顺序收，人只看最后 20 行），这一点写在正文的
+   注释里，不假装"输出都收全了"。
+6. **PR 正文是模板 + 实数，不让模型写**（§Phase 12 技术边界）。四个小节：改动 / 验证 /
+   这次 Run / 原始 issue。三个上限：issue 摘录 4,000 字符、文件清单 50 条、正文 60,000 字符
+   （GitHub 硬限 65,536——超了要截断，不能让 422 变成"PR 建不出来"）。
+7. **`--pr 只支持 --repo`**：`--local` 的 remote 是宿主目录，没地方建 PR。任务 id 的缺省值是
+   **issue 内容的 sha256 前 12 位**，不是首行标题：`branchNameForTask()` 只留 `[A-Za-z0-9._-]`，
+   中文标题会被清成空串然后直接报错；哈希是 ASCII、稳定（同一个 issue 重跑落到同一条分支/PR），
+   也不泄露 issue 内容。
+8. **限流重试的上限与兜底**：`retry-after`（秒）优先；没有就看主限流的 `x-ratelimit-reset`；
+   两个都没有则默认等 30 秒。单次等待超过 5 分钟**不等**——一次主限流的 reset 可能在一小时之后，
+   把 Run 的墙钟预算睡完不是重试。最多 3 次；只吃 `pr_rate_limited`（权限不足重试一百次还是
+   权限不足）。
+9. **`branch_protected` 单独一类**：GitHub 的 `GH006` / `protected branch` 措辞从 `push_rejected`
+   里分出来。它和 lease 被拒是两件事：前者要人去改保护规则，后者说明有人动过分支。
+10. **测试脚手架**：`FakePullRequestApi` 放进 `test/support.ts`（单测与集成测试都用它，
+    放进 `.test.ts` 会让另一个 import 的文件把那份用例再跑一遍——support.ts 文件头记过这条）；
+    它是**一份真的 PR 列表**（create 塞、update 改），因为幂等要回答的是"最后仓库里有几条 PR"，
+    不是"第几个函数被调了几次"。`createGitFixtureRepo()` 多了 `files` 参数（Phase 12 的 fixture
+    是一个带失败测试的小仓库）。
+11. **两条验收都真跑了**（GitHub App：`GITHUB_APP_ID` + `GITHUB_APP_INSTALLATION_ID` + `GITHUB_APP_PRIVATE_KEY_PATH`）。
+    跑法（会在 `PR_FIXTURE_REPO` 上留下 draft PR；分支固定，重跑是更新同一条）：
+    ```bash
+    npm run app:installations     # 先查 installation id / 核对三个权限（只读）
+    RUN_LIVE_PR=1 PR_FIXTURE_REPO=owner/name npm run test:live -w @reuben-cloud/control-plane
+    npm run agent:run -- --repo owner/name --issue-file issue.md --verify "…" --pr
+    ```
+    `scripts/github-app-installations.ts` 是第一次真跑时补的：建完 App 的页面上只有 App ID
+    与 Client ID，**没有 installation id**（那个数字藏在安装完成后的浏览地址里），而
+    `GithubAppCredentials` 构造时就需要它——这个脚本用 App JWT 调 `GET /app/installations`
+    把它查出来，顺带核对 `contents:write / pull_requests:write`，少权限时提前看见，
+    而不是等建 PR 那一刻吃 403。
+12. **弱网加固（真跑 GitHub 时踩出来的，改的是 Phase 9 的两个文件）**：这台机器到 github.com
+    的连接大约每 2 次就有 1 次**卡在请求建立阶段**（不报错、也不传字节，匿名与带 token 一样；
+    HTTP/1.1 与 HTTP/2 一样，`http.lowSpeed*` 也拦不到——它只管传输阶段，所以连"Operation too
+    slow"都很少出现）。还有一次 push 收到 GitHub 自己的 `remote: Internal Server Error`。
+    四件事，核心是**让每次尝试便宜、把重试做对**：
+    · `BASE_GIT_CONFIG` 加 `http.lowSpeedLimit=1000` / `http.lowSpeedTime=20`：能治传输阶段
+    的"永久挂住"（curl 默认没有超时），治不了建立阶段——但便宜，留着；
+    · **只读的远端操作（`ls-remote` / `fetch`）重试 4 次**（`retryTransientGit`，只认超时与
+    网络类 stderr；认证 / 分支保护 / 非快进一律不重试——重试只是把错误延后）；
+    · **每次尝试必须短**：`ls-remote` 15s、`fetch` 30s（`REMOTE_INSPECT_*`）、push 180s。
+    一开始让 `ls-remote` 共用 push 的 180s，于是一次挂住 = 3 分钟 × 重试次数，一次 live 跑能拖到
+    六分钟以上（真的被中止过一次）；实测窗口降到 15s 之后，抖动一次只花 ~16s 就重试过去了。
+    push 的重试次数**故意只有 2 次**：真推送的预算是 180s，重试三次就是九分钟；
+    · **push 的重试安全，因为 lease 的期望值固定**：上次没落地 → 重试与第一次等价；
+    上次其实落地了（超时 / 500 之后其实成功了）→ 远端就是本地 HEAD → lease 会以 `stale info`
+    拒，而这个事实正好是"上次成功了"的证据，按成功收尾（`leaseRejectionMeansAlreadyPushed`）。
+    超时但**已经在传**（有 `Writing objects:` 之类进度）时不重试——那是事实，不是抖动；
+    · 顺带去掉一次冗余往返：`publishRun` 已经用 `ls-remote` + `fetch` 验过归属，
+    `commitAndPush` 就不再问一次"远端现在在哪"（`expectedRemoteSha` 已显式给出）。
+13. **`GITHUB_APP_PRIVATE_KEY_PATH` 的相对路径按 cwd → 仓库根两步解析**（`keyPathCandidates`）：
+    `.env` 是整仓共用的一份，而 `test:live` / `test:integration` 的 cwd 在
+    `packages/control-plane`、`agent:run` 的 cwd 在仓库根——同一个 `./github-app.pem`
+    不可能同时对两边都对。找不到时错误里会把两条候选路径都列出来（"找不到文件"最难受的就是
+    不知道该把它放哪）。
+14. **归档的 `/diff` 在 agent 流程里要指到 `/workspace/repo`**（`ArtifactOffloadOptions.repoPath`）：
+    Phase 9 把仓库解到 `/workspace`，Phase 11 起解到 `/workspace/repo`——不对的话 `/diff` 会回
+    `not_a_git_repository`，于是"销毁前把 diff 转存"在 agent 流程里永远拿不到东西。
+    它是**降级成一条 warning、不阻断销毁**的，所以很容易一直没人发现（真跑那次 PR 流程的日志里
+    就挂在那里）。`sandbox-manager` → `ArtifactOffloader` 加一个 `repoPath` 透传，
+    `scripts/agent-run.ts` 传 `REPO_DIR`；归档（`/archive`）仍然对整个 workspace。
 
 ---
 
