@@ -1,6 +1,10 @@
 node_modules/
 dist/
 *.log
+# 例外：P6 的错误分类 fixture 是**样本日志**（spec 附录 D），要进 git。
+# 【为什么要这条】`*.log` 这条规则的本意是"运行时产物别进 git"（transcript / 构建日志），
+# 而 build-logs 下的样本是测试数据，和 fixtures/repos 里的仓库文件同类。
+!packages/control-plane/test/fixtures/build-logs/*.log
 .DS_Store
 .claude/
 # 本地凭据（模型 key / DB 连接串）。.env.example 之类的模板可以进 git。

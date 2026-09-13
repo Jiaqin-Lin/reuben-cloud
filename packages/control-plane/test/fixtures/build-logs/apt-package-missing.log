@@ -1,0 +1,18 @@
+#4 [1/2] FROM docker.io/library/reuben-cloud/base-python-dev:dev
+#4 CACHED
+#5 [2/2] RUN apt-get update && apt-get install -y --no-install-recommends libvips42-dev
+#5 0.284 Get:1 http://deb.debian.org/debian bookworm InRelease [151 kB]
+#5 0.512 Get:2 http://deb.debian.org/debian bookworm/main amd64 Packages [8,786 kB]
+#5 1.902 Reading package lists...
+#5 2.206 Reading package lists...
+#5 2.214 Building dependency tree...
+#5 2.398 Reading state information...
+#5 2.412 E: Unable to locate package libvips42-dev
+#5 2.413 E: Couldn't find any package by glob 'libvips42-dev'
+------
+Dockerfile:2
+--------------------
+   1 | FROM reuben-cloud/base-python-dev:dev
+   2 | >>> RUN apt-get update && apt-get install -y --no-install-recommends libvips42-dev
+--------------------
+ERROR: failed to solve: process "/bin/sh -c apt-get update && apt-get install -y --no-install-recommends libvips42-dev" did not complete successfully: exit code: 100

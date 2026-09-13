@@ -13,7 +13,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -301,12 +301,15 @@ describe("collectSignals", () => {
     assert.equal(existsSync(path.join(dir, "pwned-sh")), false);
   });
 
-  test("采集层不 import child_process（结构性的第二道门）", async () => {
+  test("推断层不 import child_process（结构性的第二道门）", async () => {
     // 行为断言（上面那条）能抓住"现在真的执行了"，这条能抓住"有人为了别的功能
     // 把 child_process 引进来"——推断是纯读文本的一层，不该有任何进程能力。
+    //
+    // 【P6 起为什么要列出文件名而不是扫整个目录】同一个目录里多了 `build.ts`，它的工作
+    // 就是起 `docker build`（spec P6 §2）——目录级扫描会把这条完全正当的能力当成违规。
+    // 所以这里列的是**推断层**那六个文件；谁把 child_process 引到它们里面，这条仍然会红。
     const dir = fileURLToPath(new URL("../../src/environment/", import.meta.url));
-    for (const file of await readdir(dir)) {
-      if (!file.endsWith(".ts")) continue;
+    for (const file of ["signals.ts", "infer.ts", "devcontainer.ts", "types.ts", "base-images.ts", "store.ts"]) {
       const text = await readFile(path.join(dir, file), "utf8");
       assert.ok(!text.includes("child_process"), `${file} 不该 import child_process`);
       assert.ok(!/\bexecSync\b|\bspawnSync\b/.test(text), `${file} 不该有同步执行`);

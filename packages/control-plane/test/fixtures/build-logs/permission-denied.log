@@ -1,0 +1,9 @@
+#5 [2/3] RUN mkdir -p /opt/tools && echo hello > /opt/tools/marker
+#5 0.312 /bin/sh: 1: cannot create /opt/tools/marker: Permission denied
+------
+Dockerfile:2
+--------------------
+   1 | FROM reuben-cloud/base-node-dev:dev
+   2 | >>> RUN mkdir -p /opt/tools && echo hello > /opt/tools/marker
+--------------------
+ERROR: failed to solve: process "/bin/sh -c mkdir -p /opt/tools && echo hello > /opt/tools/marker" did not complete successfully: exit code: 2

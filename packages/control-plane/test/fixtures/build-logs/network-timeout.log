@@ -1,0 +1,12 @@
+#5 [2/4] RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev
+#5 30.012 Get:1 http://deb.debian.org/debian bookworm InRelease [151 kB]
+#5 30.014 Err:1 http://deb.debian.org/debian bookworm InRelease
+#5 30.014   Temporary failure resolving 'deb.debian.org'
+#5 30.015 Get:2 http://security.debian.org/debian-security bookworm-security InRelease [48.0 kB]
+#5 32.120 Err:2 http://security.debian.org/debian-security bookworm-security InRelease
+#5 32.120   Temporary failure resolving 'security.debian.org'
+#5 32.130 Reading package lists...
+#5 32.140 W: Failed to fetch http://deb.debian.org/debian/dists/bookworm/InRelease  Temporary failure resolving 'deb.debian.org'
+#5 32.141 W: Some index files failed to download. They have been ignored, or old ones used instead.
+------
+ERROR: failed to solve: process "/bin/sh -c apt-get update && apt-get install -y --no-install-recommends libpq-dev" did not complete successfully: exit code: 100

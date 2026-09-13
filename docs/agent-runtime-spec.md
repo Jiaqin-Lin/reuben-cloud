@@ -1034,14 +1034,31 @@ hasDockerfile||hasCompose  →  level="dockerfile"（叠加 agent 必需组件�
 - `packages/control-plane/src/environment/queue.ts`（构建队列：并发 1、按 `project_key` 去重，
   带 `trigger`；触发点与"Run 绝不建环境"的口径见设计文档 §C.8）
 - `packages/control-plane/src/db/migrations/007_env_builds.sql`
-- 假 builder（集成测试用）+ 真 builder（生产路径）两个实现
+- 假 builder（集成测试与单测用）+ 真 builder（生产路径）两个实现（假的那个在
+  `test/environment-fakes.ts`——两份测试层都要用同一套替身，见该文件的头注释）
+- `scripts/build-env.ts`（`npm run env:build`：手工验收用的驱动，真连 PG / 真读 .env）
+
+> **实现备注**：P6 落地时有 8 条有意偏差，逐条记在附录 A-31 … A-38——`env_builds` 多了
+> `status` / `inference` 的 CHECK 与一个索引（A-31）；生成阶段的两类失败（`generation_failed` /
+> `constraint_violation`）也进 `error_class`（A-32）；`signals` 级的第一轮就走 LLM、而不是等构建
+> 失败（A-33，**这一条与下一条是计划本身的修正，正文已同步**）；记账口径是"每次 LLM 生成一行"，
+> 规则生成不记假账（A-34）；日志落点是一个端口（配了 S3 走 S3，没配落本地文件，A-35）；多一个
+> `scripts/build-env.ts`（A-36）；构建成功后 `environments.status` 留在 `building` 等 P7 的健康检查
+> （A-37）；镜像 tag 把 `project_key` slug 化，并把实际构建的那份文本写回 `environments.dockerfile`
+> （A-38）。另外两条不构成偏差、只是把 spec 没说死的地方写死：网络类故障最多重试 1 次是队列里
+> 的 attempt 级 break（不是"重试整个仓库"）；`build_timeout` 不设额外上限，仍然吃满三轮（§C.4 的
+> 两个防烧钱约束就是"3 轮 + 单轮 10 分钟"）。另外一处测试范围的收窄：P5 那条"环境目录不 import
+> child_process”的目录级扫描改成只扫**推断层**那六个文件（`signals` / `infer` / `devcontainer` /
+> `types` / `base-images` / `store`）——P6 的 `build.ts` 的工作就是起 `docker build`，目录级扫描
+> 会把这条完全正当的能力当成违规。
 
 ### 具体如何实现
 
 **1. 生成 prompt 的输入与硬约束**
 
 ```
-输入：RepoSignals 摘要 + 之前的错误分类（第二、三轮）+ 上一版 Dockerfile
+输入：RepoSignals 摘要 + 规则生成的基线（P5 的渲染结果，可原样保留）+ 之前的错误分类（第二、三轮）
+      + 上一版 Dockerfile + 日志尾部（40 行）
 输出：一个 ```dockerfile 代码块
 硬约束（校验不通过直接判失败，不进 build）：
   ① FROM 必须是 Layer 1 镜像之一
@@ -1081,12 +1098,18 @@ docker build -f <tmp>/Dockerfile -t reuben-cloud/env-<project_key>-<revision>:bu
 
 ```
 attempt = 1..3:
-  dockerfile = (attempt == 1) ? 规则生成 : LLM 生成(信号, 上一版, 错误分类, 日志尾部)
+  dockerfile = 第一轮 且 level != signals ? 规则生成
+                                             : LLM 生成(信号, 规则基线, 上一版, 错误分类, 日志尾部)
   校验硬约束 → build → 成功则退出
   失败 → 分类 → 记 env_builds 一行（attempt, status, error_class, log_key, duration_ms）
-        → 进 usage_ledger（kind='env_build'）
+        → 每次 LLM 生成各进 usage_ledger 一行（kind='env_build'；规则生成的那轮没有模型调用，不记）
 最终失败 → environments.status='failed'，保留全部 attempt 与日志
+成功    → environments.status 留在 building：能不能用是 P7 健康检查的结论（设计文档 §C.6）
 ```
+
+> 第一轮的分工按 level 分（附录 A-33）：`devcontainer` / `dockerfile` 级先用规则渲染（那是仓库
+> 作者写下的环境事实），失败才上模型；`signals` 级的第一轮就是 LLM（规则渲染对那一级只给得出
+> 一行 `FROM`），否则模型永远没有出手的机会——一行 FROM 的镜像几乎构不出错。
 
 **5. `env_builds` 表**
 
@@ -1099,14 +1122,17 @@ CREATE TABLE env_builds (
   inference    text NOT NULL,               -- devcontainer | dockerfile | signals | llm
   trigger      text NOT NULL,               -- first_seen | manual | promote（设计文档 §C.8）
   status       text NOT NULL,               -- building | built | failed
-  error_class  text,
-  dockerfile   text NOT NULL,               -- 每次尝试的实际文本（可复现）
-  log_key      text,                        -- 对象存储
+  error_class  text,                        -- 日志分类 + generation_failed / constraint_violation（A-32）
+  dockerfile   text NOT NULL,               -- 每次尝试的实际文本（生成失败时是模型原文）
+  log_key      text,                        -- 对象存储（没配对象存储时是本地文件 key，A-35）
   duration_ms  integer,
   image_digest text,
   created_at   timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT env_builds_trigger_check CHECK (trigger IN ('first_seen','manual','promote'))
+  CONSTRAINT env_builds_trigger_check CHECK (trigger IN ('first_seen','manual','promote')),
+  CONSTRAINT env_builds_status_check CHECK (status IN ('building','built','failed')),
+  CONSTRAINT env_builds_inference_check CHECK (inference IN ('devcontainer','dockerfile','signals','llm'))
 );
+CREATE INDEX env_builds_project_idx ON env_builds (project_key, revision, attempt);
 ```
 
 **6. 队列（`queue.ts`）：入队不等于构建**
@@ -1130,6 +1156,7 @@ CREATE TABLE env_builds (
 - `first_seen` 的入队是**异步**的：发起方（会话 / M3 的调度器）不等它，Run 照常跑（P7 §5）；
 - 生成的 Dockerfile 只允许从 Layer 1 出（避免"从零开始"导致 uid/HOME/sandbox-agent 全丢）；
 - **不在构建阶段注入凭据**（构建进程 env 里没有 GitHub token / 模型 key；`--build-arg` 白名单为空）；
+- 日志的落点是一个端口：配了对象存储就写它，没配就落本地文件（`REUBEN_CLOUD_ENV_LOG_DIR`，A-35）；
 - 不做"构建缓存优化"（M2 用 docker 默认层缓存 + C.5 的镜像级缓存，不做 BuildKit 的高级特性）。
 
 ### 测试要点
@@ -1139,13 +1166,15 @@ CREATE TABLE env_builds (
 | 1 | 假 builder：第 1 轮失败、第 2 轮成功 | 收满 2 行 env_builds；最终 status=built |
 | 2 | 假 builder：3 轮全失败 | status=failed；3 行 attempt；日志 key 都在 |
 | 3 | 错误分类表 | 每条真实日志样本（fixture）分类正确 |
-| 4 | 硬约束校验 | 含 CMD/ENTRYPOINT/root/curl\|sh 的生成结果被拒（不 build） |
+| 4 | 硬约束校验 | 含 CMD/ENTRYPOINT/root/curl\|sh 的生成结果被拒（不 build，`error_class=constraint_violation`） |
 | 5 | 超时 | 假 builder 卡住 → 10 分钟（测试里拨快时钟）后被杀并分类 |
-| 6 | 成本记账 | 三轮自愈 → usage_ledger 有 3 行 env_build |
+| 6 | 成本记账 | `signals` 级仓库三轮全失败（每轮一次 LLM 生成）→ usage_ledger 有 3 行 env_build；L1/L2 的第一轮是规则生成，不记账 |
 | 7 | 真 build（集成） | 人为缺依赖的 fixture 仓库 → ≤3 轮成功（真 docker） |
 | 8 | 构建上下文隔离 | 断言临时目录里只有 Dockerfile（没有仓库文件） |
 | 9 | 队列去重 | 同一个 `project_key` 已有构建在跑时再入队 → 复用那一次，不产生第二行 attempt |
-| 10 | 失败不阻塞 | 队列里第一个仓库 build 失败 → 第二个照常被构建 |
+| 10 | 失败不阻塞 | 队列里第一个仓库 build 失败 → 第二个照常被构建（且两者串行，不重叠） |
+| 11 | 生成阶段失败 | 模型没给代码块 / 违反硬约束 → 记一行 attempt（`generation_failed` / `constraint_violation`）、不产生 build、下一轮的 prompt 里带上那句诊断 |
+| 12 | 网络类故障重试上限 | 连续两次 `network_timeout` → 第 2 轮之后停下（不烧第 3 轮） |
 
 ### 验收标准
 
@@ -1924,8 +1953,17 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 | A-26 | Phase 5 · §5 镜像矩阵 | `Dockerfile.go-dev  # FROM common + go + gopls` | 只装 go（官方 tarball，版本钉在 ARG 里），**不装 gopls** | M2 没有任何一处消费 LSP：符号索引走 tree-sitter WASM（P8），工具面是 read/write/edit/grep/find/ls/bash（P11），没有工具会说 LSP。装一个几百 MB、无人调用的语言服务器，只让构建时间与常规镜像体积双双变难看。真接 LSP 时补一行 `go install golang.org/x/tools/gopls@vX.Y.Z` 即可——那时它才有实测需求驱动 | `images/base/Dockerfile.go-dev`（矩阵其余六档一字未改） |
 | A-27 | Phase 5 · 测试要点 7 vs P6 §1 ③ | 测试要点 7"无 CMD/ENTRYPOINT、无 root"；P6 §1 ③"不得出现 `USER root` 之后不切回" | `checkDockerfileConstraints` 按更具体的那句实现："默认用户必须非 root，且每个 `USER root` 后面都要切回非 root"；三个 fixture 的生成结果里**一个 `USER` 都没有**，测试对它们额外断言了这条更强的形态 | devcontainer 的 features（github-cli / git-lfs）只能以 root 装包；把"无 root"读成"永远不许出现 USER root"会让 §3 明确要求支持的 feature 这条路没法实现 | `infer.ts` 的 `checkDockerfileConstraints` / `renderEnvDockerfile`；`environment-infer.test.ts` 的两条用例（三个 fixture 无 USER / github-cli 有 root 但切回） |
 | A-28 | Phase 5 · §3 devcontainer 子集 | 支持字段清单（没提文件格式） | 自带 40 行 JSONC 解析（去行/块注释 + 去尾逗号，扫描时跳过字符串字面量）；解析失败返回 `error`，调用方降级到下一级并记 note | 真实仓库里的 devcontainer.json 是 VS Code 写出来的 JSONC（带注释与尾逗号）——用 `JSON.parse` 会在最常见的一类文件上失败。spec §0.2 的依赖表里没有 JSON5 / jsonc-parser，而这里要做的只有两件事；"读不懂就降级"本来就是测试要点 4 的要求，所以解析器只负责"能读的读懂、读不懂的如实上报" | `devcontainer.ts` 的 `parseJsonc`；fixture 的 `.devcontainer/devcontainer.json` **故意**写成 JSONC |
-| A-29 | Phase 5 · §2 采集清单（CI 配置、compose 的 services） | 从 `.github/workflows/*.yml` 的 `run:` 与 `compose.yaml` 的 services 读环境事实 | 两个 reader 都是**行级扫描**（缩进 + 正则）：CI 只取内联 `run:`（块状 `run: |` 进 `ignored`），compose 只取 `services:` 块里两空格缩进的服务名与 `image:` | 要读的只有两件小事，而且都是启发式——错了顶多少一条信号（`ignored` 里写明"只做了行级扫描"）。spec §0.2 没有 YAML 依赖，为它引一个库要按表格写理由。行级扫描读不到的东西（`depends_on` 关系、YAML 锚点、多文档）对 P5 的产出没有影响：服务名 + "沙箱里起不了它们"这句 degraded 说明已经够 agent 用 | `signals.ts` 的 `readCiHints` / `readServices` / `parseComposeServices`；真需要结构化 YAML 时（例如要判服务版本）再引库 |
+| A-29 | Phase 5 · §2 采集清单（CI 配置、compose 的 services） | 从 `.github/workflows/*.yml` 的 `run:` 与 `compose.yaml` 的 services 读环境事实 | 两个 reader 都是**行级扫描**（缩进 + 正则）：CI 只取内联 `run:`（块状 `run: \|` 进 `ignored`），compose 只取 `services:` 块里两空格缩进的服务名与 `image:` | 要读的只有两件小事，而且都是启发式——错了顶多少一条信号（`ignored` 里写明"只做了行级扫描"）。spec §0.2 没有 YAML 依赖，为它引一个库要按表格写理由。行级扫描读不到的东西（`depends_on` 关系、YAML 锚点、多文档）对 P5 的产出没有影响：服务名 + "沙箱里起不了它们"这句 degraded 说明已经够 agent 用 | `signals.ts` 的 `readCiHints` / `readServices` / `parseComposeServices`；真需要结构化 YAML 时（例如要判服务版本）再引库 |
 | A-30 | Phase 5 · 交付物（`images/sandbox/Dockerfile` 改为 `FROM reuben-cloud/base-<x>`） | "保留一层薄封装" | 薄封装只剩 FROM + 两个 LABEL，底座选 `base-fullstack`；`npm run build:image` 从一条 `docker build` 改成 `scripts/build-images.ts`（按拓扑序建 common → python-dev → fullstack → sandbox-base 并打印 digest），新增 `npm run build:base-images` 建七档；`scripts/sandbox-image-check.ts` 的缓存断言从"看 sandbox 镜像里的 `#6 CACHED`"改成"看 common 那次构建真的没跑 apt + sandbox 镜像的 config digest 不变" | ① `sandbox-base:dev` 这个 tag 是"本地开发与既有测试的底座"（egress-proxy 的集成测试要 python venv、agent 集成测试要 node、image-check 要 git/tar），矩阵里只有 fullstack 同时满足；② 镜像名是**一个**事实——脚本从 `base-images.ts` 取引用，Dockerfile 的缺省 ARG 只是手工构建时的方便值；③ apt 层随 common 搬走后，旧断言里的步骤号必然失效，而"步骤号"本来就是最脆的断言方式 | `images/sandbox/Dockerfile`、`scripts/build-images.ts`、`scripts/sandbox-image-check.ts`、`package.json`、`docs/sandbox-spec.md` Phase 4 的构建命令、README §8 |
+
+| A-31 | Phase 6 · `007_env_builds.sql` | 建表语句只给 `trigger` 一个 CHECK | 另加 `status` / `inference` 的 CHECK 与 `(project_key, revision, attempt)` 索引 | 与 006 同一条理由：这两个列是被 `switch` / `if` 按值读的（UI 徽章、队列的分支、P7 的缓存），写错一个字母只会让某个分支永远走不到；索引是因为"这个仓库这一版试过几次"是 UI 与排障最常读的形态 | 007 迁移；`store.ts` 的 `listEnvBuilds`；集成测试按 attempt 升序断言三行 |
+| A-32 | Phase 6 · 生成阶段的两类失败 | 分类表只有日志类（`unknown_base_image` … `unknown`） | `env_builds.error_class` 另收 `generation_failed`（模型没给代码块 / 调用失败）与 `constraint_violation`（生成结果违反硬约束、按 spec 不进 build）；`env_builds.dockerfile` 是 NOT NULL，生成失败时放模型原文或一句说明 | "这一轮为什么没成"对下一轮生成是同一个问题；把它们记成 `unknown` 会让 UI 与 prompt 都少一句可行动的诊断。形状统一（同一个 `BuildFailure`）之后，循环里只有一处填 `error_class` | `build.ts` 的 `ENV_BUILD_ERROR_CLASSES`；`queue.ts` 的两个失败分支；单测两条用例 |
+| A-33 | Phase 6 · §4 自愈循环（**计划本身的修正，正文已同步**） | `dockerfile = (attempt == 1) ? 规则生成 : LLM 生成(...)` | `signals` 级的第一轮就是 LLM 生成（规则渲染结果作为 prompt 里的基线）；`devcontainer` / `dockerfile` 级保持"第一轮规则、失败才自愈"；没有生成端口时（没配模型 key）一律退化成规则生成 | ① P5 §4 对这一级的原话是"本地规则；P6 接 LLM 生成"；② 规则渲染对 signals 级只给得出一行 `FROM`（没有作者写的 devcontainer / Dockerfile 可复用），而一行 FROM 的镜像几乎永远构不出错——等构建失败再上模型等于模型永远没有机会，环境里也就永远没有系统依赖；③ L1/L2 相反：第一轮规则输出里有作者的事实，先用它省一次模型调用 | `queue.ts` 的 `#plan`；单测两条（signals 级第一轮就调模型 / devcontainer 级第一轮不调） |
+| A-34 | Phase 6 · §4 记账口径（**计划本身的修正，正文已同步**） | 循环末尾"失败 → … 进 usage_ledger（kind='env_build'）" + 测试要点 6"三轮自愈 → 3 行" | **每次 LLM 生成各记一行**；第一轮走规则生成的那条路（L1/L2 且第一轮失败前）不记假账；模型调用失败但拿到了 usage 也照记 | 账本是成本，规则生成没有模型调用；"三轮 → 3 行"只在三轮都有 LLM 调用时成立（signals 级正是这样）。反过来给零 token 的规则轮记一行，会让按 kind 汇总的账多出一批"花了钱"的假行 | `queue.ts` 的 recordUsage 分支；单测断言 3 行（signals）与 1 行（devcontainer）两种形态 |
+| A-35 | Phase 6 · §2 日志落点 | "日志：docker 的 stdout/stderr 合并，边流边写对象存储（`env_builds.log_key`）" | 落点是一个端口（`BuildLogStore`）：配了 S3 就用它，没配就落本地目录（`REUBEN_CLOUD_ENV_LOG_DIR`，缺省 `$TMPDIR/reuben-cloud-env-logs`）；上传失败只记一条 warn 并把 `log_key` 置空 | 对象存储是**部署形态**、本地文件是**开发形态**；让"没配 S3 就不能构建环境"成为事实，只会逼人在本地把四个 S3 变量编出来。日志是证据不是产物：一次成功的构建不该因为 MinIO 抖动而失败（反过来，构建失败也不会因为日志丢了而变成成功） | `build.ts` 的 `FileBuildLogStore` / `envBuildLogStoreFromEnv`；单测两条；README §8 的环境变量表 |
+| A-36 | Phase 6 · 交付物 | 只有三个模块 + 迁移 + 两个 builder 实现 | 多一个 `scripts/build-env.ts`（`npm run env:build`：推断 → 建 revision → 入队 → 打印分轮结果与 digest） | 验收标准是"人为缺一个依赖的仓库能在 ≤3 轮内构建成功"——手工验收需要一条能真连 PG、真读 `.env` 里的模型凭据的驱动；P7 的 `agent:run --rebuild-env` 要等 P7 的会话接线，先给一个独立脚本少一次等待（与 P8 的 `index:repo` 同一个定位） | `scripts/build-env.ts`、`package.json`、README §8 |
+| A-37 | Phase 6 · 构建成功之后的环境状态 | 只写了"最终失败 → `environments.status='failed'`" | 成功时**不动**状态：留在队列开始时推进过去的 `building`，等 P7 的健康检查收尾 | `ready` 的定义是"依赖装上了、构建命令跑通了"（设计文档 §C.6），而 P6 只证明了 `docker build` 成功。在这里写 ready 等于把"可能用不了"当成事实，degraded 就再也没机会出现——而 degraded 是 M2 最有价值的一个状态 | `queue.ts` 的收尾分支；集成测试断言 `status='building'`；P7 的健康检查接着推到 ready / degraded / failed |
+| A-38 | Phase 6 · 镜像 tag 与成功后的文本回写 | `-t reuben-cloud/env-<project_key>-<revision>:build`；没说自愈成功之后 `environments.dockerfile` 怎么办 | tag 变成 `reuben-cloud/env-<slug>-r<revision>:build`（`/` 与怪字符 slug 化，同一版的所有尝试共用一个 tag）；成功自愈后把**实际构建的那份文本**写回 `environments.dockerfile` | ① tag 里不能有 `/`，而 `project_key` 就是 `owner/name`；② P7 的缓存键里有一项是 `dockerfileText`：如果环境行留着规则生成的那份、而镜像是模型改过的，缓存命中就会把"用另一份文本构建的镜像"当成这一版的产物复用出去——那是最难查的一类错（本地是好的、别人那儿不对） | `build.ts` 的 `envImageTag` / `slugifyProjectKey`；`store.ts` 的 `setEnvironmentDockerfile`；`queue.ts` 的收尾；集成测试断言回写 |
 
 **已经预知的两条偏差**（实施时必须确认并回填）：
 

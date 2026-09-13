@@ -25,6 +25,29 @@ export const INFERENCE_LEVELS = ["devcontainer", "dockerfile", "signals"] as con
 export type InferenceLevel = (typeof INFERENCE_LEVELS)[number];
 
 /**
+ * 构建队列的触发来源（设计文档 §C.8）。**只影响入队**，不改变构建流程。
+ *
+ * 【为什么它是类型而不是一句注释】`env_builds.trigger` 有 CHECK 约束，三处入队点
+ * （会话 / CLI / 页面）与测试都按这三个值分支。写成字面量联合之后，拼错在编译期就报错。
+ */
+export const ENV_BUILD_TRIGGERS = ["first_seen", "manual", "promote"] as const;
+export type EnvBuildTrigger = (typeof ENV_BUILD_TRIGGERS)[number];
+
+/**
+ * 一次构建尝试的 Dockerfile 是从哪来的：三级推断的 level，或 P6 的 LLM 生成。
+ *
+ * 【为什么与 `InferenceLevel` 分开】"这一版环境是 devcontainer 级推断"与
+ * "这一次尝试的文本是模型生成的"是两个不同的事实：同一版环境的第 1 次尝试可能是
+ * 规则生成（signals），第 2 次就是 llm。混用之后 UI 上会看到自相矛盾的两行。
+ */
+export const ENV_BUILD_INFERENCES = ["devcontainer", "dockerfile", "signals", "llm"] as const;
+export type EnvBuildInference = (typeof ENV_BUILD_INFERENCES)[number];
+
+/** 一次尝试的状态（`env_builds.status`）。`built` 只说明 docker build 成功——能不能用是 P7 的健康检查的事。 */
+export const ENV_BUILD_STATUSES = ["building", "built", "failed"] as const;
+export type EnvBuildStatus = (typeof ENV_BUILD_STATUSES)[number];
+
+/**
  * 「看到了但没用」的一条记录。
  *
  * 【为什么这个类型值得存在】设计文档 §C.3 的原话是"不支持的字段要显式记录'已忽略'，

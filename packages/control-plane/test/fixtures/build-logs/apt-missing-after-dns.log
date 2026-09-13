@@ -1,0 +1,15 @@
+#5 [2/3] RUN apt-get update && apt-get install -y --no-install-recommends libvips42-dev
+#5 30.101 Get:1 http://deb.debian.org/debian bookworm InRelease [151 kB]
+#5 30.104 Err:1 http://deb.debian.org/debian bookworm InRelease
+#5 30.104   Temporary failure resolving 'deb.debian.org'
+#5 30.210 Reading package lists...
+#5 30.384 Reading package lists...
+#5 30.385 Building dependency tree...
+#5 30.402 E: Unable to locate package libvips42-dev
+------
+Dockerfile:2
+--------------------
+   1 | FROM reuben-cloud/base-node-dev:dev
+   2 | >>> RUN apt-get update && apt-get install -y --no-install-recommends libvips42-dev
+--------------------
+ERROR: failed to solve: process "/bin/sh -c apt-get update && apt-get install -y --no-install-recommends libvips42-dev" did not complete successfully: exit code: 100

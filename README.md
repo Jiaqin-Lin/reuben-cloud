@@ -253,12 +253,22 @@ L3  以上都没有                            →  信号推断 + LLM 生成 Do
 **LLM 生成 Dockerfile + 自愈循环**（这一步很实用）：
 
 ```
-生成 Dockerfile
+生成 Dockerfile（signals 级第一轮就上模型；devcontainer / Dockerfile 级第一轮先用规则渲染）
+  → 校验硬约束（FROM 必须是 Layer 1 / 不写 CMD、ENTRYPOINT、COPY、凭据、curl|sh）
   → 构建
-  → 失败? 把构建错误 + Dockerfile + repo 信号 喂回模型 → 重新生成
-  → 最多 N 轮（比如 3 轮）
-  → 仍失败 → Env 状态置 failed，保留全部日志给用户看
+  → 失败? 把「错误分类 + 诊断 + 日志尾部 40 行 + 上一版 Dockerfile」喂回模型 → 重新生成
+  → 最多 3 轮，单轮 10 分钟超时（网络类故障只重试 1 次）
+  → 仍失败 → Env 状态置 failed，保留全部 attempt 与日志给用户看
 ```
+
+错误分类是收敛的关键：把 2000 行日志压成一句可行动的诊断（`apt_package_missing` 会带上包名、
+`syntax_error` 带上行号、`unknown_base_image` 会重列一遍 Layer 1 清单）；网络类故障与
+"包不存在"在日志里会同时出现（DNS 挂了之后 apt 也会说"看不到包"），所以分类有**优先级**。
+每次 LLM 生成都进 `usage_ledger`（`kind='env_build'`），自愈不会变成无限烧钱。
+
+**构建队列**：并发 1（宿主机 docker daemon 是共享资源）、按 `project_key` 去重（同一仓库已有构建在跑
+就复用那一次）、**失败不阻塞**（一个坏仓库不会把后面排队的卡死）。三个触发源
+（`first_seen` / `manual` / `promote`）走同一个入队函数，差别只有 `env_builds.trigger` 这一列。
 
 **构建即缓存**：以 `hash(base_image + repo_signals + builder_version)` 为 key。命中直接复用。团队里第一个人构建，后面所有人秒开 —— 这个收益是复利的。
 
@@ -285,6 +295,7 @@ Environment 有版本号，可 diff、可回滚。用户手动在会话里装了
   写进上下文告诉 agent——构建失败是合法结果，它不该变成"用户的话没人处理"。
 
 设计细节与三个触发点（`first_seen` / `manual` / `promote`）见 [`docs/agent-runtime.md` §C.8](docs/agent-runtime.md)。
+手工跑一次见 §8 的 `npm run env:build`。
 
 ---
 
@@ -698,7 +709,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 
 **第二部分 · Environment**
 - [x] P5 环境定义与推断（**Layer 1 七档镜像矩阵** `images/base/Dockerfile.{common,node-dev,python-dev,go-dev,rust-dev,fullstack,ubuntu-dev}`——非语言部分抽到 `common`（sandbox-agent + git/curl/tar/gzip/procps + uid 1000 契约），语言镜像只加自己的工具链；`images/sandbox/Dockerfile` 只剩 `FROM base-fullstack` + 两个 LABEL，构建入口换成 `npm run build:image` = `scripts/build-images.ts`（按拓扑序建链 + 打印 digest，另有 `build:base-images` 建七档）；CP 侧 `environment/{base-images,signals,devcontainer,infer}.ts` + 最小 `store.ts`——三级判定（**devcontainer 子集** > Dockerfile/compose > 信号）、信号采集（锁文件优先级 / 运行时版本 / 构建入口 / CI / compose 服务 / monorepo，**只读不执行**、**两次采集逐字节相同**）、自带的容错 **JSONC** 解析、**确定性渲染**出完整可构建的 Dockerfile（`checkDockerfileConstraints` 与 P6 共用硬约束，`USER root` 必须切回）；`006_environments.sql`（revision 单调 + `kind`/`level`/`status` 三个 CHECK）；三个 fixture 仓库（`test/fixtures/repos/`）各命中一级，集成测试里**真的 build 成功**且继承 Layer 1 的 `CMD` 与 `1000:1000`）
-- [ ] P6 LLM 生成 Dockerfile + 自愈循环（≤3 轮、错误分类、成本记账）+ **构建队列**（并发 1、按仓库去重、`env_builds.trigger`）
+- [x] P6 LLM 生成 Dockerfile + 自愈循环 + **构建队列**（`environment/{generate,build,queue}.ts` + `007_env_builds.sql`：生成 prompt = 规则基线 + 信号 + 上一版 + 错误分类 + 日志尾部 40 行（`cache:"none"`）；**`signals` 级第一轮就上模型**、devcontainer / dockerfile 级第一轮用规则、失败才自愈（附录 A-33）；硬约束复用 P5 的 `checkDockerfileConstraints`，违反**不进 build**；错误分类 10 类 + 优先级 + 抽包名 / 行号（DNS 与"看不到包"同时出现时先报网络）；真 builder = `docker build --iidfile`——构建上下文只含 Dockerfile、日志边跑边写（有 S3 写 S3，否则 `REUBEN_CLOUD_ENV_LOG_DIR`）、10 分钟超时杀**进程组**、构建进程 env 白名单里没有凭据；队列并发 1 + 按 `project_key` 去重 + 失败不阻塞；每次 LLM 生成进 `usage_ledger`（`kind='env_build'`）；`env_builds` 逐 attempt 一行（status / inference / trigger 三个 CHECK）；手工验收 `npm run env:build -- --local <path>`——真模型跑过一次（`deepseek-flash` 给 node 仓库补了 make / build-essential / python3）
 - [ ] P7 缓存 + 版本化 + 健康检查（ready / degraded / failed）+ promote + **触发接线**（`first_seen` / `manual` / `promote`，Run 拿不到环境就先用基础镜像）
 
 **第三部分 · 索引与上下文**
@@ -831,6 +842,10 @@ export S3_BUCKET=reuben-cloud
 export S3_ACCESS_KEY_ID=reuben-cloud
 export S3_SECRET_ACCESS_KEY=reuben-cloud-dev
 
+# Phase 6 起：环境构建的日志同样走上面那四个变量；**一个都不给时落本地文件**
+# （开发形态；`npm run env:build` 末行会打印日志目录）。换位置用这个：
+export REUBEN_CLOUD_ENV_LOG_DIR=/tmp/reuben-cloud-env-logs   # 可选
+
 # Phase 11 起：agent 循环要模型凭据。**只在 CP 里**（§F.3 红线：沙箱内不存在任何凭据）。
 # 推荐写进仓库根的 .env（已在 .gitignore 里；脚本带 --env-file-if-exists 会自动读）：
 #   REUBEN_CLOUD_PROVIDER=deepseek
@@ -870,6 +885,25 @@ npm run agent:run -- --local ~/code/my-project --issue "..." --serve
 （或者 `GITHUB_APP_PRIVATE_KEY` 内联 PEM；相对路径按进程 cwd → 仓库根依次找）；`--no-draft` 可以关掉默认的 draft。
 建完 GitHub App 之后用 `npm run app:installations` 查 installation id 并核对三个权限（只读 API）；
 把私钥放在仓库根时记得别改 `.env` 里的路径——它已经被 `.gitignore` 拦住了（`*.pem`）。
+
+### 跑一次环境构建（Phase 6）
+
+```bash
+npm run dev:up && export DATABASE_URL=$(npm run --silent db:url)
+npm run build:image                              # Layer 1（生成的 Dockerfile 的 FROM 指它）
+
+# 推断 → LLM 生成 + 自愈（≤3 轮）→ environments / env_builds 两张表
+npm run env:build -- --local ~/code/my-project
+npm run env:build -- --local ~/code/my-project --project acme/web --trigger manual
+npm run env:build -- --local ~/code/my-project --no-model   # 只看规则生成的 Dockerfile
+```
+
+- 模型凭据来自 `.env`（与 `agent:run` 同一份）；没配 key 时自动退化成规则生成（不是错误）；
+- 脚本会打印每一轮的 status / 错误分类 / 日志 key / digest；构建成功之后环境定义留在 `building`
+  ——能不能用是 Phase 7 的健康检查的结论（设计文档 §C.6）；
+- 日志：配了 S3 就落对象存储（`env-logs/` 前缀），否则落本地目录（见上面的
+  `REUBEN_CLOUD_ENV_LOG_DIR`）；
+- 同一个仓库再跑一次 = 新 revision；"第二次秒开"要等 Phase 7 的缓存命中。
 
 ### 会话与沙箱租约（Phase 2）
 

@@ -1,25 +1,40 @@
 /**
- * `environment/store.ts` —— `environments` 表的读写（spec Phase 5 的验收项：表能存下一份完整候选）。
+ * `environment/store.ts` —— `environments` / `env_builds` 两张表的读写（spec Phase 5 的验收项：
+ * 表能存下一份完整候选；Phase 6 §5：每次尝试一行）+ 构建队列要的存储端口。
  *
  * 【为什么 P5 就有了它】spec 的交付物清单里只有迁移，没有 store；但验收标准里写着
  * "`environments` 表能存下一份完整候选（level / dockerfile / signals / notes）"——
  * 只建表不写入口的话，这条验收只能靠测试里手写 SQL 证明，而真正要用的 P6/P7 还得再造一次。
- * 所以这里只放**最小**的三个函数（插入 / 按 id 取 / 取最新），revision 的父指针、promote、
- * 清理策略都留给 P7 的 `revision.ts`（附录 A-27）。
  *
  * 【revision 为什么在 SQL 里算】"同一 project_key 单调递增"必须是**一次**数据库动作
  * （`MAX(revision) + 1` 与插入同一条语句），否则"先查后写"在并发下必然产生重复 revision。
  * `(project_key, revision)` 的唯一键是最后一道闸：并发撞上了会拿到唯一约束冲突，
  * 而不是两份都写进去。P7 会在这个入口上做真正的串行化（它需要 revision 的父子关系）。
  *
+ * 【`EnvBuildStore` 为什么在这里而不是 queue.ts】它是**队列的依赖端口**，但实现是 SQL：
+ * 端口与实现放一起，`queue.ts` 只 import 类型（没有运行时依赖，也就不存在循环 import）；
+ * 单测的替身（内存实现）放在 `test/environment-fakes.ts`，与 SessionStore 的 memory/PG
+ * 两份实现是同一条规矩。
+ *
  * 【列名为什么是 snake_case】与 `db/sandboxes.ts` 同一条理由：pg 回来的就是这样，
  * 多一层驼峰映射只会多一处能写错的地方。
  */
 
+import type { UsageRow } from "@reuben-cloud/agent-runtime";
 import type { Queryable } from "../db/client.ts";
 import { maybeOne, one } from "../db/client.ts";
+import { insertUsage } from "../session/postgres.ts";
 import { prefixedId } from "../ulid.ts";
-import type { EnvironmentCandidate, EnvKind, EnvStatus, InferenceLevel, RepoSignals } from "./types.ts";
+import type {
+  EnvBuildInference,
+  EnvBuildStatus,
+  EnvBuildTrigger,
+  EnvironmentCandidate,
+  EnvKind,
+  EnvStatus,
+  InferenceLevel,
+  RepoSignals,
+} from "./types.ts";
 
 /** 一行 environments。字段与 006 迁移一一对应。 */
 export interface EnvironmentRow {
@@ -116,4 +131,179 @@ export function listEnvironments(q: Queryable, projectKey: string, limit = 10): 
       [projectKey, limit],
     )
     .then((result) => result.rows);
+}
+
+// ---------------------------------------------------------------- 环境状态的推进（P6 的队列写）
+
+/**
+ * 推进某一版环境的状态。返回受影响行数（**0 = 那一版不存在**——调用方据此记一条 warn，
+ * 而不是静默地把状态丢了：那会让 UI 永远停在旧值上，排查时无从下手）。
+ *
+ * 【为什么成功不在这里收尾】P6 只证明"docker build 成功"，而 `ready` 的定义是
+ * "依赖装上了、构建命令跑通了"（设计文档 §C.6），那是 P7 在一次性沙箱里体检的结论。
+ * 所以构建成功之后环境行留在 `building`，等健康检查把它推到 ready / degraded / failed。
+ */
+async function setEnvironmentStatus(
+  q: Queryable,
+  projectKey: string,
+  revision: number,
+  status: EnvStatus,
+): Promise<number> {
+  const result = await q.query(
+    "UPDATE environments SET status = $3 WHERE project_key = $1 AND revision = $2",
+    [projectKey, revision, status],
+  );
+  return result.rowCount ?? 0;
+}
+
+/**
+ * 自愈成功后把"真正构建的那份文本"写回环境定义。
+ *
+ * 【为什么必须写回】P7 的缓存键里有一项是 `dockerfileText`：如果环境行留着规则生成的那份、
+ * 而镜像是模型改过的那份，缓存命中就会把一个**用另一份文本构建的镜像**当成这一版的产物
+ * 复用出去——那是最难查的一类错（"本地是好的，别人那儿不对"）。
+ */
+async function setEnvironmentDockerfile(
+  q: Queryable,
+  projectKey: string,
+  revision: number,
+  dockerfile: string,
+): Promise<void> {
+  await q.query("UPDATE environments SET dockerfile = $3 WHERE project_key = $1 AND revision = $2", [
+    projectKey,
+    revision,
+    dockerfile,
+  ]);
+}
+
+// ---------------------------------------------------------------- env_builds（一次尝试一行）
+
+/** 一行 env_builds。字段与 007 迁移一一对应。 */
+export interface EnvBuildRow {
+  id: string;
+  project_key: string;
+  revision: number;
+  attempt: number;
+  inference: EnvBuildInference;
+  trigger: EnvBuildTrigger;
+  status: EnvBuildStatus;
+  error_class: string | null;
+  dockerfile: string;
+  log_key: string | null;
+  duration_ms: number | null;
+  image_digest: string | null;
+  created_at: Date;
+}
+
+/** 开一行 attempt。**在 build 开始前写**（见 007 迁移的头注释：UI 要看得见"正在建"）。 */
+export interface NewEnvBuild {
+  id: string;
+  projectKey: string;
+  revision: number;
+  attempt: number;
+  inference: EnvBuildInference;
+  trigger: EnvBuildTrigger;
+  /** 本次尝试要构建的文本（生成阶段失败时是模型原文 / 一句说明）。 */
+  dockerfile: string;
+}
+
+/** 收一行 attempt。成功与失败都走这里；`building` 不会被写回（那是初始值）。 */
+export interface EnvBuildFinish {
+  status: Exclude<EnvBuildStatus, "building">;
+  errorClass?: string | null;
+  logKey?: string | null;
+  durationMs?: number | null;
+  imageDigest?: string | null;
+}
+
+/** `bld_<ulid>`（spec §0.1 的 ID 前缀表）。 */
+export function envBuildId(): string {
+  return prefixedId("bld");
+}
+
+/**
+ * 队列要的存储端口。
+ *
+ * 【为什么是端口而不是直接拿 `Db`】自愈循环的全部行为（几轮、分类、记账、状态推进）
+ * 都要能在**没有 Postgres、没有 docker** 的单测里验证（npm test 的红线）。
+ * 端口把"循环怎么跑"与"往哪落"分开，PG 实现仍然是唯一的 SQL 出处。
+ */
+export interface EnvBuildStore {
+  startAttempt(row: NewEnvBuild): Promise<void>;
+  finishAttempt(id: string, patch: EnvBuildFinish): Promise<void>;
+  /** 推进环境状态；返回受影响行数（见 `setEnvironmentStatus`）。 */
+  setEnvironmentStatus(projectKey: string, revision: number, status: EnvStatus): Promise<number>;
+  setEnvironmentDockerfile(projectKey: string, revision: number, dockerfile: string): Promise<void>;
+  /** 一次 LLM 生成的用量进账本（kind='env_build'，没有 session / run）。 */
+  recordUsage(row: UsageRow): Promise<void>;
+}
+
+export async function insertEnvBuild(q: Queryable, input: NewEnvBuild): Promise<EnvBuildRow> {
+  return one<EnvBuildRow>(
+    q,
+    `INSERT INTO env_builds (id, project_key, revision, attempt, inference, trigger, status, dockerfile)
+     VALUES ($1, $2, $3, $4, $5, $6, 'building', $7)
+     RETURNING *`,
+    [
+      input.id,
+      input.projectKey,
+      input.revision,
+      input.attempt,
+      input.inference,
+      input.trigger,
+      input.dockerfile,
+    ],
+  );
+}
+
+export async function finishEnvBuild(q: Queryable, id: string, patch: EnvBuildFinish): Promise<void> {
+  await q.query(
+    `UPDATE env_builds
+        SET status = $2, error_class = $3, log_key = $4, duration_ms = $5, image_digest = $6
+      WHERE id = $1`,
+    [
+      id,
+      patch.status,
+      patch.errorClass ?? null,
+      patch.logKey ?? null,
+      patch.durationMs ?? null,
+      patch.imageDigest ?? null,
+    ],
+  );
+}
+
+export function getEnvBuild(q: Queryable, id: string): Promise<EnvBuildRow | null> {
+  return maybeOne<EnvBuildRow>(q, "SELECT * FROM env_builds WHERE id = $1", [id]);
+}
+
+/** 某一版环境的全部尝试（按 attempt 升序 = 时间序；UI 的分轮日志与排障读它）。 */
+export function listEnvBuilds(q: Queryable, projectKey: string, revision: number): Promise<EnvBuildRow[]> {
+  return q
+    .query<EnvBuildRow>(
+      "SELECT * FROM env_builds WHERE project_key = $1 AND revision = $2 ORDER BY attempt",
+      [projectKey, revision],
+    )
+    .then((result) => result.rows);
+}
+
+/** 把 PG 包成队列要的端口。**SQL 只在这里**（唯一的方言出处）。 */
+export function pgEnvBuildStore(db: Queryable): EnvBuildStore {
+  return {
+    async startAttempt(row: NewEnvBuild): Promise<void> {
+      await insertEnvBuild(db, row);
+    },
+    async finishAttempt(id: string, patch: EnvBuildFinish): Promise<void> {
+      await finishEnvBuild(db, id, patch);
+    },
+    setEnvironmentStatus(projectKey: string, revision: number, status: EnvStatus): Promise<number> {
+      return setEnvironmentStatus(db, projectKey, revision, status);
+    },
+    async setEnvironmentDockerfile(projectKey: string, revision: number, dockerfile: string): Promise<void> {
+      await setEnvironmentDockerfile(db, projectKey, revision, dockerfile);
+    },
+    async recordUsage(row: UsageRow): Promise<void> {
+      // 账本 SQL 复用会话侧的插入（`usage_ledger` 只有一份写入实现）。
+      await insertUsage(db, row);
+    },
+  };
 }

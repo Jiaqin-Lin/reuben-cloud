@@ -1,0 +1,15 @@
+#4 [1/2] FROM docker.io/library/reuben-cloud/base-python-dev:dev
+#4 CACHED
+#5 [2/2] RUN python3 -m pip install --no-cache-dir nonexistent-package-xyz==9.9.9
+#5 0.641 Collecting nonexistent-package-xyz==9.9.9
+#5 1.102   ERROR: HTTP error 404 while getting https://pypi.org/simple/nonexistent-package-xyz/
+#5 1.110 ERROR: 404 Client Error: Not Found for url: https://pypi.org/simple/nonexistent-package-xyz/
+#5 1.203 ERROR: Could not find a version that satisfies the requirement nonexistent-package-xyz==9.9.9 (from versions: none)
+#5 1.204 ERROR: No matching distribution found for nonexistent-package-xyz==9.9.9
+------
+Dockerfile:2
+--------------------
+   1 | FROM reuben-cloud/base-python-dev:dev
+   2 | >>> RUN python3 -m pip install --no-cache-dir nonexistent-package-xyz==9.9.9
+--------------------
+ERROR: failed to solve: process "/bin/sh -c python3 -m pip install --no-cache-dir nonexistent-package-xyz==9.9.9" did not complete successfully: exit code: 1
