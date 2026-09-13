@@ -35,15 +35,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "24"
           cache: npm
 
       - name: 安装依赖
         run: npm ci
+
+      # 几秒钟就能跑完的那两类检查，放在最前面：类型与单元测试一旦挂了，
+      # 没必要先花几分钟建镜像才知道。它们不需要 Docker、不需要网络。
+      - name: 快速检查（类型 + 单元测试，不需要 Docker）
+        run: |
+          npm run typecheck
+          npm test
 
       - name: 构建沙箱镜像与出网代理镜像
         run: |
@@ -79,9 +86,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "24"
           cache: npm

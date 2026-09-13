@@ -1192,8 +1192,11 @@ npm run smoke -- --list          # 只列出会跑的文件
 
 | job | 步骤 |
 |---|---|
-| `smoke` | checkout → setup-node 24（带 npm 缓存）→ `npm ci` → `npm run build:image` + `npm run build:proxy-image` → `npm run proxy:up` → `npm run smoke` |
+| `smoke` | checkout → setup-node 24（带 npm 缓存）→ `npm ci` → **`npm run typecheck` + `npm test`**（几秒钟，不需要 Docker）→ `npm run build:image` + `npm run build:proxy-image` → `npm run proxy:up` → `npm run smoke` |
 | `negative-control` | 同样的准备，然后 `SMOKE_NEGATIVE_CONTROL=1 npm run smoke -- --tag=isolation`，**断言它非 0 退出、且日志里出现 `CapDrop`** |
+
+actions 用 `actions/checkout@v5` / `actions/setup-node@v5`：v4 的运行时是 Node 20，GitHub 已经在用
+Node 24 强行跑它并打弃用警告（第一次跑 CI 时就看到了，见实现备注 16）。
 
 两个 job 都带一个 `if: failure()` 的诊断步骤（`docker ps -a` + 代理与各沙箱的 `docker logs`），
 因为冒烟失败时第一件要做的事永远是"先看容器"。触发条件是 `pull_request` + **push 到 main** +
@@ -1230,8 +1233,11 @@ CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**
 
 ### 验收标准
 
-- [x] CI 上 `npm run smoke` 全绿 —— 本地：macOS 全量 16/16、隔离组 `SMOKE_ANY_PLATFORM=1` 参考跑 10/10、
-      `tsc --noEmit` 通过、Phase 5/6 的集成测试 24/24 未被影响；**真 CI 的结果要等第一次推上去**（本机没有远端）
+- [x] CI 上 `npm run smoke` 全绿 —— 第一次跑（`8a20b2a`）**两个 job 都在 10 秒内红了**：
+      `npm ci` 直接 `EUSAGE`——`package-lock.json` 从 Phase 5 起就没同步过（`control-plane` 也不在里面），
+      而之前的 Phase 从没在 CI 里跑过 `npm ci`（见实现备注 16）。修完 lockfile 后本地 `npm ci` 复现通过；
+      本地另已验过：macOS 全量 26/26（含 `SMOKE_ANY_PLATFORM=1` 的红线）、`tsc --noEmit`、
+      Phase 5/6 集成测试 24/24
 - [x] **反向验证 job 红了**（证明脚本有牙齿）—— 本地用 `SMOKE_ANY_PLATFORM=1 SMOKE_NEGATIVE_CONTROL=1` 跑 `--tag=isolation`：
       10 条里**只有 I10 变红**，且断言消息里含 `CapDrop`（CI 的 job 断言的就是这两件事）
 - [x] 手工把 `CapDrop` 去掉再跑一次，本地也变红 —— 同上一行（同一套机制；CI 里由 negative-control job 每次自动做）
@@ -1314,6 +1320,15 @@ CI 的 negative-control job 断言两件事：`--tag=isolation` **非 0 退出**
     是 Phase 7 的验收项之一。加上 push 到 main 之后：第一次推送就能看到完整结果，
     以后直推 main 也仍然验一遍红线（对单人开发来说这是唯一的安全网）。
     它**不是**跳过开关：pull_request 与 push 两条路径跑的是同一条 `npm run smoke`，都没有参数。
+16. **CI 第一次跑就把一个从 Phase 5 埋下的问题抓了出来：`package-lock.json` 一直是旧的。**
+    两个 job 都在 10 秒内红，报的是 `npm ci` 的 `EUSAGE`：lockfile 的 `packages` 里只有
+    `packages/sandbox-agent`——`control-plane`（Phase 5 新增的 workspace）从未进去，
+    更不用说刚加的 `packages/e2e`。本地一直没暴露是因为开发时跑的是 `npm test` / `npm run smoke`
+    （不校验 lockfile），而前六个 Phase 从没在 CI 里跑过 `npm ci`。修法：`npm install --package-lock-only`
+    把三个 workspace 补进 lockfile。
+    顺带两件事：（a）冒烟 job 里加了一步 `npm run typecheck` + `npm test`（几秒钟、不需要 Docker），
+    这类"提交前就该知道"的失败不必等镜像构建完；（b）actions 从 `@v4` 升到 `@v5`——v4 的运行时是
+    Node 20，GitHub 已经拿 Node 24 强行跑它并打弃用警告（annotations 里能看到）。
 
 ---
 ---
