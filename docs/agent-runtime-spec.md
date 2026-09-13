@@ -1429,6 +1429,23 @@ import 路径直接给出高权重边（weight=2）
 - 内存：worker `--max-old-space-size=1024`；
 - 索引失败**不阻塞 Run**（只是没有 Repo Map）：`indexer` 返回 `null`，Run 继续。
 
+> **实现备注**：P8 落地时有 7 条有意偏差，逐条记在附录 A-49 … A-55——迁移里是**四张表**
+> （多一张 `repo_file_refs` 存"候选引用"，没有它增量就没法精确重建边，A-49）；交付物多两个文件
+> `index/git-port.ts` 与 `index/vendor.ts`（A-50）；九份语法文件从 `@vscode/tree-sitter-wasm@0.3.1`
+> vendor 而来（`web-tree-sitter` 钉 `~0.27.0`，`vendor:tree-sitter --check` 校验摘要，A-51）；
+> 单文件预算**只能事后判定**（WASM 的 parse 不可中断），超了丢掉这个文件的结果（A-52）；
+> `repo_indexes.files` 数是**扫描到的**文件数（含不支持的语言），截断时 `error='partial_max_files'`
+> （A-53）；`index:repo` 多 `--dry-run`（不连库）与从 origin 推 `owner/name`（A-54）；
+> 引用候选收窄成"裸调用目标 + 成员链的根 + import 路径"，并过滤框架全局名、把匿名函数当遍历边界（A-55）。
+>
+> 另外几处把 spec 没说死的地方写死：① 增量只重算三类边——变化文件的全部边、"候选名字的
+> 定义集变了"的边、"import 解析结果变了"的边；受影响的 `(path, symbol)` 同时是复制时的排除集
+> （两边由同一份数据决定，不会出现"排除了却没重算"）；② 解析失败（超时 / 崩 / 太大 / 读不动）
+> 的文件**不保留旧结果**——它在这次索引里就是"没有符号、没有引用"；③ 索引成功后按 `built_at`
+> 只保留最近两版（当前 + 增量基准），更老的整段删掉；④ `git diff` 用 `-z` + `--no-renames`
+> （路径原样输出；改名拆成删 + 加，宁可多解析一个文件）；⑤ 同 `(repo_key, commit_sha)` 已有
+> `ready` 行时直接返回（`mode: "skipped"`，一个字节都不写），这是幂等的最便宜形态。
+
 ### 技术边界
 
 - **不做类型解析 / 精确 call graph**（那是每语言一套编译器前端的量级）；文件级边足够 Repo Map 用；
@@ -1464,7 +1481,7 @@ import 路径直接给出高权重边（weight=2）
 ### 交付物
 
 - `packages/control-plane/src/index/{rank,render,personalize}.ts`
-- `packages/control-plane/src/db/migrations/009_repo_map.sql`（`repo_maps` 缓存表）
+- `packages/control-plane/src/db/migrations/010_repo_map.sql`（`repo_maps` 缓存表；009 已被 P8 的仓库索引占掉，同 A-39 的理由）
 - `npm run map:repo -- --local <path> --issue-file <f>`（可单独看地图长什么样）
 - 接线：ContextCompiler 的 `repo_map` 分区（P10 正式接，本 Phase 先提供函数）
 
@@ -2006,6 +2023,15 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 | A-46 | Phase 7 · §2 清理 | "清理：保留最近 10 个 revision；被 sandboxes 表引用过的 image_digest 永不清理" | 清理的对象**只有镜像**：`planRevisionCleanup()` 算计划（窗口 10 + 引用 + 被窗口内版本共用的 digest），`pruneRevisionImages()` 用注入的 `removeImage` 端口执行（生产 = `docker image rm`）；`environments` 的行一个都不删 | `runs.env_revision` 指向某一版——删行会让"这次执行当时用的是什么环境"变成悬空引用，而那是排障要看的第一条线索。行很小、镜像很大，所以清理只对后者动手。"被窗口内版本共用"是必须的一条：回滚 / promote 之后可能有两版指向同一个 digest，删了就把正在用的那一版一起弄坏 | `revision.ts`；`store.ts` 的 `listReferencedDigests`；`runtime.ts` 在每次新镜像建出来之后后台跑一次 |
 | A-47 | Phase 7 · §4 UI 与日志代理 | "只读路由"；观察窗的文件头写着"这个服务只有 GET" | 环境页有**一条 POST**（`POST /env/{projectKey}/build`，manual 入队，回 202 不等构建）；日志路由形如 `GET /env/{projectKey}/logs/{revision}?build=<bld_id>`（或 `?health=<run_id>`），**对象 key 由服务端用校验过的四段拼**，客户端不传 key | ① 一个 GET 不该有副作用（浏览器预取、链接重放、爬虫都会踩到"重建环境"）；这条写口的合法性来自它的位置——只绑定回环、无鉴权、单租户（M1 的真 API 面不在这里长）。② 让客户端传 key 等于开一个任意读的口（`../`、别人的仓库、别的前缀）；服务端拼 key 之后"只允许 `env-logs/` 前缀"是结构上的性质，不需要一条 if 挡着 | `web/server.ts` 的 `parseEnvRoute` / `handleEnvRoute`；`web/env.ts` 的 `readEnvironmentLog` / `logRequestOf`；`web-env.test.ts` 的路由与 400/404/503 用例 |
 | A-48 | Phase 7 · §5 Run 侧回退 | "用 Layer 1 的语言镜像" | 新增 `provider/image-ref.ts`（把 `resolveImageRef` 从 `test/support.ts` 搬过来，脚手架改成 re-export）；`runtime.ts` 缺省用它把 Layer 1 的 tag 解析成 digest，解析不到返回 null、由解析层抛出可行动的错误 | `SandboxSpec.image` 只收 digest，所以生产路径也需要"tag → digest"这一步；而产品代码 import 测试脚手架是反向依赖（AGENTS.md §1）。搬迁零成本（调用方按 `test/support.ts` 的路径 import，一行不动），留在脚手架里则意味着 P7 的 Run 侧回退要么复制一份实现、要么永远只能跑在测试里 |
+
+| A-49 | Phase 8 · §1 迁移 | 三张表（`repo_indexes` / `repo_symbols` / `repo_refs`）；§5 只写"边的两端涉及 C 时重算" | 加**第四张表** `repo_file_refs(repo_key, commit_sha, path, symbol, kind)`——"候选引用"（出现在这个文件里的名字 / import 路径，还没解析成边的那一步）；索引成功后按 `built_at` 只保留最近两版（当前 + 增量基准），更老的整段删掉 | ① 增量要精确重建边就必须知道"不变文件里出现过哪些名字"。只从上一版的边反推会在**歧义那条边**上丢信息：`n > 5` 时我们刻意不产生任何边（spec §4），于是"某个名字当时有 8 个定义"这件事在 `repo_refs` 里不留痕迹——将来它变成唯一时增量就发现不了新边，"增量 == 全量"（测试要点 5）在那个角落里不成立。② 每索引一个 commit 就多一整份符号表，而索引每次 Run 都可能发生（P9 起）；留两版之外的历史只值考古，而它是派生物，随时能重建 | 009 迁移；`store.ts` 的 `insertRepoFileRefs` / `listRepoFileRefs` / `pruneRepoIndexes`；`indexer.ts` 的受影响集与复制排除集；`index-incremental.test.ts` 的两条用例（同一 commit 幂等、只留两版） |
+| A-50 | Phase 8 · 交付物 | `index/{parse,symbols,refs,worker,store}.ts` + `indexer.ts` | 多两个文件：`index/git-port.ts`（增量判定要的三条 git 命令的真实现：`rev-parse HEAD` / `merge-base --is-ancestor` / `diff --name-status -z`）、`index/vendor.ts`（`vendor/tree-sitter/` 的**唯一**出处，可用 `REUBEN_CLOUD_TREE_SITTER_DIR` 覆盖） | ① 增量判定是 P8 唯一"结果依赖历史"的逻辑，它必须能在没有 git 仓库的单测里被逐条验证（`IndexGitPort` 是端口，真实现单独一个文件），否则 `indexer.ts` 里会长出 `spawn`。② vendor 目录有三个使用方（worker 的默认值、indexer 的传参、CLI），各写一遍相对路径就会漂，而路径写错的唯一症状是"worker 一启动就崩"——要跨进程排查 | 纯新增；`parseWorkerArgs` 与 `indexRepository` 的缺省值都指向它 |
+| A-51 | Phase 8 · 交付物（语法文件） | `vendor/tree-sitter/*.wasm`（**7 种**语言语法文件 + LICENSE + `SHA256SUMS`）；依赖表只写"`web-tree-sitter` 最新稳定（pin 到 minor）"，语法文件"vendored"没说来路 | 九份 `.wasm`，来源钉成 `@vscode/tree-sitter-wasm@0.3.1`（VS Code 自己发布的包），由 `scripts/vendor-tree-sitter.ts` 下载并写 `SHA256SUMS` + `LICENSE`（`npm run vendor:tree-sitter --check` 只校验摘要、不联网）；`web-tree-sitter` 钉 `~0.27.0` | ① 设计文档 §D.2 的语言清单（TypeScript/TSX、JavaScript、Python、Go、Rust、Java、Ruby、PHP）数一遍是九个——TS 与 TSX 各需要一个语法文件，spec 标题里的"7 种"是笔误。② 九份语法文件**同源同版本**：从九个仓库各取一个 release 是九条会漂的路径，而 ABI 是与 `web-tree-sitter` 之间唯一的契约（当前 ABI 14/15）。③ 那个 npm 包只在**重新 vendor 的那一刻**出现，不影响任何一次 `npm install`（spec §0.2 表格里"替代方案"那一栏的理由） | `vendor/tree-sitter/`（8.3 MB，含 SHA256SUMS 与 LICENSE）；`scripts/vendor-tree-sitter.ts`；`packages/control-plane/package.json` 多一个依赖；`index-parse.test.ts` 用真 wasm 跑一次往返 |
+| A-52 | Phase 8 · §6 预算 | "单文件预算：200ms（超时跳过该文件）"；"全量索引预算：90s 硬超时" | 单文件预算**事后判定**：worker 记录每个文件的解析耗时，超了就把这个文件的结果丢掉（`status: "timeout"`，符号与候选都不落库）；总预算由主进程墙钟 `SIGKILL`（worker 自己也会在每两个文件之间看表，能优雅收尾），另有 5s 收尾宽限 | WASM 的 `parse` 是同步的、不可中断——没有"掐掉一个文件"这回事，想真中断只能杀进程，而杀进程会丢掉整批已解析的结果。事后丢弃保住的是"落库的符号不来自超预算的文件"这条语义；代价是那个文件的 CPU 已经花掉了（它本来也只占 200ms 的量级） | `parse.ts` 的 worker 循环（`status === "timeout"` 的两个分支）；`parseBatch` 的硬杀与 `killGraceMs`；`index-incremental.test.ts` 的单文件超时用例 |
+| A-53 | Phase 8 · §1 `repo_indexes.files` | `files integer NOT NULL DEFAULT 0`（没说数什么）；`error` 只举了 `partial_timeout` 一个例子 | `files` = **扫描到的**文件数（含不认识的语言与超大文件）；`languages` 只数那九种语言；扫描被 `maxFiles`（20000）截断时 `error = "partial_max_files"` | ① 拿"解析成功的文件数"当 `files` 会让"这个索引覆盖了多少"与"仓库里到底有多少文件"分不清，而 P9 要按这个比例判断"该不该在地图上标一句不完整"。② 截断必须是**可见的**：地图少了三分之一文件时模型不会知道，而"地图不全"与"仓库就这么大"对 agent 是两件事 | `parse.ts` 的 `discoverFiles`（复用 `environment/signals.ts` 的 `scanRepo`：什么算仓库文件只有一处定义）；`indexer.ts` 的 `error`；`index:repo` 的输出 |
+| A-54 | Phase 8 · dev 脚本 | `npm run index:repo -- --local <path>`（不接 GitHub 也能建索引） | 多两个开关：`--dry-run`（不连 PG，只跑发现 + 解析 + 算边并打印符号与边）、`--repo owner/name`（缺省时从 clone 的 `origin` 推，推不出来才退回目录名）；`--top <n>` 控制打印条数 | ① `--dry-run` 是"第一次在一台干净机器上验证"的最短路径（不需要 `dev:up`），也是排障时回答"这个仓库解析出来长什么样"的第一句话。② `repo_key` 是索引的键：手工跑用目录名、生产用 `owner/name`，同一次索引会变成两份互不相干的数据；从 remote 读一次就避免了这个人人都可能踩的不一致 | `scripts/index-repo.ts`；`package.json` 的 `index:repo` 与 `vendor:tree-sitter`；README §8 |
+
+| A-55 | Phase 8 · §4 引用边的候选 | "对每个文件：收集标识符（去掉语言关键字与局部变量名的最佳努力：只取'出现在成员访问左侧 或 作为调用目标'的名字）" | 收窄成三类：**裸调用目标**（`helper(x)` / `new Store()` / JSX 组件名）、**成员链的根**（`a.b.c` → `a`）、**import 路径**；`a.b.c()` 里的 `c` 与 `console.error` 里的 `error` 都不再是候选；另外过滤掉测试框架注入的全局名（`describe` / `test` / `it` / `expect` / `assert` / `before` / `after` / …），并把匿名函数（箭头函数 / lambda / 闭包 / Ruby 块）当作遍历边界（局部定义不再进符号表） | ① 属性名会与**任何**同名函数挂钩，而它给出的依赖信息（"用了某个对象/模块"）已经由成员链的根给出了——在本仓库自身上量过：`console.log` / `res.text` / `stream.end` / `container.destroy` 这类属性名贡献了 7.6% 的边（`log` 一个名字 212 条）；② 框架全局名撞上"恰好同名的一个定义"是 1/N 衰减救不了的那一类（`describe` 命中两个 interface 上的同名方法、`assert` 命中一个脚本里的局部 helper，共 265 条）；③ 匿名函数不是定义节点，遍历会走进去，测试回调里的 `const input = …` 会被当成模块级常量收下来——这条直接制造了几百条假边（实测 8630 → 4424 条边，第 ② 条修完之后剩下的噪声换成"局部变量名撞上顶层定义"，属于名字匹配法的固有代价，见设计文档 §D.3 的"宁可少边"）。**留一个 P9 的杠杆**：如果地图里仍被 `path` / `store` / `log` 这类"词汇名"占位，可以在 `edgesFor()` 上加一条文档频率闸（被 20 个以上文件引用的名字不产生边）——那需要把"变化文件引用过的名字"也纳入增量的受影响集（现在的受影响集只覆盖"定义集变了的名字"） | `refs.ts` 的 `RefRules` / `calleeName` / `FRAMEWORK_GLOBALS` / `KEYWORDS`；`symbols.ts` 的 `FUNCTION_BOUNDARIES`；`index-refs.test.ts` 的四条"候选提取的收窄"用例与 `index-symbols.test.ts` 的匿名函数边界用例 |
 
 **已经预知的两条偏差**（实施时必须确认并回填）：
 

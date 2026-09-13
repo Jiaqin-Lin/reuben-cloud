@@ -64,7 +64,9 @@ node --test packages/control-plane/test/unit/web-server.test.ts
 ## 3. 硬性约束（破了就是 bug，不是风格问题）
 
 1. **`agent-runtime` 不许 import `pg` / `octokit` / `@aws-sdk/*`**。存储用接口注入（`SessionStore`），
-   容器与宿主实现放在 CP。SQL 只允许出现在 `packages/control-plane/src/session/postgres.ts`。
+   容器与宿主实现放在 CP。SQL 只允许出现在 CP 的存储层——一个领域一个文件：
+   `session/postgres.ts`、`environment/store.ts`（P5 起）、`index/store.ts`（P8 起）、`db/*.ts`。
+   别的模块（尤其是编排与路由）不许自己拼 SQL。
 2. **Node >= 24 + `erasableSyntaxOnly`**：能在容器/宿主直接 `node xxx.ts` 跑的代码不得用 enum /
    namespace / 参数属性 / 装饰器（沙箱镜像里没有构建步骤）。`import type` 与 `.ts` 扩展名是这个仓库
    的写法（`allowImportingTsExtensions` + `verbatimModuleSyntax`）。

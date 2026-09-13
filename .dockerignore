@@ -16,6 +16,10 @@ docs
 # CP 还不在这个阶段的交付里，而且它是最会长的那个包。
 packages/control-plane
 
+# P8 起：语法文件（vendor/tree-sitter/*.wasm，8.3MB）只服务 CP 侧的符号索引，
+# 而索引**不在沙箱里跑**（设计文档 §D.2）——镜像里一个字节都不需要它。
+vendor
+
 # 下面两条不在 spec 的清单里，理由：
 #   packages/*/test —— 测试不进镜像（镜像里只有 src），排掉它让「镜像里到底有什么」
 #                      一眼可见；CONTEXT 小一圈只是附带好处。

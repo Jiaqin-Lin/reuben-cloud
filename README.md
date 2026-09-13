@@ -316,6 +316,10 @@ Environment 有版本号，可 diff、可回滚。用户手动在会话里装了
 | 依赖图 | import/call graph | 影响面分析（改了 A 会影响谁） | ⚠️ 只做文件级引用图 |
 | **仓库地图** | 符号图 + PageRank | **最重要：压缩成几 K token 常驻上下文** | ✅ 核心 |
 
+> **P8 落地**（符号索引）：表是 `repo_indexes` / `repo_symbols` / `repo_refs` / `repo_file_refs`（`009_repo_index.sql`），
+> 代码在 `packages/control-plane/src/index/`，九种语言的语法文件 vendored 在 `vendor/tree-sitter/`。
+> `npm run index:repo -- --local <path>` 可以立刻看到某个仓库解析出什么（见 §8）。
+
 **仓库地图（Repo Map）是被验证过最有效的一招**（Aider 的做法）：在符号引用图上跑 PageRank，取排名最高的 N 个符号，连同它们的签名，生成一份"这个仓库长什么样"的骨架，几 K token 就能让模型有全局感。这比向量检索 RAG 更稳定，因为它给的是**结构**而不是**相关片段**。
 
 #### 上下文预算分配
@@ -713,7 +717,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 - [x] P7 缓存 + 版本化 + 健康检查 + promote + **触发接线**（`environment/{cache,health,health-sandbox,revision,resolve,runtime}.ts` + `008_env_health.sql`：**缓存键** = `sha256(基础镜像 + 规范化信号 + BUILDER_VERSION + Dockerfile 文本)`，命中直接复用 digest 与体检结论（`findCacheHit` 只认 ready / degraded）；**体检**在用该镜像起的一次性沙箱里跑（clone → 灌仓库 → 按语言选命令 → `ready` / `degraded`（结构化事实 `{reason, affected, detail}`）/ `failed`，跑完即焚），构建成功后由队列同一条链收尾；**版本**：`revision` 单调 + `parent_revision`、`project_env_state.current_revision`（回滚 = 指针指回旧值、不删行）、promote（会话里验证过的 Dockerfile 固化成新 revision）、保留最近 10 版且被 `sandboxes.image_digest` 引用过的镜像永不清理（只删镜像不删行）；**Run 侧只解析不构建**——`resolveEnvironment` 命中就用项目环境、没命中就用 Layer 1 镜像 + 一句结构化事实并**异步入队** `first_seen`（`runs.env_revision` 记用了哪一版）；CLI `agent:run --env-revision/--rebuild-env/--promote-env/--no-env`、`env:build --rebuild/--no-health`；环境页 `/env/{projectKey}`（状态 / 体检细节 / 历次构建 / 日志只读代理 + manual 触发按钮））
 
 **第三部分 · 索引与上下文**
-- [ ] P8 仓库符号索引（tree-sitter WASM + 文件级引用图 + 增量）
+- [x] P8 仓库符号索引（**四张表** `009_repo_index.sql`：`repo_indexes`（每个 commit 一行统计与状态）+ `repo_symbols`（符号：名字 / kind（六种）/ 单行签名 / 1 起行号）+ `repo_refs`（文件级边：唯一同名 1.0、歧义 1/n、`n>5` 丢弃、import 2.0）+ `repo_file_refs`（候选引用，增量精确重建边的输入，A-49）；CP 侧 `index/{symbols,refs,parse,worker,git-port,store,indexer,vendor}.ts`——**九种语言**（TS/TSX/JS/Python/Go/Rust/Java/Ruby/PHP）的定义节点表 + 通用遍历器（签名截到 body 之前、压单行、200 字符），`vendor/tree-sitter/*.wasm` **vendored 8.3 MB**（来源 `@vscode/tree-sitter-wasm@0.3.1` + SHA256SUMS，`npm run vendor:tree-sitter --check` 校验摘要，A-51）；解析在**子进程 worker** 里跑（一批文件一个、NDJSON 协议、`--max-old-space-size=1024`、单文件 200ms 事后判定、总预算 90s 主进程硬杀、崩溃只落一行 `failed` 不动 CP，A-52）；**增量** = 只解析变化的 A/M + 从上一版复制没变化的行 + 只重算三类边（变化文件的全部边 / "候选名字定义集变了"的边 / "import 解析结果变了"的边），与全量共用同一段 `edgesFor()`，所以"增量 == 全量"是结构性质（单测 + 集成两层哈希断言）；只留最近两版（A-49）；手工验收 `npm run index:repo -- --local <path> [--dry-run] [--rebuild]`；单测（含 9 语言符号金标准 / 边与歧义 / worker 崩溃隔离 / 增量==全量）+ 集成（真 PG + 真 git + 真 WASM）；5k 文件合成仓库解析 + 算边 **678ms**（预算 90s、验收线 60s）
 - [ ] P9 **仓库地图（Repo Map）**（PageRank + 个性化 + token 预算 + 确定性）
 - [ ] P10 ContextCompiler（分区预算 + 缓存前缀 + 可回放）
 - [ ] ~~向量索引~~：**移出 M2**（没有需求驱动，也没有评估集；先有实测案例再单独立项）
@@ -854,6 +858,10 @@ export REUBEN_CLOUD_ENV_LOG_DIR=/tmp/reuben-cloud-env-logs   # 可选
 export ANTHROPIC_API_KEY=sk-...               # 或这个（两个都有时用 REUBEN_CLOUD_PROVIDER 选）
 export REUBEN_CLOUD_MODEL=claude-opus-4-8    # 可选；默认值按 provider 走
 export REUBEN_CLOUD_EFFORT=high              # 可选；low|medium|high|xhigh|max
+
+# Phase 8 起：符号索引的语法文件目录。缺省就是仓库里的 vendor/tree-sitter/（8.3 MB，vendored）；
+# 打包进镜像 / 单独挂载时用这个变量指过去（写错的唯一症状是"worker 一启动就崩"，A-50）。
+export REUBEN_CLOUD_TREE_SITTER_DIR=/opt/reuben-cloud/tree-sitter   # 可选
 ```
 
 ### 跑一次 agent（Phase 11 + 12 + 13）
@@ -1033,4 +1041,32 @@ GET  /env/{projectKey}/logs/{n}?health=<run_id>   某次体检的日志
   因此是结构上的性质，而不是一条 if；
 - 触发只对**这个进程认识的那个仓库**有效（环境页对别的仓库是只读的）；
 - 它是观察窗里唯一一条非 GET 路由：一个 GET 不该有副作用（浏览器预取、链接重放都会踩到）。
+
+### 跑一次仓库索引（Phase 8）
+
+```bash
+npm run dev:up && export DATABASE_URL=$(npm run --silent db:url)
+
+# ① 不连库看一眼解析结果（发现 → 解析 → 算边，打印符号与边）
+npm run index:repo -- --local ~/code/my-project --dry-run --top 20
+
+# ② 真的建索引（落 repo_indexes / repo_symbols / repo_refs / repo_file_refs）
+npm run index:repo -- --local ~/code/my-project                  # 第一次：全量
+npm run index:repo -- --local ~/code/my-project                  # 第二次：同一个 commit 直接跳过
+npm run index:repo -- --local ~/code/my-project --rebuild         # 忽略上一版，强制全量
+npm run index:repo -- --local ~/code/my-project --commit <sha>    # 索引指定快照
+
+# ③ 语法文件的摘要（升级 / 手工改动之后第一时间跑；不联网）
+npm run vendor:tree-sitter --check
+```
+
+- `repo_key` 缺省从 clone 的 `origin` 推 `owner/name`（推不出来才用目录名）——索引的键必须与生产
+  那一次一致，否则同一次索引会变成两份互不相干的数据（A-54）；
+- 索引读的是**工作区**里的文件（与生产一致：CP 的 clone 停在某个 commit 上），所以手工跑之前
+  自己 `git -C <clone> checkout <sha>`；
+- 每次成功索引只保留最近两版（当前 + 增量基准），更老的整段删掉（A-49）；
+- 增量怎么算、为什么只重算三类边、为什么必须有 `repo_file_refs` 这张表：见
+  `packages/control-plane/src/index/indexer.ts` 的文件头——那是 P8 唯一"结果依赖历史"的地方，
+  也是"增量 == 全量"这条不变量的全部论证。
+
 

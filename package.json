@@ -28,6 +28,8 @@
     "smoke": "node packages/e2e/src/smoke.ts",
     "agent:run": "node --env-file-if-exists=.env scripts/agent-run.ts",
     "env:build": "node --env-file-if-exists=.env scripts/build-env.ts",
+    "index:repo": "node --env-file-if-exists=.env scripts/index-repo.ts",
+    "vendor:tree-sitter": "node scripts/vendor-tree-sitter.ts",
     "app:installations": "node --env-file-if-exists=.env scripts/github-app-installations.ts",
     "proxy:up": "node scripts/egress-proxy.ts up",
     "proxy:down": "node scripts/egress-proxy.ts down",
