@@ -37,7 +37,7 @@ import type { Readable as NodeReadable } from "node:stream";
 import type { LogFn } from "../log.ts";
 import { noopLog } from "../log.ts";
 import type { SandboxTarget } from "../repo/types.ts";
-import type { RunEventSink } from "./events.ts";
+import type { ExecEventSink } from "./events.ts";
 import { createExecEventMapper, emitEvent } from "./events.ts";
 
 // ---------------------------------------------------------------- 沙箱出口（窄接口）
@@ -113,7 +113,7 @@ export interface SandboxToolkitOptions {
   /** 模型心里的工作目录，默认 `/workspace/repo`。 */
   repoDir: string;
   /** 观察窗出口（exec 事件的映射在这里做）。 */
-  events?: RunEventSink;
+  events?: ExecEventSink;
   log?: LogFn;
 }
 
@@ -165,7 +165,7 @@ export interface LazySandboxToolkitOptions {
   api: SandboxFilesPort;
   /** 模型心里的工作目录，默认 `/workspace/repo`。 */
   repoDir: string;
-  events?: RunEventSink;
+  events?: ExecEventSink;
   log?: LogFn;
 }
 
@@ -248,7 +248,7 @@ function createBashOperations(options: SandboxToolkitOptions): BuiltinToolOperat
 
   return {
     async exec(command: string, cwd: string, execOptions: BashExecOptions): Promise<BashExecResult> {
-      // 观察窗：沙箱的原始事件在这里翻成 RunEvent（前端不认识沙箱的词汇）。
+      // 观察窗：沙箱的原始事件在这里翻成观察窗事件（前端不认识沙箱的词汇）。
       const mapExecEvent = createExecEventMapper();
       /** 沙箱的 started 事件带来 executionId；abort 时用它去 kill。 */
       let executionId: string | null = null;
@@ -274,8 +274,8 @@ function createBashOperations(options: SandboxToolkitOptions): BuiltinToolOperat
           ...(execOptions.timeoutMs === undefined ? {} : { timeoutMs: execOptions.timeoutMs }),
           ...(execOptions.env === undefined ? {} : { env: execOptions.env }),
           onEvent: (event) => {
-            // ① 观察窗：沙箱事件 → RunEvent。
-            for (const runEvent of mapExecEvent(event)) emitEvent(options.events, runEvent, log);
+            // ① 观察窗：沙箱事件 → exec 事件（认不出的变成一条 note）。
+            for (const mapped of mapExecEvent(event)) emitEvent(options.events, mapped, log);
             // ② abort 时要用的 executionId（started 事件里带来）。
             const data = parseData(event);
             if (data !== null && typeof data["execution_id"] === "string") executionId = data["execution_id"];

@@ -1,5 +1,5 @@
 /**
- * `hub.ts` —— 观察窗的服务端：一次 Run 的事件缓冲 + 多订阅者广播（Phase 13）。
+ * `hub.ts` —— 观察窗的服务端：一次 Run 的事件缓冲 + 多订阅者广播（Phase 13，P4 改协议）。
  *
  * 【为什么需要它，而不是让 SSE 端点直接挂在循环上】三件事只有在这里做才做得对：
  *  ① **重放**：浏览器断线重连（`EventSource` 自带 `Last-Event-ID`）要能接上断点，
@@ -8,7 +8,11 @@
  *  ② **多个订阅者**：刷新页面会短暂出现新旧两条连接，`curl -N` 调试时也会多一条。
  *  ③ **解耦**：循环只管 `emit()`，它不等待、也不知道有没有人在看（`emitEvent` 吞异常）。
  *
- * 【为什么文本增量要合并】`onText` 的粒度是 token：一次 40 轮的 Run 能产生上万条增量。
+ * 【P4 改了什么】缓冲里存的从 M0 的 `RunEvent` 变成 `HubEvent`（Run 生命周期 + 沙箱输出 +
+ * **循环的原生 `AgentEvent`**）：一个 Run 的可观测信息只有一套来源。文字增量不再是一条
+ * 独立的 `text` 事件，而是 `message_update` 里 `text_delta` 的合并（下面那条规矩没变）。
+ *
+ * 【为什么文本增量要合并】`message_update` 的粒度是 token：一次 40 轮的 Run 能产生上万条增量。
  * 逐条进来的话，环形缓冲会被它挤爆（工具结果、轮次标记全被淘汰），浏览器也要为一堆
  * 一两个字符的事件各跑一次布局。合并规则只有一条：**文本攒到 80ms 或下一条非文本事件
  * 到达时一起发**。语义没有损失（页面上本来就是连续的一段文字），代价是"最后一个词
@@ -25,13 +29,14 @@
 
 import type { LogFn } from "../log.ts";
 import { noopLog } from "../log.ts";
-import type { RunEvent, RunEventSink } from "../agent/events.ts";
+import type { AgentMessage, AssistantMessage, AssistantStreamEvent } from "@reuben-cloud/agent-runtime";
+import type { HubEvent, HubEventSink } from "../agent/events.ts";
 
 /** 缓冲里的一条事件。`id` 从 1 开始单调递增，**它就是 SSE 的 `Last-Event-ID`**。 */
-export interface RunEventRecord {
+export interface HubEventRecord {
   id: number;
   ts: string;
-  event: RunEvent;
+  event: HubEvent;
 }
 
 /** `/runs/{id}/info` 的响应体（UI 用它判断 run 是否存在，也是页面标题的来源）。 */
@@ -44,6 +49,8 @@ export interface RunInfo {
   status: "running" | "ended";
   model: string | null;
   issue: string | null;
+  /** 这次执行挂在哪个会话上（页面用它读会话视图）；单跑没有会话时是 null。 */
+  sessionId: string | null;
   /** 当前缓冲里还有多少条（会被淘汰，所以不是"一共发生过多少条"）。 */
   bufferedEvents: number;
   /** 从开始到现在一共发过多少条（含已被淘汰的）。 */
@@ -86,12 +93,12 @@ export interface SubscribeOptions {
 }
 
 /** 没有 run 时 subscribe 返回 null；有 run 时返回一个异步迭代器（`for await` 消费）。 */
-export class Subscription implements AsyncIterableIterator<RunEventRecord> {
+export class Subscription implements AsyncIterableIterator<HubEventRecord> {
   /** 重放部分（订阅那一刻的快照），先于实时队列消费。 */
-  #replay: RunEventRecord[];
+  #replay: HubEventRecord[];
   #replayCursor = 0;
   /** 实时队列（有界）。 */
-  #queue: RunEventRecord[] = [];
+  #queue: HubEventRecord[] = [];
   #limit: number;
   #closed = false;
   #wake: (() => void) | null = null;
@@ -101,7 +108,7 @@ export class Subscription implements AsyncIterableIterator<RunEventRecord> {
   readonly #now: () => number;
   #detachAbort: (() => void) | null = null;
 
-  constructor(replay: RunEventRecord[], options: { limit: number; now: () => number; signal?: AbortSignal }) {
+  constructor(replay: HubEventRecord[], options: { limit: number; now: () => number; signal?: AbortSignal }) {
     this.#replay = replay;
     this.#limit = Math.max(1, options.limit);
     this.#now = options.now;
@@ -117,7 +124,7 @@ export class Subscription implements AsyncIterableIterator<RunEventRecord> {
   }
 
   /** 广播一条。**同步**：调用方（`RunHub.emit`）不该等一个慢消费者。 */
-  push(record: RunEventRecord): void {
+  push(record: HubEventRecord): void {
     if (this.#closed) return;
     if (this.#queue.length >= this.#limit) {
       const dropped = this.#queue.shift();
@@ -143,11 +150,11 @@ export class Subscription implements AsyncIterableIterator<RunEventRecord> {
     return this.#closed;
   }
 
-  [Symbol.asyncIterator](): AsyncIterableIterator<RunEventRecord> {
+  [Symbol.asyncIterator](): AsyncIterableIterator<HubEventRecord> {
     return this;
   }
 
-  async next(): Promise<IteratorResult<RunEventRecord>> {
+  async next(): Promise<IteratorResult<HubEventRecord>> {
     for (;;) {
       const ready = this.#take();
       if (ready !== null) return ready;
@@ -156,13 +163,13 @@ export class Subscription implements AsyncIterableIterator<RunEventRecord> {
     }
   }
 
-  async return(): Promise<IteratorResult<RunEventRecord>> {
+  async return(): Promise<IteratorResult<HubEventRecord>> {
     this.close();
     return { value: undefined, done: true };
   }
 
   /** 队列里下一条（重放优先，其次是积压的 gap 说明，最后是实时队列）。没有则 null。 */
-  #take(): IteratorResult<RunEventRecord> | null {
+  #take(): IteratorResult<HubEventRecord> | null {
     if (this.#replayCursor < this.#replay.length) {
       const value = this.#replay[this.#replayCursor]!;
       this.#replayCursor += 1;
@@ -179,7 +186,6 @@ export class Subscription implements AsyncIterableIterator<RunEventRecord> {
           ts: new Date(this.#now()).toISOString(),
           event: {
             type: "note",
-            turn: null,
             kind: "gap",
             message: `页面渲染跟不上，${count} 条事件被丢弃（Run 本身不受影响；重连后可以从断点补回来）`,
           },
@@ -213,9 +219,9 @@ interface PerRunLimits {
 class RunEntry {
   readonly runId: string;
   readonly startedAt: string;
-  #sink: RunEventSink;
+  #sink: HubEventSink;
 
-  #records: RunEventRecord[] = [];
+  #records: HubEventRecord[] = [];
   #bytes = 0;
   #seq = 0;
   #total = 0;
@@ -223,11 +229,21 @@ class RunEntry {
   #evictedThrough = 0;
   #subscribers = new Set<Subscription>();
 
-  #pendingText = "";
+  /**
+   * 攒着的文本增量（`message_update` + `text_delta`）。`partial` 取**最近一条**
+   * 增量里的快照——前端只需要 delta，`partial` 是给"将来要完整消息"的消费者留的。
+   */
+  #pendingText: {
+    message: AgentMessage;
+    partial: AssistantMessage;
+    contentIndex: number;
+    text: string;
+  } | null = null;
   #flushTimer: NodeJS.Timeout | null = null;
 
   #model: string | null = null;
   #issue: string | null = null;
+  #sessionId: string | null = null;
   #endedAt: string | null = null;
   #stopReason: string | null = null;
   #ok: boolean | null = null;
@@ -245,7 +261,7 @@ class RunEntry {
     this.#sink = { emit: (event) => this.emit(event) };
   }
 
-  get sink(): RunEventSink {
+  get sink(): HubEventSink {
     return this.#sink;
   }
 
@@ -259,21 +275,37 @@ class RunEntry {
 
   /**
    * 收一条事件。文本走合并；其余事件先 flush 掉还没发的文本（**顺序不能乱**：
-   * 文本属于它前面那一轮，先发 `tool_call` 再补上一段文字会让页面顺序错乱）。
+   * 文本属于它前面那一轮，先发 `tool_execution_start` 再补上一段文字会让页面顺序错乱）。
    */
-  emit(event: RunEvent): void {
-    if (event.type === "text") {
-      this.#pendingText += event.delta;
-      if (this.#coalesceMs === 0) this.flushText();
-      else if (this.#flushTimer === null) {
-        this.#flushTimer = setTimeout(() => this.flushText(), this.#coalesceMs);
-        // 别让一个合并窗口把进程吊住（run 结束后来不及 flush 的那一个词不重要）。
-        this.#flushTimer.unref();
-      }
+  emit(event: HubEvent): void {
+    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      this.#appendText(event.message, event.assistantMessageEvent);
       return;
     }
     this.flushText();
     this.#publish(event);
+  }
+
+  /** 攒一条文本增量（见 `#pendingText` 的说明）。 */
+  #appendText(message: AgentMessage, delta: Extract<AssistantStreamEvent, { type: "text_delta" }>): void {
+    if (this.#pendingText === null) {
+      this.#pendingText = {
+        message,
+        partial: delta.partial,
+        contentIndex: delta.contentIndex,
+        text: delta.delta,
+      };
+    } else {
+      this.#pendingText.text += delta.delta;
+      this.#pendingText.partial = delta.partial;
+      this.#pendingText.message = message;
+    }
+    if (this.#coalesceMs === 0) this.flushText();
+    else if (this.#flushTimer === null) {
+      this.#flushTimer = setTimeout(() => this.flushText(), this.#coalesceMs);
+      // 别让一个合并窗口把进程吊住（run 结束后来不及 flush 的那一个词不重要）。
+      this.#flushTimer.unref();
+    }
   }
 
   /** 把攒着的文本立刻发出去。没有攒着的东西时是 no-op。 */
@@ -282,16 +314,25 @@ class RunEntry {
       clearTimeout(this.#flushTimer);
       this.#flushTimer = null;
     }
-    if (this.#pendingText === "") return;
-    const delta = this.#pendingText;
-    this.#pendingText = "";
-    this.#publish({ type: "text", delta });
+    const pending = this.#pendingText;
+    if (pending === null) return;
+    this.#pendingText = null;
+    this.#publish({
+      type: "message_update",
+      message: pending.message,
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: pending.contentIndex,
+        delta: pending.text,
+        partial: pending.partial,
+      },
+    });
   }
 
-  #publish(event: RunEvent): void {
+  #publish(event: HubEvent): void {
     this.#seq += 1;
     this.#total += 1;
-    const record: RunEventRecord = { id: this.#seq, ts: new Date(this.#now()).toISOString(), event };
+    const record: HubEventRecord = { id: this.#seq, ts: new Date(this.#now()).toISOString(), event };
     this.#bytes += Buffer.byteLength(JSON.stringify(event));
     this.#records.push(record);
     this.#trim();
@@ -312,11 +353,12 @@ class RunEntry {
     }
   }
 
-  #noteMeta(event: RunEvent): void {
+  #noteMeta(event: HubEvent): void {
     switch (event.type) {
       case "run_start":
         this.#model = event.model;
         this.#issue = event.issue;
+        this.#sessionId = event.sessionId;
         break;
       case "run_end":
         this.#endedAt = new Date(this.#now()).toISOString();
@@ -334,7 +376,7 @@ class RunEntry {
 
   subscribe(options: SubscribeOptions): Subscription {
     const after = options.afterId ?? null;
-    const replay: RunEventRecord[] = [];
+    const replay: HubEventRecord[] = [];
     // 请求的游标落在淘汰区里：先给一条 gap，让客户端的游标跳到"最早的还在的"前面。
     // 它的 id 用 oldest.id - 1（比客户端当前的大、比下一条真实事件小），于是重连游标
     // 单调前进，不会因为一条说明而倒退。
@@ -345,7 +387,6 @@ class RunEntry {
         ts: new Date(this.#now()).toISOString(),
         event: {
           type: "note",
-          turn: null,
           kind: "gap",
           message: `缓冲里最早的 id 是 ${oldest.id}，你要的 ${after + 1} 已经被淘汰（最多保留 ${this.#options.maxEventsPerRun} 条）`,
         },
@@ -384,6 +425,7 @@ class RunEntry {
       status: this.#endedAt === null ? "running" : "ended",
       model: this.#model,
       issue: this.#issue,
+      sessionId: this.#sessionId,
       bufferedEvents: this.#records.length,
       totalEvents: this.#total,
       lastEventId: this.#seq,
@@ -410,7 +452,7 @@ export class RunHub {
   }
 
   /** 登记一个 run（幂等）并拿到它的 sink。 */
-  ensure(runId: string): RunEventSink {
+  ensure(runId: string): HubEventSink {
     const existing = this.#runs.get(runId);
     if (existing !== undefined) return existing.sink;
     const entry = new RunEntry(runId, this.#options, {

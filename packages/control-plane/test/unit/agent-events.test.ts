@@ -1,16 +1,17 @@
 /**
- * Phase 13 · 事件词汇与埋点（不需要网络、模型、Docker）；Phase 1 迁到新契约上。
+ * Phase 13 · 事件词汇与埋点（P4 迁到**唯一事件协议**上；不需要网络、模型、Docker）。
  *
- * 两件事在这里被验到：
- *  ① 沙箱事件 → RunEvent 的映射（`createExecEventMapper`）：字段名从 snake_case 翻过来、
- *     `executionId` 靠 `started` 事件补上、认不出的事件变成 note 而不是异常。
- *  ② **兼容层真的在发事件**：脚本化模型跑一次 → 事件序列与顺序（`tool_call` 必须在
- *     `tool_result` 之前）；真 `bash` 工具配一个假 exec 出口 → `exec_start` /
- *     `exec_output` / `exec_end` 真的发得出来。
+ * 三件事在这里被验到：
+ *  ① **AgentEvent → SSE 通道的映射**（`sseFrameOf`）：编译期清单
+ *     （`Record<AgentEvent["type"], true>`，漏一个类型就编译不过）驱动的运行期逐条断言。
+ *  ② 沙箱事件 → 观察窗事件（`createExecEventMapper`）：字段名从 snake_case 翻过来、
+ *     `executionId` 靠 `started` 事件补上、认不出的/坏掉的变成 **`AgentEvent` note** 而不是异常。
+ *  ③ 兼容层真的在把循环事件发出去：脚本化模型跑一次 → 事件序列与顺序
+ *     （`tool_execution_start` 必须在 `tool_execution_end` 之前；文字走 `message_update`）。
  *
- * 【Phase 1 的变化】模型侧从"返回一条完整响应"变成"流式事件"（`AgentEvent` 是唯一真相）；
- * CP 的 `runAgentLoop(options)` 仍然是入口，它把循环事件翻成 M0 的 `RunEvent`（P4 会把这个
- * 映射表变成正式协议）。所以这里的断言基本没变——变的是**假模型**与**工具装配**的写法。
+ * 【P4 的变化】M0 这里断言的是\"每个事件都翻成 `RunEvent`\"；现在观察窗收的就是循环的
+ * 原生事件——**翻译层本身被删掉了**，所以断言换成\"事件按原样、按顺序到达\"加上
+ * \"通道名由映射表决定\"。
  */
 
 import assert from "node:assert/strict";
@@ -19,10 +20,17 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { after, before, describe, test } from "node:test";
-import type { AgentTool, AssistantMessageEventStream, Content, ModelClient, ModelRequest } from "@reuben-cloud/agent-runtime";
+import type {
+  AgentEvent,
+  AgentTool,
+  AssistantMessageEventStream,
+  Content,
+  ModelClient,
+  ModelRequest,
+} from "@reuben-cloud/agent-runtime";
 import { createAssistantMessageEventStream, emptyUsage } from "@reuben-cloud/agent-runtime";
-import type { RunEvent, RunEventSink } from "../../src/agent/events.ts";
-import { createExecEventMapper, mapExecEvent } from "../../src/agent/events.ts";
+import type { ExecEvent, HubEvent, HubEventSink, RunEvent, SseEventName } from "../../src/agent/events.ts";
+import { createExecEventMapper, mapExecEvent, sseFrameOf } from "../../src/agent/events.ts";
 import { runAgentLoop } from "../../src/agent/run.ts";
 import type { ExecPort, SandboxFilesPort, ToolExecResult } from "../../src/agent/sandbox-operations.ts";
 import { createSandboxToolkit } from "../../src/agent/sandbox-operations.ts";
@@ -44,8 +52,8 @@ after(async () => {
 });
 
 /** 一个把事件收进数组的 sink（RunHub 的最小替身）。 */
-function collectingSink(): RunEventSink & { events: RunEvent[] } {
-  const events: RunEvent[] = [];
+function collectingSink(): HubEventSink & { events: HubEvent[] } {
+  const events: HubEvent[] = [];
   return {
     events,
     emit(event) {
@@ -58,8 +66,25 @@ function sse(event: string, data: unknown): SseEvent {
   return { id: "1", event, data: JSON.stringify(data) };
 }
 
-function typesOf(events: readonly RunEvent[]): string[] {
+function typesOf(events: readonly HubEvent[]): string[] {
   return events.map((event) => event.type);
+}
+
+/** 事件的紧凑标记（断言顺序用；`message_update` 的三种增量都记成同一个标记）。 */
+function markerOf(event: HubEvent): string {
+  switch (event.type) {
+    case "message_start":
+    case "message_end":
+      return `${event.type}:${event.message.role}`;
+    case "message_update":
+      return "message_update";
+    case "tool_execution_start":
+      return `tool_start:${event.toolName}`;
+    case "tool_execution_end":
+      return `tool_end:${event.toolName}:${event.isError}`;
+    default:
+      return event.type;
+  }
 }
 
 function textBlock(value: string): Content {
@@ -135,9 +160,117 @@ function stubTool(name: string, content = "ok"): AgentTool {
   };
 }
 
+// ---------------------------------------------------------------- AgentEvent → SSE 通道
+
+/** 每个 `AgentEvent` 的一个样本（运行时逐条喂给 `sseFrameOf`）。 */
+const AGENT_SAMPLE: Record<AgentEvent["type"], AgentEvent> = {
+  agent_start: { type: "agent_start" },
+  agent_end: { type: "agent_end", messages: [] },
+  turn_start: { type: "turn_start" },
+  turn_end: { type: "turn_end", message: { role: "assistant", content: [] }, toolResults: [] },
+  message_start: { type: "message_start", message: { role: "user", content: "hi" } },
+  message_update: {
+    type: "message_update",
+    message: { role: "assistant", content: [] },
+    assistantMessageEvent: {
+      type: "text_delta",
+      contentIndex: 0,
+      delta: "好",
+      partial: { role: "assistant", content: [] },
+    },
+  },
+  message_end: { type: "message_end", message: { role: "user", content: "hi" } },
+  tool_execution_start: { type: "tool_execution_start", toolCallId: "tu_1", toolName: "bash", args: {} },
+  tool_execution_update: {
+    type: "tool_execution_update",
+    toolCallId: "tu_1",
+    toolName: "bash",
+    args: {},
+    partialResult: {},
+  },
+  tool_execution_end: {
+    type: "tool_execution_end",
+    toolCallId: "tu_1",
+    toolName: "bash",
+    result: {},
+    isError: false,
+  },
+  context_compiled: { type: "context_compiled", turn: 1, sections: [], hash: "h" },
+  compaction: { type: "compaction", reason: "threshold", tokensBefore: 1, firstKeptEntryId: "ent_1" },
+  note: { type: "note", kind: "test", message: "说明" },
+};
+
+/**
+ * 编译期清单：**漏掉一个 `AgentEvent` 这里就是类型错误**；运行期再把每个样本真的
+ * 过一遍映射函数（spec 测试要点 1 的\"编译期 switch + 运行时表\"）。
+ */
+const AGENT_CHANNEL: Record<AgentEvent["type"], SseEventName> = {
+  agent_start: "agent",
+  agent_end: "agent",
+  turn_start: "turn",
+  turn_end: "turn",
+  message_start: "message",
+  message_update: "message",
+  message_end: "message",
+  tool_execution_start: "tool",
+  tool_execution_update: "tool",
+  tool_execution_end: "tool",
+  context_compiled: "context",
+  compaction: "compaction",
+  note: "note",
+};
+
+describe("Phase 4 · 事件 → SSE 通道", () => {
+  test("每个 AgentEvent 都映射到一个通道（逐个样本真跑一遍）", () => {
+    const types = Object.keys(AGENT_CHANNEL) as Array<AgentEvent["type"]>;
+    assert.ok(types.length >= 13, "AgentEvent 的类型数量不该少于 13");
+    for (const type of types) {
+      const event = AGENT_SAMPLE[type];
+      assert.equal(event.type, type, `样本 ${type} 自己写错了`);
+      assert.equal(sseFrameOf(event).event, AGENT_CHANNEL[type], `${type} 的通道不对`);
+    }
+  });
+
+  test("三个 Run 生命周期事件都走 `run` 通道", () => {
+    const samples: RunEvent[] = [
+      {
+        type: "run_start",
+        runId: "run_1",
+        sessionId: null,
+        model: "m",
+        issue: "i",
+        repoDir: "/workspace/repo",
+        limits: { maxTurns: 1, wallClockMs: 1, outputTokenBudget: 1, maxTokens: 1 },
+      },
+      { type: "run_end", ok: true, stopReason: "end_turn", detail: "d", turns: 1, toolCalls: 0, usage: emptyUsage() },
+      { type: "run_error", message: "崩了" },
+    ];
+    for (const event of samples) assert.equal(sseFrameOf(event).event, "run");
+  });
+
+  test("三个沙箱输出事件都走 `exec` 通道", () => {
+    const samples: ExecEvent[] = [
+      { type: "exec_start", executionId: null, cmd: ["ls"], cwd: null },
+      { type: "exec_output", executionId: null, stream: "stdout", text: "x" },
+      {
+        type: "exec_end",
+        executionId: null,
+        state: "completed",
+        exitCode: 0,
+        durationMs: 1,
+        stdoutBytes: 1,
+        stderrBytes: 0,
+        truncated: false,
+        logPath: null,
+      },
+    ];
+    for (const event of samples) assert.equal(sseFrameOf(event).event, "exec");
+  });
+});
+
 // ---------------------------------------------------------------- 映射
 
-describe("Phase 13 · 沙箱事件 → RunEvent", () => {
+describe("Phase 13 · 沙箱事件 → 观察窗事件", () => {
   test("started 带来 executionId 与命令，后面的输出事件借用它", () => {
     const map = createExecEventMapper();
     const started = map(
@@ -181,7 +314,7 @@ describe("Phase 13 · 沙箱事件 → RunEvent", () => {
     }
   });
 
-  test("truncated 变成一条 note，并把完整日志的位置写进去", () => {
+  test("truncated 变成一条 note（AgentEvent），并把完整日志的位置写进去", () => {
     const events = mapExecEvent(
       sse("truncated", { reason: "output_limit", limit: 1024, log_path: "/tmp/reuben-cloud/exec/exe_1.log" }),
       { executionId: "exe_1" },
@@ -221,8 +354,8 @@ describe("Phase 13 · 沙箱事件 → RunEvent", () => {
 
 // ---------------------------------------------------------------- 循环埋点
 
-describe("Phase 13 · 兼容层发出来的事件", () => {
-  test("一次带工具调用的 Run：run_start → turn → tool_call → tool_result → turn → run_end", async () => {
+describe("Phase 13 · 兼容层发出来的事件（P4：原生事件直通）", () => {
+  test("一次带工具调用的 Run：事件按循环的顺序原样到达，没有翻译层", async () => {
     const sink = collectingSink();
     const transcript = await newTranscript();
     const model = scriptedModel([callTool("tu_1", "bash", { command: "echo hi" }), say("好了")]);
@@ -232,32 +365,46 @@ describe("Phase 13 · 兼容层发出来的事件", () => {
       tools: [stubTool("bash")],
       transcript,
       issue: "跑一条命令",
+      sessionId: "ses_evt",
       events: sink,
-      onText: (delta) => sink.emit({ type: "text", delta }),
+      onText: () => undefined,
       log: noopLog,
     });
 
-    assert.deepEqual(typesOf(sink.events), [
+    assert.deepEqual(sink.events.map(markerOf), [
       "run_start",
-      "turn",
-      "tool_call",
-      "tool_result",
-      "turn",
-      "text",
-      "text",
+      "agent_start",
+      "turn_start",
+      "message_start:user",
+      "message_end:user",
+      "message_start:assistant",
+      "message_update", // toolcall_start
+      "message_update", // toolcall_delta
+      "message_update", // toolcall_end
+      "message_end:assistant",
+      "tool_start:bash",
+      "tool_end:bash:false",
+      "message_start:toolResult",
+      "message_end:toolResult",
+      "turn_end",
+      "turn_start",
+      "message_start:assistant",
+      "message_update",
+      "message_update",
+      "message_update",
+      "message_update",
+      "message_end:assistant",
+      "turn_end",
+      "agent_end",
       "run_end",
     ]);
+
     const runStart = sink.events[0]!;
     assert.equal(runStart.type === "run_start" ? runStart.model : null, "scripted-test");
     assert.equal(runStart.type === "run_start" ? runStart.issue : null, "跑一条命令");
-    const toolCall = sink.events[2]!;
-    assert.deepEqual(
-      { turn: toolCall.type === "tool_call" ? toolCall.turn : null, name: toolCall.type === "tool_call" ? toolCall.name : null },
-      { turn: 1, name: "bash" },
-    );
-    const toolResult = sink.events[3]!;
-    assert.equal(toolResult.type === "tool_result" ? toolResult.content : null, "ok");
-    assert.equal(toolResult.type === "tool_result" ? toolResult.isError : null, false);
+    assert.equal(runStart.type === "run_start" ? runStart.sessionId : null, "ses_evt");
+    const toolEnd = sink.events.find((event) => event.type === "tool_execution_end")!;
+    assert.equal(toolEnd.type === "tool_execution_end" ? toolEnd.isError : null, false);
     const runEnd = sink.events.at(-1)!;
     assert.equal(runEnd.type === "run_end" ? runEnd.ok : null, true);
     assert.equal(runEnd.type === "run_end" ? runEnd.turns : null, 2);
@@ -269,38 +416,46 @@ describe("Phase 13 · 兼容层发出来的事件", () => {
       .split("\n")
       .filter((line) => line !== "")
       .map((line) => JSON.parse(line) as Record<string, unknown>);
-    const turnsOf = (type: string): unknown[] => records.filter((record) => record["type"] === type).map((record) => record["turn"]);
+    const turnsOf = (type: string): unknown[] =>
+      records.filter((record) => record["type"] === type).map((record) => record["turn"]);
     assert.deepEqual(turnsOf("request"), [1, 2]);
     assert.deepEqual(turnsOf("response"), [1, 2]);
     assert.deepEqual(turnsOf("tool_call"), [1]);
   });
 
-  test("文字增量通过 onText 接到事件流上（唯一的高频通道）", async () => {
+  test("文字增量既能流到事件里，也能交给 onText（两条路同源不互斥）", async () => {
     const sink = collectingSink();
     const transcript = await newTranscript();
+    const seen: string[] = [];
     await runAgentLoop({
       model: scriptedModel([say("你好，世界")]),
       tools: [],
       transcript,
       issue: "x",
       events: sink,
-      onText: (delta) => sink.emit({ type: "text", delta }),
+      onText: (delta) => seen.push(delta),
     });
-    assert.deepEqual(typesOf(sink.events), ["run_start", "turn", "text", "text", "run_end"]);
-    assert.deepEqual(
-      sink.events.filter((event) => event.type === "text").map((event) => (event.type === "text" ? event.delta : null)),
-      ["你好", "，世界"],
-    );
+    const deltas = sink.events
+      .filter((event) => event.type === "message_update" && event.assistantMessageEvent.type === "text_delta")
+      .map((event) => (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta" ? event.assistantMessageEvent.delta : null));
+    assert.deepEqual(deltas, ["你好", "，世界"]);
+    assert.deepEqual(seen, ["你好", "，世界"]);
+    assert.deepEqual(typesOf(sink.events).slice(0, 3), ["run_start", "agent_start", "turn_start"]);
   });
 
-  test("stopReason=tool_use 但没有工具调用 → incomplete_response（注意 model_error 也一样如实报）", async () => {
+  test("stopReason=length 但没有工具调用 → run_end 如实报 incomplete_response", async () => {
     const sink = collectingSink();
     const transcript = await newTranscript();
     await runAgentLoop({
       model: scriptedModel([
         (stream) => {
           // 一轮"说了话但没有工具调用、也不是正常收尾"。
-          const message = { role: "assistant" as const, content: [textBlock("我说了话")], usage: emptyUsage(), stopReason: "length" as const };
+          const message = {
+            role: "assistant" as const,
+            content: [textBlock("我说了话")],
+            usage: emptyUsage(),
+            stopReason: "length" as const,
+          };
           stream.push({ type: "start", partial: { ...message } });
           stream.push({ type: "done", reason: "length", message });
         },
@@ -314,7 +469,7 @@ describe("Phase 13 · 兼容层发出来的事件", () => {
     assert.equal(end.type === "run_end" ? end.stopReason : null, "incomplete_response");
   });
 
-  test("模型报错：一条 note（kind=model_error）+ run_end（stopReason=model_error）", async () => {
+  test("模型报错：一条 AgentEvent note（kind=model_error）+ run_end（stopReason=model_error）", async () => {
     const sink = collectingSink();
     const transcript = await newTranscript();
     const failing: ModelClient = {
@@ -341,6 +496,10 @@ describe("Phase 13 · 兼容层发出来的事件", () => {
     assert.equal(note?.type === "note" ? note.kind : null, "model_error");
     const end = sink.events.at(-1)!;
     assert.equal(end.type === "run_end" ? end.stopReason : null, "model_error");
+    // note 排在失败的那条消息之后（页面上"模型失败"不会出现在那句失败的话之前）。
+    const noteIndex = sink.events.findIndex((event) => event.type === "note");
+    const messageEndIndex = sink.events.findIndex((event) => event.type === "message_end");
+    assert.ok(noteIndex > messageEndIndex);
   });
 
   test("重复调用：第三次插提示（note），第四次停（note + run_end）", async () => {
@@ -372,7 +531,9 @@ describe("Phase 13 · 兼容层发出来的事件", () => {
       events: sink,
       maxTurns: 10,
     });
-    const kinds = sink.events.filter((event) => event.type === "note").map((event) => (event.type === "note" ? event.kind : ""));
+    const kinds = sink.events
+      .filter((event) => event.type === "note")
+      .map((event) => (event.type === "note" ? event.kind : ""));
     assert.deepEqual(kinds, ["repeat_notice", "repeat_stop"]);
     assert.equal(result.stopReason, "repeated_tool_calls");
     assert.equal(result.turns, 4);

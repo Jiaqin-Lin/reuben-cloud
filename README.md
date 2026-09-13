@@ -681,8 +681,8 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 **第一部分 · Agent Runtime（对齐 pi：`/Users/reuben/Documents/pi`）**
 - [x] P1 运行时契约与包拆分（独立 workspace `packages/agent-runtime`：契约 `types.ts` / `EventStream` / **双层循环**（逐条对齐 pi 的 `agent-loop.ts`：steering、follow-up、`executionMode`、`length` 截断保护、`before/afterToolCall`）/ 预算与重复检测搬进钩子（`limits.ts`）/ 流式模型客户端（Anthropic + DeepSeek 兼容端点）/ 工具 **Operations 化**（窄口注入 + TypeBox 参数）/ 提示词分区组装；CP 侧 `agent/` 只剩编排与兼容层——`runAgentLoop(options)` 签名不变，新增 `handleUserMessage` / `steer` 两个入口（P1 内存锁）与沙箱适配器 `sandbox-operations.ts`；`agent-runtime/test/` 68 个用例覆盖 spec 的 13 条测试要点，真沙箱集成测试全绿）
 - [x] P2 会话持久化 + **沙箱租约**（`005_agent_runtime.sql` 六张表：`sessions`（长期）/ `runs`（一次执行）/ `session_entries`（只追加的对话树）/ `tool_invocations`（intent→结算）/ `usage_ledger` / `model_requests`；`SessionStore` 抽象 + 内存与 Postgres 两个实现跑**同一份契约测试**；会话级沙箱租约（按需建 / 热着复用 / 30 分钟沉默回收 / 6h 换容器 / 回收前落地、失败不销毁）；`handleUserMessage` 编排（PG 条件更新抢锁 → 读 entries 重建历史 → 懒建沙箱 → 跑 → 释放锁）与 `agent:run --session/--export` 接线；`agent-runtime/test/session-store.test.ts` + CP 的 `sandbox-lease` / `session-run` / `session-export` 单测，Postgres 契约（含 kill -9 停在 intent）进 `npm run test:integration`）
-- [ ] P3 compaction（阈值 / 切点 / split turn / 结构化摘要 / 累积文件清单）
-- [ ] P4 事件统一（`AgentEvent` 唯一事件源，观察窗改成会话视图 + 上下文面板）
+- [x] P3 compaction（`agent-runtime/src/compaction/*`：chars/4 估算 + **真实 usage 基线**、切点只落 turn 边界（**绝不切在 tool_result 上**）、单个 turn 超预算时 split turn（两段摘要合并）、结构化摘要模板 + **累积文件清单**、阈值 / 溢出 / 手动三种触发；摘要调用进 `usage_ledger`（`kind='compaction'`）且**不写 prompt cache**；压不出来时 Run 以 `compaction_failed` 如实停止；`agent:run --compact [n]` 手动验证）
+- [x] P4 事件统一（`AgentEvent` 成为唯一事件协议：CP 的 `RunEvent` 只剩 `run_start` / `run_end` / `run_error` 三个生命周期事件，沙箱命令输出独立成 `ExecEvent` 一小族；SSE 帧带 `event:` 通道名——通道映射只有 `events.ts` 一张 `sseFrameOf` 表（`switch` + `never` 兜底），前端按通道注册监听（`SSE_CHANNELS` 与后端清单逐条比对）；观察窗默认渲染**会话视图**（新增 `GET /sessions/{id}/entries` 与 `GET /runs/{id}/transcript`，都读 `session_entries`，用 `runs.startEntryId` 标每一轮边界），实时部分仍走内存环形缓冲；新增**上下文面板**（分区 token / 占比 / `compiled_hash` 前 8 位 / 压缩标记，数据留给 P10）与压缩分隔线；`web/` 26 条单测覆盖 M0 的 19 条用例 + 面板 / 会话视图 / 未知事件）
 
 **第二部分 · Environment**
 - [ ] P5 环境定义与推断（三层结构；devcontainer 子集 > Dockerfile > 信号）
@@ -860,3 +860,63 @@ npm run agent:run -- --session ses_01H... --export /tmp/session.jsonl --issue ".
 所有变量都有合理缺省（不配也能跑）：`REUBEN_CLOUD_DB_IMAGE / _NAME / _PORT / _PASSWORD`、`REUBEN_CLOUD_MINIO_IMAGE / _PORT / _CONSOLE_PORT / _USER / _PASSWORD / _BUCKET`、`REUBEN_CLOUD_MC_IMAGE`。
 
 **集成测试不用 compose**：它们故意每个文件起自己的一次性容器 + 随机宿主端口（`node --test` 默认并行跑文件，钉死端口就是必然的碰撞）。
+
+### 上下文压缩（Phase 3）
+
+长会话不会撞窗口：上下文估算超过 `窗口 - 预留` 时自动压缩——把最老的一段换成一份结构化摘要
+（`## Goal` / `## Progress` / `## Key Decisions` / `## Next Steps` / `## Critical Context`，末尾带累积的
+`<read-files>` / `<modified-files>`）。`session_entries` **一行不删**：压缩改的是"送去模型的投影"，
+不是历史（审计、回放、导出照旧）。
+
+- **切点只落在 turn 边界**（user / assistant / 自定义消息），**绝不切在 `tool_result` 上**——
+  tool_use 与 tool_result 必须同生共死，切成两半下一次请求就是 400；单个 turn 自己就超预算时
+  切在 turn 中间（split turn，两份摘要合并成一条）。
+- **第二次压缩的起点是上一次的 `firstKeptEntryId`**（不是压缩条目本身）：上次幸存的消息这次仍会
+  被纳入摘要，否则它们会永远卡在窗口里；投影里只保留**最新**那一份摘要。
+- **溢出恢复**：provider 报"超出上下文窗口"→ 压缩一次 → 重试这一轮（只重试一次）。压不出来
+  （摘要模型失败 / 已经没有可压的历史）→ Run 以 `compaction_failed` 停下并如实报告，
+  **不进入"压缩 → 还想压 → 再压缩"的死循环**。
+- 摘要调用进账本（`usage_ledger.kind = 'compaction'`，与压缩条目同事务），**不写 prompt cache**
+  （一次性请求，写缓存是浪费）；摘要请求里的工具结果截断到 2000 字符、整段序列化再按预留预算卡总长
+  （否则"压缩"会变成另一次超窗）。
+
+```bash
+# 调试：第一次轮次准备时强制压一次（不看阈值）
+npm run agent:run -- --local ~/code/my-project --issue "..." --compact
+# 指定在第 n 次轮次准备时压
+npm run agent:run -- --local ~/code/my-project --issue "..." --compact 3
+```
+
+四个旋钮都有合理缺省：`REUBEN_CLOUD_COMPACTION_ENABLED`（默认开）、
+`REUBEN_CLOUD_COMPACTION_RESERVE_TOKENS`（默认 16384：给摘要请求与摘要输出留的窗口）、
+`REUBEN_CLOUD_COMPACTION_KEEP_TOKENS`（默认 20000：压缩后近似保留的近期上下文）、
+`REUBEN_CLOUD_COMPACTION_SUMMARY_MODEL`（默认与主模型相同；换便宜模型是配置不是默认——
+摘要质量影响压缩之后的每一轮）。
+
+### 观察窗（Phase 4：一套事件、会话视图、上下文面板）
+
+`npm run agent:run -- --serve` 之后，浏览器里看到的不再只是"这一次执行"：
+
+- **会话视图**：页面打开时先读 `GET /sessions/{id}/entries`（`session_entries` 表），把这个会话
+  之前说过的话画出来，用 `runs[].startEntryId` 标出每一轮的边界；本次执行的部分继续由实时流补上
+  （hub 的环形缓冲会从头重放，刷新页面不会丢）。所以"上一轮说了什么"不再依赖内存与环境
+  ——CP 重启后历史仍然在（实时缓冲只在内存里，那是 M3 的事）。
+- **一条事件流**：`AgentEvent` 是循环侧的唯一协议；CP 只保留三个 Run 生命周期事件
+  （`run_start` / `run_end` / `run_error`），沙箱命令输出是独立的一小族。SSE 帧带**通道名**
+  （`run` / `agent` / `turn` / `message` / `tool` / `context` / `compaction` / `note` / `exec`），
+  通道与事件的对应只有一张表（`control-plane/src/agent/events.ts` 的 `sseFrameOf`，
+  `switch` + `never` 兜底）。前端按通道注册监听：后端将来加通道，老页面只会"少一块信息"，
+  不会崩（`EventSource` 只派发有人监听的类型）。
+- **上下文面板**：`context_compiled` 事件一到就显示每个分区的 token 数与占比、`compiled_hash`
+  前 8 位、是否命中压缩（由 `compaction` 事件点亮）；压缩发生时流里会插一条"已压缩"分隔线
+  （含压前 token）。面板的数据来自 P10 的 ContextCompiler，现在只有壳（DOM 单测喂合成事件）。
+- **工具与命令输出**：`tool_execution_update` 是长命令的中间输出（bash 的 `onUpdate`），
+  `exec_*` 是沙箱的 stdout / stderr（按块上色）；两块的渲染都有上限（命令输出 400 行、
+  工具结果 300 行），超了丢最老的并写明丢了多少。
+
+只读的两个取证端点（同一台回环服务，不额外起进程）：
+
+```bash
+curl -s 127.0.0.1:8787/runs/<runId>/transcript   # 本次执行的 entries（runs.start_entry_id 的边界也在这）
+curl -s 127.0.0.1:8787/sessions/<sessionId>/entries | head -c 400   # 整个会话（跨 Run）
+```

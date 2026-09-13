@@ -179,6 +179,14 @@ export function sessionStoreContract(name: string, factory: StoreFactory): void 
       assert.equal(runs[0]!.sandboxId, "sbx_1");
       assert.ok(runs[0]!.endedAt !== null);
       assert.equal(runs[1]!.envRevision, "3");
+
+      // P4：run id 反查会话与边界（观察窗的 `/runs/{id}/transcript` 从 run 出发）。
+      const fetched = await store.getRun(first);
+      assert.equal(fetched?.id, first);
+      assert.equal(fetched?.sessionId, sessionId);
+      assert.equal(fetched?.startEntryId, null);
+      assert.equal(fetched?.status, "stopped");
+      assert.equal(await store.getRun("run_不存在"), null);
     });
 
     test("9. 工具调用：intent → 结算用同一个 entry id；重复结算报错", async () => {

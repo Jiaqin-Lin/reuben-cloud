@@ -21,6 +21,7 @@ import type {
   AgentEvent,
   AgentMessage,
   AgentTool,
+  CompactionEntryPayload,
   SessionStore,
   ToolResultMessage,
   Usage,
@@ -29,6 +30,7 @@ import type {
 import {
   accumulateUsage,
   emptyUsage,
+  entryForCompaction,
   entryForMessage,
   entryForNote,
 } from "@reuben-cloud/agent-runtime";
@@ -164,6 +166,23 @@ export class EntryRecorder {
    */
   wrapTools(tools: readonly AgentTool[]): AgentTool[] {
     return tools.map((tool) => this.#wrapTool(tool));
+  }
+
+  /**
+   * 压缩条目（P3 的压缩控制器调它）。
+   *
+   * 【为什么必须走这一层】leaf 是记录器持有的——控制器直接 `store.appendEntry` 会让
+   * 后面的消息接在一个过时的 parent 上（对话树断链，而 `buildContextEntries` 不看 parent，
+   * 所以这个错会一直静静存在到导出/回放时才暴露）。用量与 entry 同一次事务。
+   */
+  async appendCompaction(payload: CompactionEntryPayload, usage: UsageRow): Promise<string> {
+    this.#leaf = await this.#store.appendEntry(
+      this.#sessionId,
+      this.#runId,
+      entryForCompaction(payload, { parentId: this.#leaf }),
+      { usage },
+    );
+    return this.#leaf;
   }
 
   /**

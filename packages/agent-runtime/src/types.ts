@@ -266,6 +266,11 @@ export interface ModelRequest {
   messages: LlmMessage[];
   tools: LlmToolDefinition[];
   maxTokens: number;
+  /**
+   * 提示词缓存的写开关。缺省 `default`（system 打一个缓存断点）；
+   * `none` = 这一轮不写缓存（P3 的摘要请求用它：一次性请求，写缓存是纯浪费）。
+   */
+  cache?: "default" | "none";
   signal?: AbortSignal;
 }
 
@@ -354,12 +359,50 @@ export interface ShouldStopAfterTurnContext {
   newMessages: AgentMessage[];
 }
 
-export type PrepareNextTurnContext = ShouldStopAfterTurnContext;
+/**
+ * `prepareNextTurn` 拿到的快照。比 `shouldStopAfterTurn` 多一个取消信号：
+ * 压缩摘要这类准备工作是**耗时且可取消**的（用户 abort 时不该等它跑完）。
+ */
+export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {
+  signal?: AbortSignal;
+}
+
+/** 压缩的三种触发原因（事件与压缩条目都用这一套词）。 */
+export type CompactionReason = "threshold" | "overflow" | "manual";
 
 /** `prepareNextTurn` 的返回值：替换下一轮要用的上下文 / 模型。 */
 export interface AgentLoopTurnUpdate {
   context?: AgentContext;
   model?: ModelClient;
+  /**
+   * 这一轮的准备压掉了历史：循环发一条 `compaction` 事件（P3）。
+   * 压缩条目**由准备方自己写**（它才知道 entry id 与账本），循环只负责播事件。
+   */
+  compaction?: { reason: CompactionReason; tokensBefore: number; firstKeptEntryId: string };
+  /**
+   * 准备方决定不再继续：循环发一条同名 `note` 后收工（P3 的 `compaction_failed` 用它）。
+   * `reason` 会同时进 note 的 `kind`——宿主（CP）按它给 Run 一个终态（与 `AgentStopReason` 同名）。
+   */
+  stop?: { reason: string; detail: string };
+}
+
+/**
+ * 模型请求失败后的恢复快照（P3 的溢出恢复挂在 `recoverFromModelError` 上）。
+ *
+ * 【为什么失败的那条消息不在 `context` 里】循环在调钩子之前已经把它退掉了：恢复的语义是
+ * "这一次尝试不算数"——重试的请求必须以 user / toolResult 结尾（末条是 assistant 的话模型
+ * 会去续写那句话），而钩子看到的就是重试要用的那份上下文。
+ */
+export interface ModelFailureRecoveryContext {
+  /** 失败的那条 assistant 消息（`stopReason === "error"`）。 */
+  message: AssistantMessage;
+  /** 失败尝试已经退掉之后的上下文（重试要用的形状）。 */
+  context: AgentContext;
+  /** 本次调用的增量消息（含失败的那条；恢复成功后它是这一轮的历史记录）。 */
+  newMessages: AgentMessage[];
+  signal?: AbortSignal;
+  /** 这一轮里已经恢复过几次（0 = 刚失败）。循环只给一次机会（见 `recoverFromModelError`）。 */
+  attempt: number;
 }
 
 /**
@@ -435,6 +478,17 @@ export interface AgentLoopConfig {
     context: PrepareNextTurnContext,
   ) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
   /**
+   * 模型请求失败后问一次"能不能恢复"（P3 的溢出恢复走它）。返回一个带 `context` 的
+   * update → 循环丢掉这次失败的尝试，把那一轮**当作新的一轮重试**（只重试一次，
+   * 见 `attempt`）；返回 undefined → 按原样失败收尾。
+   *
+   * 【为什么不把"什么样的错误可恢复"写进循环】那是 provider 的知识（各家报超窗的
+   * 文案不一样），循环只提供时机，判断在 `compaction/index.ts` 的 `isContextOverflowError`。
+   */
+  recoverFromModelError?: (
+    context: ModelFailureRecoveryContext,
+  ) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
+  /**
    * 取"插话"消息（P1 的 `steer()`）。**每次只取一条**由调用方决定：
    * 循环在每轮工具结束后取一次，取到就注入、不打断正在跑的工具。
    */
@@ -472,7 +526,7 @@ export type AgentEvent =
   | { type: "tool_execution_update"; toolCallId: string; toolName: string; args: unknown; partialResult: unknown }
   | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: unknown; isError: boolean }
   | { type: "context_compiled"; turn: number; sections: SectionStat[]; hash: string }
-  | { type: "compaction"; reason: "threshold" | "overflow" | "manual"; tokensBefore: number; firstKeptEntryId: string }
+  | { type: "compaction"; reason: CompactionReason; tokensBefore: number; firstKeptEntryId: string }
   | { type: "note"; kind: string; message: string };
 
 /** `context_compiled` 里每个分区的统计（P10 的 ContextCompiler 产出）。 */

@@ -368,16 +368,7 @@ export class AnthropicModelClient implements ModelClient {
 
   /** 请求参数。**system 的最后一块打 `cache_control`**（见文件头与 `toSdkTools` 的排序）。 */
   #params(request: ModelRequest): MessageCreateParamsStreaming {
-    return {
-      model: this.model,
-      max_tokens: request.maxTokens,
-      system: [{ type: "text", text: request.system, cache_control: { type: "ephemeral" } }],
-      messages: toSdkMessages(request.messages),
-      tools: toSdkTools(request.tools),
-      ...(this.#thinking ? { thinking: { type: "adaptive" } } : {}),
-      output_config: { effort: this.#effort },
-      stream: true,
-    };
+    return toSdkParams(request, { model: this.model, thinking: this.#thinking, effort: this.#effort });
   }
 }
 
@@ -464,6 +455,24 @@ export function modelFromEnv(env: NodeJS.ProcessEnv = process.env, options: { lo
     : new AnthropicModelClient(common);
 }
 
+/**
+ * 用**指定的模型名**建客户端（同一套凭据，只换模型）。
+ *
+ * 【provider 为什么以模型名前缀为准】`REUBEN_CLOUD_PROVIDER` 是为主模型准备的；摘要是可选的
+ * 第二个模型（`claude-*` / `deepseek-*` 的前缀是它自己最可靠的出处）。把 `claude-haiku-4-5`
+ * 发给 DeepSeek 端点只会得到一个 400——前缀优先能防住这个。
+ */
+export function modelNamedFromEnv(
+  model: string,
+  env: NodeJS.ProcessEnv = process.env,
+  options: { log?: LogFn } = {},
+): AnthropicModelClient {
+  const override: NodeJS.ProcessEnv = { ...env, [ENV_MODEL]: model };
+  if (model.startsWith("deepseek")) override[ENV_PROVIDER] = "deepseek";
+  else if (model.startsWith("claude")) override[ENV_PROVIDER] = "anthropic";
+  return modelFromEnv(override, options);
+}
+
 /** 循环要用的默认单轮输出上限：`REUBEN_CLOUD_MAX_TOKENS` 可覆盖，硬顶是模型目录的 `maxTokens`。 */
 export function maxTokensFromEnv(model: string, env: NodeJS.ProcessEnv = process.env): number {
   const info = MODEL_CATALOG[model] ?? CONSERVATIVE_MODEL_INFO;
@@ -491,6 +500,38 @@ function isEffort(value: string | undefined): value is Effort {
 }
 
 // ---------------------------------------------------------------- 转换
+
+/** 建 SDK 参数的三个非请求量（模型 / 思考 / effort）。 */
+export interface SdkParamsOptions {
+  model: string;
+  thinking: boolean;
+  effort: Effort;
+}
+
+/**
+ * `ModelRequest` → SDK 参数。**抽成纯函数是为了可测**：缓存断点与 tools 排序都是
+ * "缓存前缀字节稳定"的一部分，测试要能在没有网络的情况下断言它们。
+ *
+ * 【`cache: "none"` 省略 `cache_control`】P3 的摘要请求是一次性的（请求发出去就不再复用），
+ * 给它写缓存是纯浪费——写缓存比读费钱。各家对"不写缓存"的支持不同（DeepSeek 自动缓存、
+ * Anthropic 看断点），省略断点是两边都成立的最小动作。
+ */
+export function toSdkParams(request: ModelRequest, options: SdkParamsOptions): MessageCreateParamsStreaming {
+  const cache = request.cache ?? "default";
+  return {
+    model: options.model,
+    max_tokens: request.maxTokens,
+    system:
+      cache === "none"
+        ? [{ type: "text", text: request.system }]
+        : [{ type: "text", text: request.system, cache_control: { type: "ephemeral" } }],
+    messages: toSdkMessages(request.messages),
+    tools: toSdkTools(request.tools),
+    ...(options.thinking ? { thinking: { type: "adaptive" } } : {}),
+    output_config: { effort: options.effort },
+    stream: true,
+  };
+}
 
 /**
  * 我们的协议消息 → SDK 的参数。

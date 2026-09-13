@@ -431,6 +431,12 @@ export class PostgresSessionStore implements SessionStore {
     return rows.map(mapRun);
   }
 
+  async getRun(runId: string): Promise<StoredRun | null> {
+    const rows = await many<RunRow>(this.#db, "SELECT * FROM runs WHERE id = $1", [runId]);
+    const row = rows[0];
+    return row === undefined ? null : mapRun(row);
+  }
+
   // -------------------------------------------------------------- 工具调用
 
   async beginToolInvocation(inv: NewInvocation): Promise<string> {

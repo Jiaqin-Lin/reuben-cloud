@@ -681,6 +681,11 @@ reapIdleSessions(now):                         // 扩展现有 manager/sweeper.t
   `_KEEP_TOKENS`（20000）/ `_SUMMARY_MODEL`（默认同主模型）
 - 接线：`prepareNextTurn` 钩子 + 溢出恢复 + `--compact` 手动触发
 
+> **实现备注**：P3 落地时有 7 条有意偏差，逐条记在附录 A-11 … A-17——循环契约的三个
+> 新增（`compaction` / `stop` / `recoverFromModelError`）、溢出恢复按**新的一轮**记账、摘要序列化
+> 再加一道总长闸、投影里只留最新一份摘要、M0 的 600k 裁剪随本 Phase 删除、摘要请求的缓存开关
+> （`cache: "none"`）、`compaction_failed` 用"与停止原因同名的 note"传到 Run 终态。
+
 ### 具体如何实现
 
 **1. 估算（`tokens.ts`，逐条对齐 pi）**
@@ -816,12 +821,31 @@ prepareNextTurn（每轮结束、下一轮开始前）：
 - `packages/web/public/app.js` 增加事件分支与**上下文面板**（sections 占比 + 压缩标记）
 - 迁移 M0 Phase 13 的"每个事件类型都有前端分支"单测到新协议
 
+> **实现备注**：P4 落地时有 6 条有意偏差，逐条记在附录 A-18 … A-23——SSE 帧多了
+> `event:` 通道名（唯一映射表是 `events.ts` 的 `sseFrameOf`，`switch` + `never` 兜底）；
+> `SessionStore` 多一个 `getRun`（`/runs/{id}/transcript` 要从 run 反查会话）；`run_start`
+> 多一个 `sessionId`（页面靠它读会话视图）；沙箱命令输出成独立的一小族 `ExecEvent`；
+> 每个 Run 的 JSONL transcript **保留**（观察窗不再读它）；上下文面板的"是否命中压缩"
+> 由 `compaction` 事件点亮（P10 的 `context_compiled` 里没有这个字段）。
+>
+> 两件本轮没有做的事，写在这里免得被当成漏了：① `context_compiled` 现在**没有任何生产者**
+> ——面板是壳、DOM 单测喂合成事件，数据由 P10 的 ContextCompiler 接上（spec P10 的原文就是
+> "P4 已建壳，本 Phase 填数据"）；② 不做"选轮次看当时上下文"的重放 UI（M3 的可观测性）。
+>
+> **验证**：`npm test` 495 项（agent-runtime 124 / control-plane 244 / sandbox-agent 101 /
+> web 26）与 `npm run typecheck` 全绿；`npm run test:integration` 107 项里 106 绿、0 红
+> （1 条是早就有的、需要真 key 的 live 开关用例）。与 P4 直接相关的两条端到端：
+> `web-stream` 在真容器上跑完一次 Run 并读真 HTTP 的 SSE（命名通道、完整事件序列、
+> `Last-Event-ID` 重连），同一文件里新增的一条用真 PG 验会话视图与 `/runs/{id}/transcript`；
+> `session-run.test.ts` 里还有一条把**产品路径**（会话编排 → hub）与两个读接口连起来跑的用例。
+> `web/` 的 26 条盖住了 M0 Phase 13 的 19 条原用例（表格见 `docs/sandbox-spec.md` Phase 13）。
+
 ### 具体如何实现
 
 1. **映射表**（唯一允许出现"事件名映射"的地方）：
-
-| AgentEvent | SSE `event:` | 前端行为 |
+| 事件 | SSE `event:` | 前端行为 |
 |---|---|---|
+| `run_start` / `run_end` / `run_error` | `run` | Run 卡片与终态 |
 | `agent_start` / `agent_end` | `agent` | 状态行 |
 | `turn_start` / `turn_end` | `turn` | 轮次计数 |
 | `message_start/update/end` | `message` | 打字机、工具调用卡片 |
@@ -1809,6 +1833,19 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 | A-8 | Phase 2 · `sandboxes` 表 | 设计文档 §G.1："既有三张表一行不改" | 加一列 `session_id`（spec P2 §1 就是这么写的），并加了 `(session_id, last_active_at)` 索引 | 沙箱从"某次执行的附属品"变成"某个会话的工作区"（设计文档 §A.1 的第 2 条规则）。既有行 `session_id` 为 NULL，对账/状态机/sweeper 的语义一个字没变——这是**加列**，不是改结构 | 005 迁移；`SandboxRow`；`manager.createSandbox` 多一个可选 `sessionId`；持久层"列清单"测试同步加了这一列 |
 | A-9 | Phase 2 · 目标目录 | `session/{store,memory,entries,export}` + CP 的 `session/{postgres,requests,sandbox-lease}` | 多三个文件：`session/entry-recorder.ts`、`session/session-run.ts`、`session/provision.ts` | ① "事件 → entries / intent / usage"必须只有一份实现：会话编排（多轮）与 `agent:run`（单轮手工验收）都要它；② `sandbox-lease.ts` 要能在没有 Docker / git / 网络时被完整测到（测试要点 11–20 全是这一类），所以"建沙箱 / 落地"这两个真动作拆到 `provision.ts`（端口注入），租约只留策略 | 纯新增，不影响既有文件；集成测试只跑 `provision.ts` 的真路径 |
 | A-10 | Phase 2 · `AgentLoopOptions` | P1 的兼容入口只有 `onText` / `events` | 多四个口：`onAgentEvent` / `onRequest` / `history` / `prompts` | ① 会话层要**原生事件**（`events` 是 M0 的观察窗词汇，P4 才统一）才能写 entries 与结算 intent；② `model_requests` 要"真的发给模型的东西"，它只存在于 `transformContext` 里；③ 多轮必须有"这一轮之前的历史"与"本次注入的消息"两个独立的口——否则续轮要么丢历史、要么把任务书重复注入每轮 | `run.ts`（兼容层，P4 删）；`session-run.ts`；`agent:run` 脚本；P1 的测试没受影响（都是可选项） |
+| A-11 | Phase 3 · 循环契约 | 只写"接线：`prepareNextTurn` 钩子 + 溢出恢复 + `--compact`" | `AgentLoopTurnUpdate` 多两个字段（`compaction` / `stop`），`AgentLoopConfig` 多一个钩子（`recoverFromModelError`），`PrepareNextTurnContext` 多一个 `signal` | ① 压缩条目与"压了多少 token、保留自哪条 entry"只有准备方知道（entry id 与账本都在它手里），循环只该负责播事件——否则循环要知道会话存储的形状；② "压不出来就终止 Run"需要一个明确的停下信号（`stop`），返回 `undefined` 的语义是"这次不压"；③ 摘要是耗时请求，没有 signal 就没法在用户 abort 时取消它 | `types.ts` 的三个契约；`loop.ts` 的两处接线；`compaction-controller.test.ts` 的溢出恢复用例 |
+| A-12 | Phase 3 · 溢出恢复的"重试本轮" | "强制 compact 一次 → 重试本轮（只重试一次）" | 重试**算作新的一轮**：失败的尝试照常落 entries / `model_requests` / transcript（轮次号前进），重试之前**跳过 `prepareNextTurn` 一次** | ① `model_requests` 的对象 key 是 `(session, run, turn)`，同一轮两次请求会覆写第一轮的输入（A-6 同一条毛病）；轮次号前进让"失败的尝试"与"重试"各有完整记录；② 恢复钩子已经给过一份压缩后的上下文，再跑一遍 `prepareNextTurn` 会让"压缩完还超阈值"的上下文被立刻压第二次（白烧一次摘要）；③ `shouldStopAfterTurn` 看到的仍是"模型真的跑完的那一轮" | `loop.ts` 的 `recoveries` / `preparedByRecovery`；测试要点 7 的断言（"第一次失败 + 重试一次"） |
+| A-13 | Phase 3 · 摘要序列化的总预算 | 工具结果截断到 2000 字符（单条）；测试要点 11 又要求"100 条含 200 KB 工具结果的对话 → 序列化后 < 预留预算" | 单条仍截 2000 字符，**再加一道总长闸**：整段序列化超过 `reserveTokens × 4` 时保留头 1/4 + 尾、中间标省略 | 100 × 2000 字符 = 200 KB > 预留预算（16384 token ≈ 65 KB）——只做单条截断满足不了测试要点 11，而"摘要请求自己超窗"正是设计文档 §E.4 点名的死循环。头尾各留一段是因为开头有原始诉求、结尾有"刚做到哪"，只留一边会结构性丢信息 | `summarize.ts` 的 `serializeConversation` / `summaryBudgetChars`；`compaction.test.ts` 要点 11 |
+| A-14 | Phase 3 · `buildContextEntries` 的摘要去重 | P2 的投影规则只说"从最后一条 compaction 的 `firstKeptEntryId` 开始取" | `projectAll` 跳过**所有**压缩条目（投影里只可能有一份摘要） | 第二次压缩时旧压缩条目正好落在保留区间里（它的 seq 在新压缩条目之前、`firstKeptEntryId` 之后），不跳过就会把一份**过时摘要**当成一条 user 消息发出去——与最新那份互相矛盾，也正是测试要点 4 的隐含前提 | `session/entries.ts`；`compaction.test.ts` 的"连续压缩之后投影里只有一份摘要" |
+| A-15 | Phase 3 · M0 的上下文裁剪 | "M0 的做法：超 600k 字符丢旧 `tool_result`；M2 的 compaction 取代它" | 随 P3 一起删除（`elideOldToolResults`、三个常量、`AgentLoopOptions.context`，以及它的单测 `agent-context.test.ts`） | 两套缩减机制并存会让"上下文为什么变小"有两个可能；而裁剪按体积丢正文、能丢在 turn 中间、每次丢完都让缓存前缀失效。删 `AgentLoopOptions.context` 不影响任何调用方（会话路径与脚本都不传它） | `agent/run.ts`；`test/unit/agent-compaction.test.ts` 取代 `agent-context.test.ts` |
+| A-16 | Phase 3 · 摘要请求的缓存开关 | "摘要请求本身关闭 prompt cache 写入"（没有说关在哪一层） | `ModelRequest` 多一个 `cache?: "default" \| "none"`；SDK 参数构造从 `#params` 抽成纯函数 `toSdkParams` | ① 缓存断点在 `system` 那一个块上，客户端不给开关就只能发一次带缓存的请求——写缓存比读贵；② 抽成纯函数之后"没有 `cache_control`"这条断言可以在没有网络、没有 key 的情况下测（私有方法测不到） | `types.ts` 的 `ModelRequest.cache`；`model/client.ts` 的 `toSdkParams`；两个测试文件各一条 |
+| A-17 | Phase 3 · `compaction_failed` 怎么传到 Run 的终态 | "结构化失败：`compaction_failed`，终止 Run 并如实报告"（没有说通道） | 准备方返回 `{stop: {reason, detail}}` → 循环发一条**与停止原因同名**的 `note` 再收工；CP 兼容层按名字表把它翻成 `AgentStopReason`，`runStatusFor` 把它归到 `failed` | 循环不该为了一个业务终态长出一套新的返回类型；`note` 本来就要发（观察窗要能解释"为什么停了"），把 kind 与停止原因共用一个词之后，新增一种停止原因只需要在 `isStopReason` 里加名字。归 `failed` 是因为重跑同样的输入还会失败——那不是"我们主动停下" | `loop.ts` 的 `stop` 分支；`agent/run.ts` 的 `isStopReason` / `resolveStopReason`；`session-run.ts` 的 `runStatusFor` |
+| A-18 | Phase 4 · SSE 帧的通道名 | M0 的 `frameOf` 只写 `id:` + `data:`，前端在 `onmessage` 里再 switch `data.type` | 每条帧多一个 `event:` 字段（`run` / `agent` / `turn` / `message` / `tool` / `context` / `compaction` / `note` / `exec`），通道由 `events.ts` 的 `sseFrameOf` **一张 switch 表**（+ `never` 兜底）决定；前端把同一份清单注册成 `addEventListener` | ① `EventSource` 的 `addEventListener("tool", ...)` 是这个协议最自然的用法，把通道藏进 `data.type` 等于要求每个消费者都写一层 switch；② 后端加通道、老客户端不认识时，浏览器**根本不派发**（规范行为）——spec 要求的"向后兼容"是白拿的；③ 实现时真踩到一个坑：`source.onmessage = fn` 与 `addEventListener("message", fn)` 是**同一个通道的两个监听**，两个都注册会让 message 类事件处理两遍（文字翻倍、第一条 user 消息被当成插话重画），所以前端只注册通道、不设 `onmessage` | `events.ts` 的 `SSE_EVENT_NAMES` / `sseFrameOf`；`server.ts` 的 `frameOf`；`app.js` 的 `SSE_CHANNELS`；`ui.test.ts` 逐条比对两份清单；`web-server.test.ts` 断言四族事件的通道名 |
+| A-19 | Phase 4 · `SessionStore` 的读口 | P2 的接口只有 `listRuns(sessionId)`（从会话出发） | 多一个 `getRun(runId)` | `/runs/{id}/transcript` 拿到的是 **run id**，要回答"这个 run 属于哪个会话、从哪条 entry 开始"就必须能反查。没有这个端口，观察窗只能自己拼 SQL（破了"PG 只在 CP 存储层"的边界）或者再建一张 run→session 的内存表（重启就丢）；P10 的回放（按 run 取编译产物）走同一条路 | `session/store.ts`、`memory.ts`、CP 的 `session/postgres.ts`、契约测试 8 号用例（集成测试在真 PG 上跑同一份） |
+| A-20 | Phase 4 · `run_start.sessionId` | 交付物只说"事件统一"，没说 run 与会话怎么连 | `RunEvent.run_start` 多一个 `sessionId: string \| null` | 观察窗的入口是 `/runs/{id}`，而会话视图要 `/sessions/{id}/entries`：不给这个字段，页面就得先问一次存储（多一个往返与一个"存储没接"的空状态）；"这次执行挂在哪个会话上"本来就是 CP 才知道的编排事实，和 `model` / `issue` / `limits` 是同一类 | `events.ts`；`run.ts` 的 `AgentLoopOptions.sessionId`；`session-run.ts` 与 `scripts/agent-run.ts` 的传参；`hub.ts` 的 `RunInfo.sessionId`；`session-run.test.ts` 的一条断言 |
+| A-21 | Phase 4 · 沙箱命令输出的位置 | 映射表里只有一行"（沙箱 exec 事件）→ `exec`"，没说它是哪一族 | 独立的一小族 `ExecEvent`（3 个成员，在 CP 的 `events.ts`），与 Run 生命周期（3 个）并列；三者合成观察窗的 `HubEvent` | 沙箱是另一个进程、另一套词汇（`started` / `stdout` / `completed`，snake_case），而且在循环之外也在用（P7 的健康检查、P6 的构建日志）。塞进 `AgentEvent` 会让"循环事件"这个概念被污染（循环根本不知道这些事件），塞进 `RunEvent` 又违反了"RunEvent 只留生命周期"这条；单独一小族之后，`createSandboxToolkit` 只认 `ExecEventSink`，工具层不认识 Run 生命周期 | `events.ts` 的 `ExecEvent` / `ExecEventSink` / `HubEvent`；`sandbox-operations.ts` 的口；`web-server.test.ts` 的 `exec` 通道用例 |
+| A-22 | Phase 4 · 每个 Run 的 JSONL transcript | "transcript 从 entries 派生"（容易读成"删掉 JSONL 写入"） | 两条都留着：观察窗与 `/runs/{id}/transcript` 读 `session_entries`；`agent/transcript.ts` 继续写每个 Run 的 JSONL | 两者受众不同：JSONL 是**单次执行**的取证文件（`agent:run --export/--keep`、排障脚本、集成测试都在用它），entries 是**会话**的持久形态，每轮真发出去的全文在 `model_requests` 里。删 JSONL 要动 `run.ts` / 脚本 / 三条单测 / 两个 live 脚本，而 P4 要的"观察窗不再依赖内存 JSONL"已经拿到了 | `agent/transcript.ts` 不动；新增的 `web/history.ts` 是另一条读路径；`agent-events.test.ts` 仍断 transcript 的内容（轮次号与三条记录） |
+| A-23 | Phase 4 · 上下文面板的"是否命中压缩" | "显示每个分区的 token 数与占比、`compiled_hash` 前 8 位、是否命中压缩"（没说这个布尔从哪来） | 由流里的 `compaction` 事件点亮（面板上显示"已压缩 / 未压缩"），不新增字段 | P10 的 `context_compiled` 只有分区统计与 `compiled_hash`——"命中压缩"在编译产物里表现为"投影里有一条 `compactionSummary`"，那是投影的属性、不是某个分区的属性；而"这个上下文被压过"在事件流里已经有一条权威记录（P3 的 `compaction`）。等 P10 真需要"这一轮的分区里含多少摘要 token"时再加字段，比现在先编一个字段便宜（加字段不破坏旧客户端，编错了反而误导） | `app.js` 的 `renderCompaction` / `renderContextCompiled`；`web-server.test.ts` 的 `context` / `compaction` 通道用例；`render.test.ts` 的面板用例 |
 
 **已经预知的两条偏差**（实施时必须确认并回填）：
 

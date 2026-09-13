@@ -1,21 +1,26 @@
 /**
- * `server.ts` —— CP 的第一个（也是 M0 唯一的）HTTP 服务：**观察窗**（Phase 13）。
+ * `server.ts` —— CP 的第一个（也是 M0 唯一的）HTTP 服务：**观察窗**（Phase 13，P4 加会话视图）。
  *
  * 【它不是 API 服务器，刻意不是】没有鉴权、没有多用户、没有一个 CRUD。README 里画的
- * Hono + 完整 API 面是 M1 的事；M0 需要的只有五条路由：
- *   GET /                     → 有 run 就跳到最近那个，没有就渲染空状态
- *   GET /runs/{id}            → 页面（`packages/web/public/index.html`）
- *   GET /runs/{id}/info       → 这个 run 的元信息（JSON）
- *   GET /runs/{id}/stream     → **SSE**：模型文字增量 + 工具调用/结果 + 沙箱命令输出
- *   GET /app.js /style.css    → 白名单静态资源（见 `static.ts`）
+ * Hono + 完整 API 面是 M1 的事；M0 需要的只有这几条路由：
+ *   GET /                        → 有 run 就跳到最近那个，没有就渲染空状态
+ *   GET /runs/{id}               → 页面（`packages/web/public/index.html`）
+ *   GET /runs/{id}/info          → 这个 run 的元信息（JSON）
+ *   GET /runs/{id}/stream        → **SSE**：Run 生命周期 + 循环事件 + 沙箱命令输出
+ *   GET /runs/{id}/transcript    → 本次执行的 entries（P4，读 `session_entries`）
+ *   GET /sessions/{id}/entries   → 整个会话的 entries + runs（P4，页面默认的会话视图）
+ *   GET /app.js /style.css       → 白名单静态资源（见 `static.ts`）
  *
  * 所以实现就是 `node:http` 加一个 switch：多引一个框架只会让"这个进程到底监听了什么"
  * 变得更难回答。
  *
  * 【为什么不把 SSE 端点做成"包一层沙箱的流"】沙箱的事件流只覆盖命令输出，而观察窗要的是
- * 一次 Run 的全景（模型在想什么、调了什么工具、命令跑出什么）。三类事件在 CP 侧汇集到
+ * 一次 Run 的全景（模型在想什么、调了什么工具、命令跑出什么）。事件在 CP 侧汇集到
  * `hub.ts` 的同一个缓冲里，这个端点只是把缓冲按 SSE 的帧格式吐出去——**端点自己不认识
- * 事件内容**，加一种事件不需要动这里一行。
+ * 事件内容**，加一种事件不需要动这里一行（通道名来自 `events.ts` 的映射表）。
+ *
+ * 【P4 的会话视图为什么需要 `store`】entries 在 Postgres / 内存存储里，不在 hub 的缓冲里。
+ * 没接 store 时这两条端点回 503（说清楚原因），而不是回一个空列表假装"这个会话是空的"。
  *
  * 【安全边界就是回环地址】spec 明确"不做鉴权"，那么"谁能访问"就只能靠绑定地址回答。
  * 所以 host 写死 127.0.0.1，也**不提供** `--host` 之类的开关：想远程看就 SSH 隧道。
@@ -24,9 +29,12 @@
 
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
+import type { SessionStore } from "@reuben-cloud/agent-runtime";
 import type { LogFn } from "../log.ts";
 import { noopLog } from "../log.ts";
-import type { RunEventRecord, RunHub } from "./hub.ts";
+import { sseFrameOf } from "../agent/events.ts";
+import type { HubEventRecord, RunHub } from "./hub.ts";
+import { readRunView, readSessionView } from "./history.ts";
 import { readStatic, webRoot } from "./static.ts";
 
 /** 只监听回环（见文件头）。改这个值等于把一个无鉴权的服务暴露出去。 */
@@ -40,6 +48,11 @@ export const DEFAULT_HEARTBEAT_MS = 15_000;
 
 export interface WebServerOptions {
   hub: RunHub;
+  /**
+   * 会话存储（P4 的会话视图与 transcript 端点读它）。不给时这两条端点回 503——
+   * 观察窗的核心（实时流）不依赖它，所以它是可选的。
+   */
+  store?: SessionStore | null;
   /** 前端资源目录；缺省 `packages/web/public`（`static.ts` 的 `webRoot()`）。 */
   webRoot?: string;
   /** 端口；0 = 让系统分配（测试用）。 */
@@ -92,25 +105,28 @@ export function createWebHandler(options: WebServerOptions): WebHandler {
       return;
     }
 
-    const route = parseRunRoute(pathname);
+    const route = parseRoute(pathname);
     if (route === null) {
       return sendJson(res, 404, { error: "not_found", message: `没有这个路径：${pathname}` });
     }
 
-    if (route.action === "page") {
+    if (route.kind === "page") {
       // 页面本身对不存在的 run 也返回 200：**谁来告诉用户"这个 run 不存在"是前端的事**
       // （它靠 `/info` 判断），而服务器回 HTML 404 只会让浏览器显示一句没用的默认页。
       return sendStatic(res, "/index.html", root);
     }
-    if (route.action === "info") {
-      const info = options.hub.info(route.runId);
+    if (route.kind === "info") {
+      const info = options.hub.info(route.id);
       if (info === null) {
-        return sendJson(res, 404, { error: "run_not_found", message: `没有这个 run：${route.runId}` });
+        return sendJson(res, 404, { error: "run_not_found", message: `没有这个 run：${route.id}` });
       }
       return sendJson(res, 200, info);
     }
+    if (route.kind === "transcript" || route.kind === "session-entries") {
+      return sendHistory(res, route, options.store ?? null, url);
+    }
 
-    return streamRun(req, res, route.runId, options.hub, heartbeatMs, log);
+    return streamRun(req, res, route.id, options.hub, heartbeatMs, log);
   };
 }
 
@@ -148,26 +164,87 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
 
 // ---------------------------------------------------------------- SSE
 
-interface RunRoute {
-  runId: string;
-  action: "page" | "info" | "stream";
+interface Route {
+  /** `page` / `info` / `stream` 的对象是 run id；`session-entries` 的是 session id。 */
+  kind: "page" | "info" | "stream" | "transcript" | "session-entries";
+  id: string;
 }
 
-/** `/runs/{id}` 与 `/runs/{id}/{action}`。解析不出来（含非法转义）一律返回 null。 */
-function parseRunRoute(pathname: string): RunRoute | null {
+/**
+ * 路径解析。两种形状：`/runs/{id}[/{action}]` 与 `/sessions/{id}/entries`。
+ * 解析不出来（含非法转义、多余段）一律返回 null（→ 404）。
+ */
+function parseRoute(pathname: string): Route | null {
   const segments = pathname.split("/").filter((segment) => segment !== "");
-  if (segments.length < 2 || segments.length > 3 || segments[0] !== "runs") return null;
-  let runId: string;
+  if (segments.length < 2 || segments.length > 3) return null;
+  const [head, rawId, action] = segments;
+  const id = decodeSegment(rawId);
+  if (id === null) return null;
+
+  if (head === "sessions") {
+    if (action === "entries") return { kind: "session-entries", id };
+    return null;
+  }
+  if (head !== "runs") return null;
+  if (action === undefined) return { kind: "page", id };
+  if (action === "info") return { kind: "info", id };
+  if (action === "stream") return { kind: "stream", id };
+  if (action === "transcript") return { kind: "transcript", id };
+  return null;
+}
+
+/** 解码一段路径；空串、非法转义、含 `/` 的都算不合法。 */
+function decodeSegment(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
   try {
-    runId = decodeURIComponent(segments[1]!);
+    const value = decodeURIComponent(raw);
+    return value === "" || value.includes("/") ? null : value;
   } catch {
     return null;
   }
-  if (runId === "" || runId.includes("/")) return null;
-  if (segments.length === 2) return { runId, action: "page" };
-  const action = segments[2];
-  if (action === "info" || action === "stream") return { runId, action };
-  return null;
+}
+
+/**
+ * 会话视图 / 本次执行切片。两条端点除了取哪一份数据之外完全一样，所以共用一个处理。
+ *
+ * 404 与 503 的分界很重要：**没有这条记录**是 404（前端显示"找不到"）；
+ * **没接存储**是 503（观察窗少了半个库，不是数据不存在）——混在一起会让人去查错方向。
+ */
+async function sendHistory(
+  res: ServerResponse,
+  route: Route,
+  store: SessionStore | null,
+  url: URL,
+): Promise<void> {
+  if (store === null) {
+    return sendJson(res, 503, {
+      error: "store_unavailable",
+      message: "这个观察窗没有接会话存储，读不到 entries（起服务时传 SessionStore）",
+    });
+  }
+  const options = viewOptionsOf(url);
+  if (route.kind === "session-entries") {
+    const view = await readSessionView(store, route.id, options);
+    if (view === null) {
+      return sendJson(res, 404, { error: "session_not_found", message: `没有这个会话：${route.id}` });
+    }
+    return sendJson(res, 200, view);
+  }
+  const view = await readRunView(store, route.id, options);
+  if (view === null) {
+    return sendJson(res, 404, { error: "run_not_found", message: `没有这个 run：${route.id}` });
+  }
+  return sendJson(res, 200, view);
+}
+
+/** `?afterSeq=` / `?limit=`：解析不出来就当作没给（不因为一个坏参数回 400）。 */
+function viewOptionsOf(url: URL): { afterSeq?: number; limit?: number } {
+  const afterSeq = Number(url.searchParams.get("afterSeq"));
+  const limit = Number(url.searchParams.get("limit"));
+  return {
+    ...(Number.isFinite(afterSeq) && afterSeq > 0 ? { afterSeq } : {}),
+    ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+  };
 }
 
 async function streamRun(
@@ -236,9 +313,16 @@ function afterIdOf(req: IncomingMessage, url: URL): number | null {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-/** 一条事件 → 一个 SSE 帧。**一次 write 写完一整帧**，中间不可能被心跳插进去。 */
-export function frameOf(record: RunEventRecord): string {
-  return `id: ${record.id}\ndata: ${JSON.stringify(record.event)}\n\n`;
+/**
+ * 一条事件 → 一个 SSE 帧。**一次 write 写完一整帧**，中间不可能被心跳插进去。
+ *
+ * 【`event:` 字段为什么必须有】通道名来自 `events.ts` 的映射表（唯一出处）：
+ * 浏览器按名字分发（`addEventListener("tool", ...)`），不认识的新通道**天然被忽略**
+ * ——这就是 spec 要的"老客户端向后兼容"，不需要在客户端写兜底。
+ */
+export function frameOf(record: HubEventRecord): string {
+  const frame = sseFrameOf(record.event);
+  return `id: ${record.id}\nevent: ${frame.event}\ndata: ${JSON.stringify(frame.data)}\n\n`;
 }
 
 /** 等 `drain`，但**不能死等**：连接断掉时 drain 可能永远不来。 */

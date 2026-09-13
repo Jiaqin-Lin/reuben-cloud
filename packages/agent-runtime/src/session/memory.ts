@@ -250,6 +250,11 @@ export class MemorySessionStore implements SessionStore {
       .map(clone);
   }
 
+  async getRun(runId: string): Promise<StoredRun | null> {
+    const run = this.#runs.get(runId);
+    return run === undefined ? null : clone(run);
+  }
+
   // -------------------------------------------------------------- 工具调用
 
   async beginToolInvocation(inv: NewInvocation): Promise<string> {

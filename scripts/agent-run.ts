@@ -31,6 +31,9 @@
  *
  *   # ③ 一边跑一边看（Phase 13）：打开它打印的地址，刷新页面能看到到目前为止的全部事件
  *   node scripts/agent-run.ts --local ~/code/my-project --issue "..." --serve
+ *
+ *   # ④ 调试压缩（Phase 3）：第一次轮次准备时强制压一次（不看阈值）
+ *   node scripts/agent-run.ts --local ~/code/my-project --issue "..." --compact
  */
 
 import { readFileSync } from "node:fs";
@@ -57,6 +60,7 @@ import { Transcript } from "../packages/control-plane/src/agent/transcript.ts";
 import { PostgresSessionStore } from "../packages/control-plane/src/session/postgres.ts";
 import { RequestRecorder } from "../packages/control-plane/src/session/requests.ts";
 import { EntryRecorder } from "../packages/control-plane/src/session/entry-recorder.ts";
+import { createSessionCompaction } from "../packages/control-plane/src/session/compaction.ts";
 import { runStatusFor } from "../packages/control-plane/src/session/session-run.ts";
 import { branchNameForTask } from "../packages/control-plane/src/repo/push.ts";
 import { REPO_DIR, buildSystemPrompt } from "@reuben-cloud/agent-runtime";
@@ -90,6 +94,8 @@ interface Args {
   session: string | null;
   /** 导出整个会话的 JSONL（跨 Run，兼容 M0 的 transcript 记录类型）。 */
   exportPath: string | null;
+  /** `--compact [n]`：在第 n 次轮次准备时强制压缩一次（默认 1 = 第一轮之后）。 */
+  compactAfterTurn: number | null;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -111,6 +117,7 @@ function parseArgs(argv: string[]): Args {
     maxTurns: 40,
     session: null,
     exportPath: null,
+    compactAfterTurn: null,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const current = argv[index]!;
@@ -178,6 +185,17 @@ function parseArgs(argv: string[]): Args {
       case "--export":
         args.exportPath = next();
         break;
+      case "--compact": {
+        // 可选值：`--compact`（在第一轮之后）或 `--compact 3`（第 3 次轮次准备时）。
+        const value = argv[index + 1];
+        if (value !== undefined && /^\d+$/.test(value)) {
+          index += 1;
+          args.compactAfterTurn = parsePositiveInt(current, value);
+        } else {
+          args.compactAfterTurn = 1;
+        }
+        break;
+      }
       case "--help":
       case "-h":
         printUsage();
@@ -216,6 +234,7 @@ function printUsage(): void {
   --max-turns <n>       轮数上限（默认 40）
   --session <id>        续用已有会话（默认新建；续用会从会话的分支 head 接上）
   --export <文件>       把整个会话导出成 JSONL（跨 Run；--keep 时默认导出一份）
+  --compact [n]         在第 n 次轮次准备时强制压缩一次（调试/验证用；默认 1 = 第一轮之后）
   --serve               同时起本地观察窗（SSE 实时 transcript，默认 127.0.0.1:8787）
   --port <n>            观察窗端口（默认 8787；--serve 才有意义）
   --keep                跑完不销毁沙箱（排障用）
@@ -265,14 +284,24 @@ async function main(): Promise<void> {
   // `--task-id` 的缺省规则在 `agent/run.ts`（脚本 import 即执行，放这里测不了）。
   const taskId = args.taskId ?? taskIdForIssue(args.issue);
 
+  const image = await resolveImageRef(process.env["SANDBOX_IMAGE"] ?? "reuben-cloud/sandbox-base:dev");
+  const store = artifactStoreFromEnv();
+  const db = new Db({ connectionString: databaseUrl });
+  await runMigrations(db);
+  // ---- Phase 2：会话存储。脚本是**单轮的手工验收驱动**，但它落的账与产品路径
+  // （`handleUserMessage`）是同一套表——不然"手工跑能落库"就只是一句空话。
+  const sessionStore = new PostgresSessionStore(db);
+
   // ---- Phase 13 的观察窗。**在跑任何东西之前先起来**：这样 clone / 沙箱 / 循环
   // 任何一段出问题，浏览器里都能看到（`run_error` 事件就是给这条路径的）。
+  // P4 起把 `sessionStore` 也给它：页面默认渲染会话视图（读 `session_entries`），
+  // 而不是只看这一次执行的实时流。
   // 起不来的话只警告（端口被占不该阻断一次 Run）。
   const hub = args.serve ? new RunHub({ log }) : null;
   let web: WebServer | null = null;
   if (hub !== null) {
     try {
-      web = await startWebServer({ hub, ...(args.port === null ? {} : { port: args.port }), log });
+      web = await startWebServer({ hub, store: sessionStore, ...(args.port === null ? {} : { port: args.port }), log });
       log("info", `观察窗：${web.url}/runs/${runId}（跑完仍然保留，Ctrl-C 退出）`);
     } catch (error) {
       log("warn", `观察窗没起来（端口被占？），这次 Run 没有实时 transcript`, {
@@ -281,10 +310,6 @@ async function main(): Promise<void> {
     }
   }
   const events = hub?.ensure(runId);
-  const image = await resolveImageRef(process.env["SANDBOX_IMAGE"] ?? "reuben-cloud/sandbox-base:dev");
-  const store = artifactStoreFromEnv();
-  const db = new Db({ connectionString: databaseUrl });
-  await runMigrations(db);
 
   // ---- GitHub 凭据（只有 --repo 才可能需要：clone 与 PR 都用它）
   const ref = args.repo === null ? null : parseRepoRef(args.repo);
@@ -319,9 +344,7 @@ async function main(): Promise<void> {
     log,
   });
 
-  // ---- Phase 2：会话存储。脚本是**单轮的手工验收驱动**，但它落的账与产品路径
-  // （`handleUserMessage`）是同一套表——不然"手工跑能落库"就只是一句空话。
-  const sessionStore = new PostgresSessionStore(db);
+  // ---- Phase 2：会话存储（在观察窗那段之前已经建好；这里只剩工具与请求记录器）
   const requests = new RequestRecorder({ store: sessionStore, artifactStore: store, log });
   const api = new SandboxApiClient();
 
@@ -432,22 +455,35 @@ async function main(): Promise<void> {
       onActivity: () => sessionStore.touchSession(session.id),
       log,
     });
+    const compaction = createSessionCompaction({
+      store: sessionStore,
+      sessionId: session.id,
+      runId,
+      model,
+      appendCompaction: (input) => recorder.appendCompaction(input.payload, input.usage),
+      ...(args.compactAfterTurn === null ? {} : { forceAtTurn: args.compactAfterTurn }),
+      log,
+    });
 
     const result = await runAgentLoop({
       model,
       tools: recorder.wrapTools(toolkit.tools),
       transcript,
       issue: args.issue,
+      // 观察窗的会话视图靠它找到这个会话的 entries（P4）。
+      sessionId: session.id,
       history,
       ...(prompts === null ? {} : { prompts }),
       system: buildSystemPrompt(),
       maxTurns: args.maxTurns,
       maxTokens: maxTokensFromEnv(model.model),
+      // 压缩（P3）：与产品路径同一份构造（`createSessionCompaction`），只是强制轮次可配。
+      prepareNextTurn: (turn) => compaction.prepareNextTurn(turn),
+      recoverFromModelError: (turn) => compaction.recoverFromModelError(turn),
       ...(events === undefined ? {} : { events }),
-      onText: (delta) => {
-        process.stdout.write(delta);
-        events?.emit({ type: "text", delta });
-      },
+      // 终端里那一段人读的输出与观察窗是两条路：观察窗从 `message_update` 事件拿增量，
+      // 这里只负责写 stdout（P4 起不再手动往 sink 里塞一条 `text`）。
+      onText: (delta) => process.stdout.write(delta),
       onAgentEvent: (event) => recorder.onAgentEvent(event),
       onRequest: async (info) => {
         await sessionStore.touchSession(session.id);

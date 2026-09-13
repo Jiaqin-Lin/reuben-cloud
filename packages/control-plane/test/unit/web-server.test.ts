@@ -16,7 +16,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
-import type { RunEvent } from "../../src/agent/events.ts";
+import type { MemorySessionStore } from "@reuben-cloud/agent-runtime";
+import { MemorySessionStore as MemoryStore, entryForMessage } from "@reuben-cloud/agent-runtime";
+import type { HubEvent } from "../../src/agent/events.ts";
 import { RunHub } from "../../src/web/hub.ts";
 import type { WebServer } from "../../src/web/server.ts";
 import { startWebServer } from "../../src/web/server.ts";
@@ -43,14 +45,17 @@ after(async () => {
 interface Frame {
   /** `id:` 字段；心跳注释帧是 null。 */
   id: number | null;
+  /** `event:` 字段（SSE 通道名）；心跳注释帧是 null。 */
+  name: string | null;
   /** `data:` 的 JSON；心跳注释帧是 null。 */
-  data: RunEvent | null;
+  data: HubEvent | null;
   /** 心跳（`: ping`）等注释帧。 */
   comment: boolean;
 }
 
 function parseFrame(raw: string): Frame {
   let id: number | null = null;
+  let name: string | null = null;
   const data: string[] = [];
   let comment = false;
   for (const line of raw.split("\n")) {
@@ -62,11 +67,13 @@ function parseFrame(raw: string): Frame {
     const field = colon === -1 ? line : line.slice(0, colon);
     const value = (colon === -1 ? "" : line.slice(colon + 1)).replace(/^ /, "");
     if (field === "id") id = Number(value);
+    else if (field === "event") name = value;
     else if (field === "data") data.push(value);
   }
   return {
     id,
-    data: data.length === 0 ? null : (JSON.parse(data.join("\n")) as RunEvent),
+    name,
+    data: data.length === 0 ? null : (JSON.parse(data.join("\n")) as HubEvent),
     comment,
   };
 }
@@ -136,8 +143,8 @@ async function nextFrame(stream: { frames: AsyncGenerator<Frame> }): Promise<Fra
   return next.done === true ? null : next.value;
 }
 
-function note(message: string): RunEvent {
-  return { type: "note", turn: 1, kind: "test", message };
+function note(message: string): HubEvent {
+  return { type: "note", kind: "test", message };
 }
 
 // ---------------------------------------------------------------- 用例
@@ -223,7 +230,7 @@ describe("Phase 13 · SSE 端点", () => {
     assert.equal(body.error, "run_not_found");
   });
 
-  test("事件按 SSE 帧发出：`id:` 单调、`data:` 是 RunEvent 的 JSON", async () => {
+  test("事件按 SSE 帧发出：`id:` 单调、`event:` 是通道名、`data:` 是事件的 JSON", async () => {
     const sink = hub.ensure("run_frames");
     sink.emit(note("第一条"));
     const stream = await openStream("run_frames");
@@ -232,8 +239,38 @@ describe("Phase 13 · SSE 端点", () => {
       const frames = await readFrames(stream, 2);
       assert.equal(frames[0]?.id, 1);
       assert.equal(frames[1]?.id, 2);
+      assert.equal(frames[0]?.name, "note", "note 事件走 `note` 通道");
       assert.equal(frames[0]?.data?.type, "note");
       assert.equal(frames[1]?.data?.type === "note" ? frames[1].data.message : null, "第二条");
+    } finally {
+      await stream.close();
+    }
+  });
+
+  test("通道名按事件族分：Run 生命周期走 run、循环事件走 message/turn/context/compaction、沙箱输出走 exec", async () => {
+    const sink = hub.ensure("run_channels");
+    sink.emit({
+      type: "run_start",
+      runId: "run_channels",
+      sessionId: null,
+      model: "m",
+      issue: "i",
+      repoDir: "/workspace/repo",
+      limits: { maxTurns: 1, wallClockMs: 1, outputTokenBudget: 1, maxTokens: 1 },
+    });
+    sink.emit({ type: "turn_start" });
+    sink.emit({ type: "message_start", message: { role: "user", content: "hi" } });
+    sink.emit({ type: "exec_start", executionId: null, cmd: ["ls"], cwd: null });
+    // 上下文面板与压缩标记的数据通道（P4 的壳；数据由 P10 的 ContextCompiler 产）。
+    sink.emit({ type: "context_compiled", turn: 1, sections: [{ name: "system", tokens: 10, hash: "h" }], hash: "h" });
+    sink.emit({ type: "compaction", reason: "threshold", tokensBefore: 100, firstKeptEntryId: "ent_1" });
+    const stream = await openStream("run_channels");
+    try {
+      const frames = await readFrames(stream, 6);
+      assert.deepEqual(
+        frames.map((frame) => frame.name),
+        ["run", "turn", "message", "exec", "context", "compaction"],
+      );
     } finally {
       await stream.close();
     }
@@ -288,5 +325,108 @@ describe("Phase 13 · SSE 端点", () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.equal(hub.info("run_leak")?.subscribers, 0);
+  });
+});
+
+describe("Phase 4 · 会话视图端点（读 `session_entries`，不看内存缓冲）", () => {
+  let store: MemorySessionStore;
+  let view: WebServer;
+  let sessionId = "";
+  let runId = "";
+  let base2 = "";
+
+  before(async () => {
+    store = new MemoryStore();
+    sessionId = (
+      await store.createSession({ repoKey: "local/x", baseCommit: "a".repeat(40), cwd: "/workspace/repo", title: "会话标题" })
+    ).id;
+    runId = await store.startRun({ id: "run_view_1", sessionId, startEntryId: null, provider: "scripted", model: "m1" });
+    await store.appendEntry(sessionId, runId, entryForMessage({ role: "user", content: "第一句" }));
+    await store.appendEntry(
+      sessionId,
+      runId,
+      entryForMessage({ role: "assistant", content: [{ type: "text", text: "第一句的回答" }] }),
+    );
+    await store.endRun(runId, { status: "stopped", stopReason: "end_turn", endEntryId: null });
+    view = await startWebServer({ hub, store, port: 0, log: () => undefined });
+    base2 = view.url;
+  });
+
+  after(async () => {
+    await view.close();
+  });
+
+  test("`GET /sessions/{id}/entries`：runs + entries（页面默认渲染的就是它）", async () => {
+    const response = await fetch(`${base2}/sessions/${sessionId}/entries`);
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      sessionId: string;
+      runs: Array<{ id: string; startEntryId: string | null; status: string }>;
+      entries: Array<{ id: string; seq: number; type: string; payload: { role?: string } }>;
+    };
+    assert.equal(body.sessionId, sessionId);
+    assert.deepEqual(
+      body.runs.map((run) => run.id),
+      [runId],
+    );
+    assert.equal(body.runs[0]?.status, "stopped");
+    assert.deepEqual(
+      body.entries.map((entry) => entry.payload.role),
+      ["user", "assistant"],
+    );
+    assert.ok(body.entries[0]!.seq < body.entries[1]!.seq);
+  });
+
+  test("`GET /runs/{id}/transcript`：run 的边界 + 本次执行的 entries", async () => {
+    const response = await fetch(`${base2}/runs/${runId}/transcript`);
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      run: { id: string; model: string; stopReason: string | null };
+      entries: Array<{ runId: string }>;
+    };
+    assert.equal(body.run.id, runId);
+    assert.equal(body.run.model, "m1");
+    assert.equal(body.run.stopReason, "end_turn");
+    assert.deepEqual(
+      body.entries.map((entry) => entry.runId),
+      [runId, runId],
+    );
+  });
+
+  test("`?afterSeq=` 只给之后的（增量拉取）", async () => {
+    const first = (await (await fetch(`${base2}/sessions/${sessionId}/entries`)).json()) as { entries: Array<{ seq: number }> };
+    const after = first.entries[0]!.seq;
+    const body = (await (await fetch(`${base2}/sessions/${sessionId}/entries?afterSeq=${after}`)).json()) as {
+      entries: Array<{ seq: number }>;
+    };
+    assert.equal(body.entries.length, 1);
+    assert.ok(body.entries[0]!.seq > after);
+  });
+
+  test("不存在：会话 / run 都给 404（而不是空列表）", async () => {
+    const missingSession = await fetch(`${base2}/sessions/ses_none/entries`);
+    assert.equal(missingSession.status, 404);
+    assert.equal(((await missingSession.json()) as { error: string }).error, "session_not_found");
+    const missingRun = await fetch(`${base2}/runs/run_none/transcript`);
+    assert.equal(missingRun.status, 404);
+    assert.equal(((await missingRun.json()) as { error: string }).error, "run_not_found");
+  });
+
+  test("没接 store 的观察窗：这两条端点回 503（说得清原因），实时流不受影响", async () => {
+    const response = await fetch(`${base}/runs/run_frames/transcript`);
+    assert.equal(response.status, 503);
+    const body = (await response.json()) as { error: string; message: string };
+    assert.equal(body.error, "store_unavailable");
+    assert.match(body.message, /会话存储/);
+    // 实时流照旧：hub 是独立的。
+    const info = await fetch(`${base}/runs/run_frames/info`);
+    assert.equal(info.status, 200);
+  });
+
+  test("配额与非法参数：`limit=-1` 当作没给（不因为一个坏参数回 400）", async () => {
+    const response = await fetch(`${base2}/sessions/${sessionId}/entries?limit=-1&afterSeq=abc`);
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as { entries: unknown[] };
+    assert.equal(body.entries.length, 2);
   });
 });

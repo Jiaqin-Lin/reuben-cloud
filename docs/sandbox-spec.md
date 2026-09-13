@@ -2315,6 +2315,8 @@ MVP 版本要讲清楚的事：
 11. **上下文裁剪把旧 `tool_result` 的**内容**换成占位符，块本身留着**：Anthropic 要求每个
     `tool_use` 有配对的 `tool_result`，删块会让下一次请求 400。裁剪只发生在旧的工具结果上，
     user / assistant 的文字不丢（§4 的 MVP 策略）。
+    **（M2 P3 已删除这条裁剪**：它被 compaction 取代——见 `agent-runtime-spec.md` 附录 A-15。
+    配对的约束在 compaction 里仍然成立：切点永远不落在 `tool_result` 上。）
 12. **多一个 `scripts/agent-run.ts`（`npm run agent:run`）**：交付物清单里没有它，但 §K 第 9 步
     （给一个真实 issue 跑出 patch）需要一个能复跑的入口。它只做装配：建沙箱 → clone →
     `mkdir` + 灌入 → 跑循环 → `GET /diff` → 落 patch → 销毁（`--keep` 可留沙箱排障）。
@@ -2594,6 +2596,12 @@ PR 正文要有的东西（这是 README 说的"可信度报告"的雏形）：
 
 **完成标记：**
 - [x] **Phase 13 完成**（可选）——`npm test` 382 项（含 22 条 hub、13 条 SSE 端点、13 条事件、11 条前端契约、8 条页面渲染）与 `npm run test:integration` 里的 `web-stream` 全绿；另用 `--serve` 在**真沙箱**上手工跑过一次（真模型修好了 fixture 的 bug，21 条事件：`tool_call` ×6、`exec_output`（`npm test` 的真实输出）、`exec_end`（exit 1）、一个轮次挨着一个轮次；`Last-Event-ID: 20` 只补发了第 21 条）。M0 至此全部勾完
+
+> **M2 P4 已在这一节上做过一次协议迁移**（事件从 M0 的 `RunEvent` 改成 `AgentEvent` 唯一协议，
+> SSE 帧多了 `event:` 通道名，页面改成"会话视图 + 上下文面板"）——上文那张事件表与
+> 本节的表述保留为 M0 的历史记录，**当前口径以 `agent-runtime-spec.md` 的 Phase 4 与
+> 附录 A-18 … A-23 为准**。本节那 19 条前端单测（11 + 8）已逐条迁到新协议（现为 26 条），
+> 仍然在 `npm test` 里跑。
 
 #### 实现备注（与本文的有意偏差，都写了理由）
 

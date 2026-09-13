@@ -1,14 +1,20 @@
 /**
  * Phase 13 · 前端资源的契约（不需要浏览器、不需要网络）。
  *
+ * 【P4 之后对的是什么】观察窗的事件族是 `HubEvent`（Run 生命周期 + 沙箱输出 + 循环的
+ * `AgentEvent`），SSE 通道名由后端 `events.ts` 的 `SSE_EVENT_NAMES` 定。所以这里的比对
+ * 变成两件具体的事：① 每一个事件类型都有渲染分支；② 每一个通道名都在前端的
+ * `SSE_CHANNELS` 清单里（两份清单必须逐条一致）。
+ *
  * 【为什么这些"只是读文件"的检查值得写】这个前端**没有构建**，所以也没有构建会把错误
  * 拦在前面：一个 JS 语法错误、一个漏掉的事件分支、一个指向 CDN 的字体，都会一直安静地
  * 待到"打开浏览器才发现"。这里把三类问题变成 `npm test` 里的红：
  *
  *  ① **契约**：`index.html` 里引的东西必须真的存在，而且在 CP 的静态白名单里
  *     （白名单是唯一的出口，见 `web/static.ts`，漏一个就是线上 404）。
- *  ② **完整**：`app.js` 必须能解析（`vm.Script` 整份语法检查），且 `RunEvent` 的每一个
- *     `type` 都有一个 `case`（后端加了事件类型而前端没跟上时，页面上会少一整类信息）。
+ *  ② **完整**：`app.js` 必须能解析（`vm.Script` 整份语法检查），且观察窗的每一个事件
+ *     类型都有一个 `case`、后端每一个 SSE 通道名都在前端的通道清单里（后端加了事件
+ *     而前端没跟上时，页面上会少一整类信息）。
  *  ③ **可比对的性质**：不引外部资源（离线可用）、不用 innerHTML（外部输入进 DOM 的唯一
  *     安全通道是 textContent）、对比度真的到 AA。
  */
@@ -19,7 +25,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { describe, test } from "node:test";
-import type { RunEvent } from "../../control-plane/src/agent/events.ts";
+import type { HubEvent } from "../../control-plane/src/agent/events.ts";
+import { SSE_EVENT_NAMES } from "../../control-plane/src/agent/events.ts";
 import { STATIC_FILES } from "../../control-plane/src/web/static.ts";
 
 const publicDir = fileURLToPath(new URL("../public/", import.meta.url));
@@ -29,22 +36,40 @@ const appJs = await readFile(path.join(publicDir, "app.js"), "utf8");
 const css = await readFile(path.join(publicDir, "style.css"), "utf8");
 
 /**
- * 编译期清单：漏掉一个 `RunEvent.type` 这里就是类型错误（不是运行期才发现）。
+ * 编译期清单：漏掉一个 `HubEvent.type` 这里就是类型错误（不是运行期才发现）。
  * 运行期再把这份清单与 `app.js` 的 `case` 比一遍。
  */
-const EVENT_TYPES: Record<RunEvent["type"], true> = {
+const EVENT_TYPES: Record<HubEvent["type"], true> = {
+  // Run 生命周期（CP 侧的编排）
   run_start: true,
-  turn: true,
-  text: true,
-  tool_call: true,
-  tool_result: true,
+  run_end: true,
+  run_error: true,
+  // 沙箱命令输出
   exec_start: true,
   exec_output: true,
   exec_end: true,
+  // 循环的原生事件（AgentEvent）
+  agent_start: true,
+  agent_end: true,
+  turn_start: true,
+  turn_end: true,
+  message_start: true,
+  message_update: true,
+  message_end: true,
+  tool_execution_start: true,
+  tool_execution_update: true,
+  tool_execution_end: true,
+  context_compiled: true,
+  compaction: true,
   note: true,
-  run_end: true,
-  run_error: true,
 };
+
+/** 从前端源码里抽出它认的 SSE 通道清单（格式固定，见 `app.js` 的 `SSE_CHANNELS`）。 */
+function channelsOf(source: string): string[] {
+  const block = /const SSE_CHANNELS = \[([^\]]*)\]/.exec(source);
+  assert.ok(block !== null, "app.js 里找不到 SSE_CHANNELS 清单");
+  return [...block[1]!.matchAll(/"([a-z_]+)"/g)].map((match) => match[1]!);
+}
 
 /** 页面里出现的外部地址（一个都不该有：离线可用是它的前提之一）。 */
 function externalRefs(source: string): string[] {
@@ -71,10 +96,10 @@ describe("Phase 13 · 静态资源的契约", () => {
     }
   });
 
-  test("页面结构：run id、日志容器、状态行、主题按钮都在，且声明了中文与模块脚本", () => {
+  test("页面结构：run id、日志容器、状态行、上下文面板、主题按钮都在，且声明了中文与模块脚本", () => {
     assert.match(html, /<html lang="zh-CN"/);
     assert.match(html, /<script type="module" src="\/app\.js">/);
-    for (const id of ["log", "state", "state-text", "theme", "run-id", "jump", "jump-button", "sentinel"]) {
+    for (const id of ["log", "context", "state", "state-text", "theme", "run-id", "jump", "jump-button", "sentinel"]) {
       assert.match(html, new RegExp(`id="${id}"`), `index.html 少了 #${id}`);
     }
     assert.match(html, /<meta name="viewport"/);
@@ -96,12 +121,31 @@ describe("Phase 13 · app.js 的完整性", () => {
     assert.doesNotThrow(() => new vm.Script(appJs, { filename: "app.js" }));
   });
 
-  test("每个 RunEvent.type 都有分支（后端加事件时前端不会静默丢一类）", () => {
-    const types = Object.keys(EVENT_TYPES) as Array<RunEvent["type"]>;
-    assert.ok(types.length >= 11);
+  test("每个 HubEvent.type 都有分支（后端加事件时前端不会静默丢一类）", () => {
+    const types = Object.keys(EVENT_TYPES) as Array<HubEvent["type"]>;
+    assert.ok(types.length >= 19);
     for (const type of types) {
       assert.match(appJs, new RegExp(`case "${type}":`), `app.js 没有处理 ${type}`);
     }
+  });
+
+  test("前端认的 SSE 通道与后端 `SSE_EVENT_NAMES` 逐条一致，且每个通道都注册了监听", () => {
+    assert.deepEqual(channelsOf(appJs), [...SSE_EVENT_NAMES]);
+    // 注册方式：对清单里的每个通道各挂一个监听（见 app.js 的 openStream）。
+    assert.match(appJs, /for \(const name of SSE_CHANNELS\) source\.addEventListener\(name, onFrame\)/);
+  });
+
+  test("会话视图：页面会去读 /sessions/{id}/entries，并按 runs.startEntryId 切开历史", () => {
+    assert.match(appJs, /\/sessions\/\$\{encodeURIComponent\(sessionId\)\}\/entries/);
+    assert.match(appJs, /startEntryId/);
+    assert.match(appJs, /renderSessionHistory/);
+  });
+
+  test("上下文面板：分区 / 占比 / hash 前 8 位 / 压缩标记都在", () => {
+    assert.match(appJs, /context_compiled/);
+    assert.match(appJs, /ctx-section__pct/);
+    assert.match(appJs, /shortHash/);
+    assert.match(appJs, /已压缩/);
   });
 
   test("外部输入一律走 textContent：不拼 HTML", () => {

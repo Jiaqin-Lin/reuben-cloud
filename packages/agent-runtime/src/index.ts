@@ -60,12 +60,14 @@ export {
   isRetryableModelError,
   maxTokensFromEnv,
   modelFromEnv,
+  modelNamedFromEnv,
   selectProvider,
   toModelError,
   toSdkMessages,
+  toSdkParams,
   toSdkTools,
 } from "./model/client.ts";
-export type { AnthropicModelOptions, Effort, ModelErrorReason, ModelProvider, ProviderSelection } from "./model/client.ts";
+export type { AnthropicModelOptions, Effort, ModelErrorReason, ModelProvider, ProviderSelection, SdkParamsOptions } from "./model/client.ts";
 export { AbortedError, DEFAULT_RETRY_POLICY, retryWithBackoff, sleepWithSignal } from "./model/retry.ts";
 export type { RetryPolicy } from "./model/retry.ts";
 export * from "./tools/index.ts";
@@ -78,6 +80,49 @@ export { MemorySessionStore } from "./session/memory.ts";
 export type { MemorySessionStoreOptions } from "./session/memory.ts";
 export { exportSession } from "./session/export.ts";
 export type { ExportSessionOptions, SpilledMessagesReader } from "./session/export.ts";
+// 压缩（Phase 3）。分三层导出：估算/切点（单测与调试直接用）、摘要生成、控制器（CP 接线）。
+// 不用 `export *`：压缩内部有 `ProjectedMessage` / `CompactItem` 这类只给同包用的形状，
+// 一次性倒出去会让它们看起来像契约。
+export { calculateContextTokens, estimateContextTokens, estimateTokens, shouldCompact } from "./compaction/tokens.ts";
+export type { ContextUsageEstimate } from "./compaction/tokens.ts";
+export { findCutPoint, findTurnStartIndex, findValidCutPoints } from "./compaction/cut.ts";
+export type { CutPointResult } from "./compaction/cut.ts";
+export {
+  CompactionError,
+  TOOL_RESULT_MAX_CHARS,
+  computeFileLists,
+  createFileOps,
+  extractFileOperations,
+  extractFileOpsFromMessage,
+  formatFileOperations,
+  generateSummary,
+  generateTurnPrefixSummary,
+  serializeConversation,
+  summaryBudgetChars,
+} from "./compaction/summarize.ts";
+export type { FileLists, FileOperations, SummaryOptions, SummaryResult } from "./compaction/summarize.ts";
+export {
+  DEFAULT_COMPACTION_SETTINGS,
+  ENV_COMPACTION_ENABLED,
+  ENV_COMPACTION_KEEP_TOKENS,
+  ENV_COMPACTION_RESERVE_TOKENS,
+  ENV_COMPACTION_SUMMARY_MODEL,
+  compact,
+  compactionSettingsFromEnv,
+  createCompactionController,
+  isContextOverflowError,
+  prepareCompaction,
+} from "./compaction/index.ts";
+export type {
+  CompactOptions,
+  CompactOutcome,
+  CompactionAppend,
+  CompactionController,
+  CompactionControllerOptions,
+  CompactionFailure,
+  CompactionPreparation,
+  CompactionSettings,
+} from "./compaction/index.ts";
 export { REPO_DIR, ROLE_PROMPT, DEFAULT_EGRESS_NOTE, buildSandboxSection, buildSystemPrompt } from "./prompt/system.ts";
 export type { SandboxFacts, SystemPromptSections } from "./prompt/system.ts";
 export { buildTaskPrompt, initialMessages } from "./prompt/task.ts";

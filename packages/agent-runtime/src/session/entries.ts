@@ -10,6 +10,9 @@
  * 仍然在存储里（审计、回放、导出都要用），只是不再进模型。这是设计文档 §E.4 的
  * "压缩只改变送去模型的投影"落到代码上的那一行。
  *
+ * 【投影里只可能有一份摘要】更早的压缩条目（第二次压缩时它们会落在保留区间里）在
+ * `projectAll` 里被跳过：它们的摘要已经被最新那份吸收，再发一遍既是噪声又会互相矛盾。
+ *
  * 【为什么 note 也要进 entries】观察窗（P4）与导出（spec P2 §7）都要它。但它**不进模型**：
  * 一条"上下文太大，丢了 6 条旧工具结果"的提示对模型是纯噪声。所以自定义条目带
  * `forModel` 标记（缺省 true，note 显式 false），投影时按它过滤——用一个字段表达
@@ -40,11 +43,19 @@ export interface CompactionEntryPayload {
   usage?: Usage;
 }
 
-export interface CompactionDetails {
+/**
+ * 压缩条目携带的结构化事实。`readFiles` / `modifiedFiles` 是 P3 的累积文件清单；
+ * 索引签名留给实现方（将来加“这轮改了哪些 commit”之类不用改类型）。
+ *
+ * 【为什么是 type 不是 interface】只有 type 别名会得到 TS 的隐式索引签名：
+ * `computeFileLists()` 返回的 `FileLists` 要能直接赋给它（interface 版本会导致
+ * “Index signature for type 'string' is missing”）。
+ */
+export type CompactionDetails = {
   readFiles?: string[];
   modifiedFiles?: string[];
   [key: string]: unknown;
-}
+};
 
 /** `type='custom'` 的 payload。`forModel === false` 的条目只给 UI / 导出看。 */
 export interface CustomEntryPayload {
@@ -165,6 +176,11 @@ function findLastCompactionIndex(ordered: readonly StoredEntry[]): number {
 function projectAll(entries: readonly StoredEntry[]): AgentMessage[] {
   const out: AgentMessage[] = [];
   for (const entry of entries) {
+    // 【为什么跳过压缩条目】投影里只留**最新那份**摘要（由 `buildContextEntries` 显式放在
+    // 最前）；更早的压缩条目在序列里只是"当时的标记"，它的摘要已经被最新那一份吸收。
+    // 第二次压缩时旧压缩条目正好落在保留区间里，不跳过就会把一份**过时摘要**当一条
+    // user 消息发出去（P3 测试要点 4 抓的就是这个）。
+    if (entry.type === "compaction") continue;
     const message = projectEntry(entry);
     if (message !== null) out.push(message);
   }

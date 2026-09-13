@@ -3,11 +3,15 @@
  *
  * 【它测什么】spec 的验收标准是"一次 Run 的全过程能在浏览器里实时看到"，而"打开浏览器
  * 看一眼"不是自动化测试。所以这里用的办法是：**在真沙箱上跑一次 Run，同时用真 HTTP
- * 读那条 SSE**，然后断言这条流真的包含了三类事件：
- *  · 模型文字增量（`text`，走 Phase 11 的 `onText` 回调）
- *  · 工具调用与结果（`tool_call` / `tool_result`）
+ * 读那条 SSE**，然后断言这条流真的包含了三类信息：
+ *  · 模型文字增量（`message_update` + `text_delta`，P4 起走事件协议）
+ *  · 工具调用与结果（`tool_execution_start` / `tool_execution_end`）
  *  · **沙箱命令输出**（`exec_start` / `exec_output` / `exec_end`，来自沙箱的事件流）
  * 以及 spec 测试要点的第二条：**断线之后带 `Last-Event-ID` 重连能接上**（不重不漏）。
+ *
+ * 【P4 的变化】帧现在带 `event:` 通道名（run / agent / turn / message / tool / context /
+ * compaction / note / exec），断言里多一步"每个事件走对了通道"；事件本身不再是 M0 的
+ * `RunEvent`，而是循环的原生 `AgentEvent`（加上三个 Run 生命周期与沙箱输出）。
  *
  * 【为什么值得多一个真容器用例】单测把每一段都盖住了，但"沙箱的事件真的会经过 manager
  * 的 `onEvent`、再经 bash 工具、再进 hub、再经 SSE 到客户端"这一整条链路只有在真容器上
@@ -25,8 +29,8 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import type { AssistantMessageEventStream, Content, ModelClient } from "@reuben-cloud/agent-runtime";
-import { createAssistantMessageEventStream } from "@reuben-cloud/agent-runtime";
-import type { RunEvent, RunEventSink } from "../../src/agent/events.ts";
+import { createAssistantMessageEventStream, entryForMessage } from "@reuben-cloud/agent-runtime";
+import type { HubEvent, HubEventSink } from "../../src/agent/events.ts";
 import { runAgentLoop } from "../../src/agent/run.ts";
 import { Transcript } from "../../src/agent/transcript.ts";
 import { REPO_DIR } from "@reuben-cloud/agent-runtime";
@@ -38,6 +42,7 @@ import { SandboxManager } from "../../src/manager/sandbox-manager.ts";
 import { LocalDockerProvider } from "../../src/provider/local-docker.ts";
 import { forwardContainerName } from "../../src/provider/types.ts";
 import { cloneRepo, removeRunDir } from "../../src/repo/clone.ts";
+import { PostgresSessionStore } from "../../src/session/postgres.ts";
 import { injectRepo } from "../../src/repo/inject.ts";
 import { RunHub } from "../../src/web/hub.ts";
 import type { WebServer } from "../../src/web/server.ts";
@@ -107,7 +112,9 @@ after(async () => {
 
 interface Frame {
   id: number;
-  event: RunEvent;
+  /** SSE 的 `event:` 字段（通道名）。 */
+  name: string;
+  event: HubEvent;
 }
 
 /** 打开一条 SSE，逐条地读事件（心跳跳过）。调用方 `close()`。 */
@@ -171,6 +178,7 @@ function openReader(url: string, headers: Record<string, string> = {}): { next()
 /** 一帧 → 一条事件。心跳注释帧与没有 `data:` 的帧返回 null。 */
 function parseFrame(raw: string): Frame | null {
   let id: number | null = null;
+  let name: string | null = null;
   const data: string[] = [];
   for (const line of raw.split("\n")) {
     if (line.startsWith(":")) continue;
@@ -178,19 +186,23 @@ function parseFrame(raw: string): Frame | null {
     const field = colon === -1 ? line : line.slice(0, colon);
     const value = (colon === -1 ? "" : line.slice(colon + 1)).replace(/^ /, "");
     if (field === "id") id = Number(value);
+    else if (field === "event") name = value;
     else if (field === "data") data.push(value);
   }
-  if (id === null || data.length === 0) return null;
-  return { id, event: JSON.parse(data.join("\n")) as RunEvent };
+  if (id === null || name === null || data.length === 0) return null;
+  return { id, name, event: JSON.parse(data.join("\n")) as HubEvent };
 }
 
 /** 事件序列里的一个"标记"，用来断言顺序（不关心中间夹了什么）。 */
-function markerOf(event: RunEvent): string {
+function markerOf(event: HubEvent): string {
   switch (event.type) {
-    case "tool_call":
-      return `tool_call:${event.name}`;
-    case "tool_result":
-      return `tool_result:${event.name}`;
+    case "message_start":
+    case "message_end":
+      return `${event.type}:${event.message.role}`;
+    case "tool_execution_start":
+      return `tool_start:${event.toolName}`;
+    case "tool_execution_end":
+      return `tool_end:${event.toolName}:${event.isError}`;
     case "exec_start":
       return "exec_start";
     case "exec_output":
@@ -272,7 +284,7 @@ describe("Phase 13 · 真沙箱里的一次 Run 实时流", () => {
     // ---- 观察窗（Phase 13）：真 http server + 真 hub。先连上，再开始跑。
     const hub = new RunHub({ log: () => undefined });
     let server: WebServer | null = null;
-    const sink: RunEventSink = hub.ensure(runId);
+    const sink: HubEventSink = hub.ensure(runId);
     let stream: ReturnType<typeof openReader> | null = null;
     try {
       server = await startWebServer({ hub, port: 0, log: () => undefined });
@@ -296,7 +308,6 @@ describe("Phase 13 · 真沙箱里的一次 Run 实时流", () => {
         transcript,
         issue: "跑一遍测试",
         events: sink,
-        onText: (delta) => sink.emit({ type: "text", delta }),
         maxTurns: 4,
         log: () => undefined,
       });
@@ -318,20 +329,56 @@ describe("Phase 13 · 真沙箱里的一次 Run 实时流", () => {
       }
 
       const markers = frames.map((frame) => markerOf(frame.event));
+      // `tool_execution_update` 的**条数**取决于命令输出的分块时机（不是契约），所以从
+      // 序列断言里过滤掉、单独断言"至少来了一条"（F2：长命令的中间输出能实时看到）。
       assert.deepEqual(
-        markers.filter((marker) => !marker.startsWith("text")),
+        markers.filter((marker) => marker !== "message_update" && marker !== "tool_execution_update"),
         [
           "run_start",
-          "turn",
-          "tool_call:bash",
+          "agent_start",
+          "turn_start",
+          "message_start:user",
+          "message_end:user",
+          "message_start:assistant",
+          "message_end:assistant",
+          "tool_start:bash",
           "exec_start",
           "exec_output:stdout",
           "exec_end:completed:1",
-          "tool_result:bash",
-          "turn",
+          "tool_end:bash:false",
+          "message_start:toolResult",
+          "message_end:toolResult",
+          "turn_end",
+          "turn_start",
+          "message_start:assistant",
+          "message_end:assistant",
+          "turn_end",
+          "agent_end",
           "run_end",
         ],
       );
+      // 文字增量真的从事件协议里出来（P4 起不再有独立的 text 事件）
+      const deltas = frames
+        .filter((frame) => frame.event.type === "message_update" && frame.event.assistantMessageEvent.type === "text_delta")
+        .map((frame) =>
+          frame.event.type === "message_update" && frame.event.assistantMessageEvent.type === "text_delta"
+            ? frame.event.assistantMessageEvent.delta
+            : "",
+        );
+      assert.deepEqual(deltas, ["先跑测试看看", "跑完了"]);
+      // 工具执行中的增量（bash → onUpdate → tool_execution_update）：页面上的"实时输出"
+      assert.ok(
+        frames.some((frame) => frame.event.type === "tool_execution_update"),
+        "长命令的中间输出应该经 tool_execution_update 出来",
+      );
+
+      // 通道名：四族事件按映射表分到四个通道（前端就是按名字监听的）
+      const channelOf = new Map(frames.map((frame) => [markerOf(frame.event), frame.name]));
+      assert.equal(channelOf.get("run_start"), "run");
+      assert.equal(channelOf.get("turn_start"), "turn");
+      assert.equal(channelOf.get("message_start:assistant"), "message");
+      assert.equal(channelOf.get("tool_start:bash"), "tool");
+      assert.equal(channelOf.get("exec_output:stdout"), "exec");
 
       // 命令输出是真的从沙箱里出来的（fixture 的测试会打印 FAIL 并以 1 退出）
       const output = frames.find((frame) => frame.event.type === "exec_output")!;
@@ -340,8 +387,8 @@ describe("Phase 13 · 真沙箱里的一次 Run 实时流", () => {
       assert.equal(execEnd.event.type === "exec_end" ? execEnd.event.state : null, "completed");
       assert.equal(execEnd.event.type === "exec_end" ? execEnd.event.exitCode : null, 1);
       // 非 0 退出不是"工具报错"（Phase 1 §7 的语义），模型自己看退出码
-      const toolResult = frames.find((frame) => frame.event.type === "tool_result")!;
-      assert.equal(toolResult.event.type === "tool_result" ? toolResult.event.isError : null, false);
+      const toolEnd = frames.find((frame) => frame.event.type === "tool_execution_end")!;
+      assert.equal(toolEnd.event.type === "tool_execution_end" ? toolEnd.event.isError : null, false);
 
       // ---- 断线重连：从第 3 条之后接着读，必须正好是第 4 条开始的同一串
       const resumed = openReader(`${server.url}/runs/${encodeURIComponent(runId)}/stream`, {
@@ -373,6 +420,77 @@ describe("Phase 13 · 真沙箱里的一次 Run 实时流", () => {
       await server?.close();
       hub.close();
       await manager.destroySandbox(sandboxId, "phase13_test_done").catch(() => undefined);
+    }
+  });
+});
+
+/**
+ * Phase 4 · 会话视图与本次执行切片（真 PG + 真 HTTP）。
+ *
+ * 【为什么要在集成测试里再验一遍单测已经验过的东西】单测用的是内存实现——它证明的是
+ * "端点的形状与切分规则对不对"；这里换真 PG 之后再跑一次，证明的是"读路径真的能从
+ * `session_entries` 里取出来"：`getSession` / `listRuns` / `listEntries` / `getRun` 四个查询
+ * 与 HTTP 层的拼装一起过一遍。观察窗默认显示的就是这一份数据，它错了页面会安静地少一段历史。
+ */
+describe("Phase 4 · 会话视图端点（真 PG）", () => {
+  test("`/sessions/{id}/entries` 与 `/runs/{id}/transcript` 读的是同一批 entries", async () => {
+    const store = new PostgresSessionStore(db);
+    const session = await store.createSession({
+      repoKey: "local/fixture",
+      baseCommit: "a".repeat(40),
+      cwd: REPO_DIR,
+      title: "会话视图",
+    });
+    const viewRunId = `run_view_${randomBytes(4).toString("hex")}`;
+    await store.startRun({ id: viewRunId, sessionId: session.id, startEntryId: null, provider: "scripted", model: "m-view" });
+    const firstEntry = await store.appendEntry(
+      session.id,
+      viewRunId,
+      entryForMessage({ role: "user", content: "第一句" }),
+    );
+    const lastEntry = await store.appendEntry(
+      session.id,
+      viewRunId,
+      entryForMessage({ role: "assistant", content: [{ type: "text", text: "第一句的回答" }] }),
+    );
+    await store.endRun(viewRunId, { status: "stopped", stopReason: "end_turn", endEntryId: lastEntry });
+
+    const hub = new RunHub({ textCoalesceMs: 0 });
+    const server = await startWebServer({ hub, store, port: 0, log: () => undefined });
+    try {
+      const view = (await (await fetch(`${server.url}/sessions/${session.id}/entries`)).json()) as {
+        sessionId: string;
+        runs: Array<{ id: string; startEntryId: string | null; endEntryId: string | null; status: string }>;
+        entries: Array<{ id: string; runId: string | null; seq: number; payload: { role?: string } }>;
+      };
+      assert.equal(view.sessionId, session.id);
+      assert.equal(view.runs.length, 1);
+      assert.equal(view.runs[0]!.id, viewRunId);
+      // 轮次边界：第一轮没有上一条 leaf（null），停在 assistant 那条。
+      assert.equal(view.runs[0]!.startEntryId, null);
+      assert.equal(view.runs[0]!.endEntryId, lastEntry);
+      assert.equal(view.runs[0]!.status, "stopped");
+      assert.deepEqual(
+        view.entries.map((entry) => entry.payload.role),
+        ["user", "assistant"],
+      );
+      assert.equal(view.entries[0]!.id, firstEntry);
+      assert.ok(view.entries.every((entry) => entry.runId === viewRunId));
+
+      const transcript = (await (await fetch(`${server.url}/runs/${viewRunId}/transcript`)).json()) as {
+        run: { id: string; sessionId: string; model: string; stopReason: string | null };
+        entries: Array<{ id: string }>;
+      };
+      assert.equal(transcript.run.id, viewRunId);
+      assert.equal(transcript.run.sessionId, session.id);
+      assert.equal(transcript.run.model, "m-view");
+      assert.deepEqual(
+        transcript.entries.map((entry) => entry.id),
+        [firstEntry, lastEntry],
+      );
+    } finally {
+      await server.close();
+      hub.close();
     }
   });
 });

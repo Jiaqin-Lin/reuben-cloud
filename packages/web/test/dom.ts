@@ -150,20 +150,40 @@ export class FakeNode {
   }
 }
 
-/** 一个假的 `EventSource` 实例：测试拿它手动派发 `open` / `error` / `message`。 */
+/** 一个假的 `EventSource` 实例：测试拿它手动派发 `open` / `error` / 事件帧。 */
 export class FakeEventSource {
   readonly url: string;
   onopen: (() => void) | null = null;
   onerror: (() => void) | null = null;
   onmessage: ((message: { data: string }) => void) | null = null;
   closed = false;
+  /** 按 SSE 通道名注册的监听（与浏览器一致：`app.js` 给每个通道各注册一个）。 */
+  #listeners = new Map<string, Array<(message: { data: string }) => void>>();
 
   constructor(url: string) {
     this.url = url;
   }
 
+  addEventListener(type: string, handler: (message: { data: string }) => void): void {
+    const list = this.#listeners.get(type) ?? [];
+    list.push(handler);
+    this.#listeners.set(type, list);
+  }
+
   close(): void {
     this.closed = true;
+  }
+
+  /**
+   * 测试用：按通道名派发一帧。**名字对不上就不派发**——浏览器就是这么做的
+   * （`EventSource` 只派发有人监听的事件类型），所以"后端加了一个新通道、前端没跟上"
+   * 在真实环境里也只是少一块信息，不会走错分支。
+   * `onmessage` 是 `message` 通道的监听（等价于 `addEventListener("message", ...)`）。
+   */
+  dispatch(name: string, data: unknown): void {
+    const message = { data: JSON.stringify(data) };
+    for (const handler of this.#listeners.get(name) ?? []) handler(message);
+    if (name === "message") this.onmessage?.(message);
   }
 }
 

@@ -320,6 +320,14 @@ export interface SessionStore {
   startRun(input: NewRun): Promise<string>;
   endRun(runId: string, patch: EndRunPatch): Promise<void>;
   listRuns(sessionId: string): Promise<StoredRun[]>;
+  /**
+   * 按 id 取一次执行（没有就是 null）。
+   *
+   * 【为什么需要它（P4 新增）】`listRuns` 只能从会话出发，而观察窗拿到的是 run id：
+   * 要回答"这个 run 属于哪个会话、这次执行从哪条 entry 开始"就必须能反查。
+   * P10 的回放（按 run 找当时的编译产物）走的是同一条路。
+   */
+  getRun(runId: string): Promise<StoredRun | null>;
 
   // ---- 工具调用 / 用量 / 编译产物
   /** 记一条 intent（一个事务）。返回 invocation id。 */

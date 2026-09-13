@@ -43,11 +43,18 @@ export function usageOf(outputTokens: number): Usage {
 export type ScriptStep = (stream: AssistantMessageEventStream, request: ModelRequest) => void | Promise<void>;
 
 /** 一步文本响应（含增量，用来验证 message_update）。 */
-export function stepText(text: string, options: { stopReason?: StopReason; outputTokens?: number } = {}): ScriptStep {
+export function stepText(
+  text: string,
+  options: { stopReason?: StopReason; outputTokens?: number; usage?: Usage } = {},
+): ScriptStep {
   const reason = options.stopReason ?? "stop";
   return (stream) => {
     if (reason === "error" || reason === "aborted") throw new Error("stepText 只处理正常终态；用 stepError");
-    const message: AssistantMessage = { role: "assistant", content: [textChunk("")], usage: usageOf(options.outputTokens ?? 10) };
+    const message: AssistantMessage = {
+      role: "assistant",
+      content: [textChunk("")],
+      usage: options.usage ?? usageOf(options.outputTokens ?? 10),
+    };
     stream.push({ type: "start", partial: { ...message } });
     stream.push({ type: "text_start", contentIndex: 0, partial: { ...message } });
     let accumulated = "";
@@ -68,10 +75,13 @@ function textChunk(value: string): Content {
 }
 
 /** 一步工具调用响应（每个调用产生 toolcall_start/delta/end）。 */
-export function stepToolCalls(calls: ToolCallContent[], options: { stopReason?: StopReason } = {}): ScriptStep {
+export function stepToolCalls(
+  calls: ToolCallContent[],
+  options: { stopReason?: StopReason; usage?: Usage } = {},
+): ScriptStep {
   const reason = options.stopReason ?? "toolUse";
   return (stream) => {
-    const message: AssistantMessage = { role: "assistant", content: [], usage: usageOf(20) };
+    const message: AssistantMessage = { role: "assistant", content: [], usage: options.usage ?? usageOf(20) };
     stream.push({ type: "start", partial: message });
     message.content = [...calls];
     calls.forEach((call, index) => {
@@ -121,23 +131,64 @@ export class ScriptedModel implements ModelClient {
   stream(request: ModelRequest): AssistantMessageEventStream {
     const index = this.requests.length;
     this.requests.push(request);
-    const stream = createAssistantMessageEventStream();
     const step = this.steps[index] ?? stepText("(script exhausted)");
-    // 异步推：真实的模型不会在同一个 tick 里把整条流吐完，测试也不该假设这一点。
-    void Promise.resolve()
-      .then(() => step(stream, request))
-      .catch((error: unknown) => {
-        const message: AssistantMessage = {
-          role: "assistant",
-          content: [],
-          stopReason: "error",
-          errorMessage: error instanceof Error ? error.message : String(error),
-          usage: emptyUsage(),
-        };
-        stream.push({ type: "error", reason: "error", error: message });
-      });
-    return stream;
+    return streamFromStep(step, request);
   }
+}
+
+/**
+ * 按请求内容选脚本的模型（摘要请求与主对话请求要分流时用它）。
+ *
+ * 【为什么需要它】P3 的压缩会在主循环中间插入一次摘要请求，用固定顺序的脚本表达
+ * "第几次请求答什么"很脆（加一条断言就要重排全部步骤）。路由函数让测试写成
+ * "摘要请求走这个、主对话按计数走"——顺序不再是断言的一部分。
+ *
+ * 两个分流口按 `cache` 分：P3 的摘要请求一律 `cache: "none"`（见 `summarize.ts`）。
+ */
+export class RoutingModel implements ModelClient {
+  readonly provider = "scripted";
+  readonly model = "scripted-test";
+  readonly requests: ModelRequest[] = [];
+  readonly #route: (request: ModelRequest, index: number) => ScriptStep;
+
+  constructor(route: (request: ModelRequest, index: number) => ScriptStep) {
+    this.#route = route;
+  }
+
+  /** 主对话请求。 */
+  mainRequests(): ModelRequest[] {
+    return this.requests.filter((request) => request.cache !== "none");
+  }
+
+  /** 摘要请求。 */
+  summaryRequests(): ModelRequest[] {
+    return this.requests.filter((request) => request.cache === "none");
+  }
+
+  stream(request: ModelRequest): AssistantMessageEventStream {
+    const index = this.requests.length;
+    this.requests.push(request);
+    return streamFromStep(this.#route(request, index), request);
+  }
+}
+
+/** 一步脚本 → 一条流（脚本化模型的共用机器）。 */
+function streamFromStep(step: ScriptStep, request: ModelRequest): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+  // 异步推：真实的模型不会在同一个 tick 里把整条流吐完，测试也不该假设这一点。
+  void Promise.resolve()
+    .then(() => step(stream, request))
+    .catch((error: unknown) => {
+      const message: AssistantMessage = {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: error instanceof Error ? error.message : String(error),
+        usage: emptyUsage(),
+      };
+      stream.push({ type: "error", reason: "error", error: message });
+    });
+  return stream;
 }
 
 function splitChunks(text: string): string[] {

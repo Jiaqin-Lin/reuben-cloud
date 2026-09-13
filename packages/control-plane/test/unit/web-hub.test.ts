@@ -5,30 +5,49 @@
  * （`EventSource` 自带 `Last-Event-ID`，服务端必须按它补发）：
  *  - id 单调递增、订阅者拿到实时事件
  *  - `afterId` 只补发之后的；落在淘汰区时先给一条 `gap` 说明
- *  - 文本增量按窗口合并，且**不越过**下一条非文本事件（顺序不能乱）
+ *  - **`message_update` 的文字增量**按窗口合并，且**不越过**下一条非文本事件（顺序不能乱）
  *  - 条数 / 字节两条上限都淘汰最老的
  *  - 单个订阅者积压过多时丢最老的并说明，不拖慢 emit
  *  - run 的淘汰只动已结束的（正在跑的 run 不淘汰）
+ *
+ * 【P4 之后缓冲里混着两族事件】Run 生命周期（`run_start` / `run_end`）与循环的原生
+ * `AgentEvent` 存在同一条流里——这正是"只有一套事件"的落地（见 `events.ts` 的文件头）。
  */
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { RunEvent } from "../../src/agent/events.ts";
+import type { AgentEvent, AssistantMessage } from "@reuben-cloud/agent-runtime";
+import { emptyUsage } from "@reuben-cloud/agent-runtime";
+import type { HubEvent, RunEvent } from "../../src/agent/events.ts";
 import { RunHub } from "../../src/web/hub.ts";
-import type { RunEventRecord, Subscription } from "../../src/web/hub.ts";
+import type { HubEventRecord, Subscription } from "../../src/web/hub.ts";
 
-function text(delta: string): RunEvent {
-  return { type: "text", delta };
+/** 一条文本增量（`message_update` + `text_delta`，循环里唯一的高频事件）。 */
+function text(delta: string): AgentEvent {
+  const partial: AssistantMessage = { role: "assistant", content: [{ type: "text", text: delta }], usage: emptyUsage() };
+  return {
+    type: "message_update",
+    message: partial,
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta, partial },
+  };
 }
 
-function note(message: string): RunEvent {
-  return { type: "note", turn: 1, kind: "test", message };
+/** 从一条 `message_update` 里取它合并后的文本（断言用）。 */
+function textOf(event: HubEvent | undefined): string | null {
+  if (event === undefined || event.type !== "message_update") return null;
+  const stream = event.assistantMessageEvent;
+  return stream.type === "text_delta" ? stream.delta : null;
 }
 
-function runStart(model = "test-model", issue = "修一个 bug"): RunEvent {
+function note(message: string): AgentEvent {
+  return { type: "note", kind: "test", message };
+}
+
+function runStart(model = "test-model", issue = "修一个 bug", sessionId: string | null = null): RunEvent {
   return {
     type: "run_start",
     runId: "run_1",
+    sessionId,
     model,
     issue,
     repoDir: "/workspace/repo",
@@ -49,8 +68,8 @@ function runEnd(stopReason = "end_turn", ok = true): RunEvent {
 }
 
 /** 把一个订阅者当下能拿到的都收集起来（用于"补发"这类同步可判定的情形）。 */
-async function drain(subscription: Subscription, count: number): Promise<RunEventRecord[]> {
-  const records: RunEventRecord[] = [];
+async function drain(subscription: Subscription, count: number): Promise<HubEventRecord[]> {
+  const records: HubEventRecord[] = [];
   for (let index = 0; index < count; index += 1) {
     const next = await subscription.next();
     if (next.done === true) break;
@@ -75,7 +94,7 @@ describe("Phase 13 · hub 的基本行为", () => {
     );
     assert.deepEqual(
       records.map((record) => record.event.type),
-      ["run_start", "text", "note"],
+      ["run_start", "message_update", "note"],
     );
   });
 
@@ -94,18 +113,20 @@ describe("Phase 13 · hub 的基本行为", () => {
     assert.equal(hub.info("run_missing"), null);
   });
 
-  test("info 从事件里补元信息：run_start 填模型/题面，run_end 填终态", () => {
+  test("info 从事件里补元信息：run_start 填模型/题面/会话，run_end 填终态", () => {
     const hub = new RunHub();
     const sink = hub.ensure("run_1");
     const before = hub.info("run_1")!;
     assert.equal(before.model, null);
+    assert.equal(before.sessionId, null);
     assert.equal(before.status, "running");
     assert.equal(before.endedAt, null);
 
-    sink.emit(runStart("deepseek-flash", "把测试修好"));
+    sink.emit(runStart("deepseek-flash", "把测试修好", "ses_1"));
     const during = hub.info("run_1")!;
     assert.equal(during.model, "deepseek-flash");
     assert.equal(during.issue, "把测试修好");
+    assert.equal(during.sessionId, "ses_1");
 
     sink.emit(runEnd("max_turns", false));
     const after = hub.info("run_1")!;
@@ -221,7 +242,7 @@ describe("Phase 13 · 重放（Last-Event-ID）", () => {
   });
 });
 
-describe("Phase 13 · 文本增量合并", () => {
+describe("Phase 13 · 文本增量合并（`message_update` + `text_delta`）", () => {
   test("coalesceMs=0 时不合并（逐条发）", async () => {
     const hub = new RunHub({ textCoalesceMs: 0 });
     const sink = hub.ensure("run_1");
@@ -229,12 +250,12 @@ describe("Phase 13 · 文本增量合并", () => {
     sink.emit(text("好"));
     const records = await drain(hub.subscribe("run_1")!, 2);
     assert.deepEqual(
-      records.map((record) => (record.event.type === "text" ? record.event.delta : null)),
+      records.map((record) => textOf(record.event)),
       ["你", "好"],
     );
   });
 
-  test("攒到窗口结束合成一条（flush 之后）", async () => {
+  test("攒到窗口结束合成一条（flush 之后），且仍然是一条 `message_update`", async () => {
     const hub = new RunHub({ textCoalesceMs: 60_000 });
     const sink = hub.ensure("run_1");
     sink.emit(text("你"));
@@ -242,17 +263,17 @@ describe("Phase 13 · 文本增量合并", () => {
     assert.equal(hub.info("run_1")?.lastEventId, 0, "还没到窗口，不该发出去");
     hub.flush();
     const records = await drain(hub.subscribe("run_1")!, 1);
-    assert.equal(records[0]?.event.type === "text" ? records[0].event.delta : null, "你好");
+    assert.equal(textOf(records[0]?.event), "你好");
   });
 
-  test("非文本事件**先把文本放出去**，顺序不乱（`tool_call` 不能跑到它前面）", async () => {
+  test("非文本事件**先把文本放出去**，顺序不乱（`tool_execution_start` 不能跑到它前面）", async () => {
     const hub = new RunHub({ textCoalesceMs: 60_000 });
     const sink = hub.ensure("run_1");
     sink.emit(text("我先说的"));
-    sink.emit(note("然后才是这一条"));
+    sink.emit({ type: "tool_execution_start", toolCallId: "tu_1", toolName: "bash", args: {} });
     const records = await drain(hub.subscribe("run_1")!, 2);
-    assert.equal(records[0]?.event.type, "text");
-    assert.equal(records[1]?.event.type, "note");
+    assert.equal(records[0]?.event.type, "message_update");
+    assert.equal(records[1]?.event.type, "tool_execution_start");
   });
 
   test("定时器到点自己会发（不用外部推动）", async () => {
@@ -261,7 +282,23 @@ describe("Phase 13 · 文本增量合并", () => {
     const subscription = hub.subscribe("run_1")!;
     sink.emit(text("稍后见"));
     const next = await subscription.next();
-    assert.equal(next.value?.event.type, "text");
+    assert.equal(next.value?.event.type, "message_update");
+  });
+
+  test("Run 生命周期与循环事件在同一条缓冲里（P4：只有一套事件）", async () => {
+    const hub = new RunHub({ textCoalesceMs: 0 });
+    const sink = hub.ensure("run_1");
+    sink.emit(runStart());
+    sink.emit({ type: "agent_start" });
+    sink.emit({ type: "turn_start" });
+    sink.emit(text("做点事"));
+    sink.emit({ type: "note", kind: "model_error", message: "模型挂了" });
+    sink.emit(runEnd());
+    const records = await drain(hub.subscribe("run_1")!, 6);
+    assert.deepEqual(
+      records.map((record) => record.event.type),
+      ["run_start", "agent_start", "turn_start", "message_update", "note", "run_end"],
+    );
   });
 });
 

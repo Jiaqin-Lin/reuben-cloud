@@ -10,7 +10,9 @@
  *
  * 【循环不管预算】轮数 / 墙钟 / 输出 token 都在 `shouldStopAfterTurn` 钩子里
  * （`limits.ts` 给默认策略）。压缩挂在 `prepareNextTurn`，上下文编译挂在
- * `transformContext`。循环本身只有"这一轮做什么、下一轮还要不要跑"。
+ * `transformContext`，模型请求失败后的恢复挂在 `recoverFromModelError`（P3 的溢出恢复）。
+ * 循环本身只有"这一轮做什么、下一轮还要不要跑"——它不认识"什么样算是超窗"，
+ * 那是 provider 的知识（各家的报错文案不一样），判断在 `compaction/index.ts`。
  *
  * 【四条必须守住的性质（每条对应一个测试）】
  *  ① 一次响应里的多个工具调用：结果按**源码顺序**放在同一条（协议层）消息里回来；
@@ -43,6 +45,7 @@ import type {
   Content,
   LlmMessage,
   LlmToolDefinition,
+  ModelFailureRecoveryContext,
   PrepareNextTurnContext,
   ToolCallContent,
   ToolResultMessage,
@@ -164,6 +167,17 @@ async function runLoop(
   let lastCompletedTurn: PrepareNextTurnContext | undefined;
   // 起手先取一次插话：用户可能在上一轮还没开始时就已经说了话。
   let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) ?? [];
+  /**
+   * 这一轮里已经做过几次溢出恢复。**跑完一轮就清零**：它兜的是"压缩了还是超窗"这种
+   * 原地打转——第一次失败给一次机会，恢复之后紧接着又失败就不再试了（spec P3 §4
+   * 的"只重试一次"）；但同一个 Run 的后面的轮次真的再次超窗时，仍然可以再恢复。
+   */
+  let recoveries = 0;
+  /**
+   * 下一个 `turn_start` 之前跳过 `prepareNextTurn`：溢出恢复已经做过一次准备
+   * （压缩后的上下文就是它给的），再跑一遍只会让"压缩完还超阈值"的上下文被立刻压第二次。
+   */
+  let preparedByRecovery = false;
 
   for (;;) {
     let hasMoreToolCalls = true;
@@ -171,8 +185,19 @@ async function runLoop(
     // 内层：工具调用 + 插话。
     while (hasMoreToolCalls || pendingMessages.length > 0) {
       if (lastCompletedTurn) {
-        const update = await config.prepareNextTurn?.(lastCompletedTurn);
-        if (update) {
+        const prepared: PrepareNextTurnContext =
+          signal === undefined ? lastCompletedTurn : { ...lastCompletedTurn, signal };
+        const update = preparedByRecovery ? undefined : await config.prepareNextTurn?.(prepared);
+        preparedByRecovery = false;
+        if (update !== undefined) {
+          if (update.compaction !== undefined) await emit({ type: "compaction", ...update.compaction });
+          if (update.stop !== undefined) {
+            // 准备方决定不再继续（P3 的 compaction_failed）：如实播一条 note 再收工。
+            // note 的 kind 就是停止原因——宿主（CP）按它给 Run 一个终态。
+            await emit({ type: "note", kind: update.stop.reason, message: update.stop.detail });
+            await emit({ type: "agent_end", messages: newMessages });
+            return;
+          }
           currentContext = update.context ?? currentContext;
           config = applyTurnUpdate(config, update);
         }
@@ -197,12 +222,50 @@ async function runLoop(
       const message = await streamAssistantResponse(currentContext, config, signal, emit);
       newMessages.push(message);
 
+      // 模型报了错：先问一次"能不能恢复"（P3 的上下文超窗就是这一类）。
+      // 恢复成功 → 把这一轮**当作新的一轮重试**：循环顶部会重新发 `turn_start`（轮次号前进，
+      // 失败的那次如实留在 entries / model_requests 里），但**跳过 `prepareNextTurn`**
+      // ——恢复钩子已经给过一份压缩后的上下文，再准备一遍会把它立刻压第二次。
+      if (message.stopReason === "error" && config.recoverFromModelError !== undefined && recoveries === 0) {
+        // 退掉这次失败的尝试（没有任何产出）：钩子拿到的必须是"还能重试"的形状
+        // ——末条是 user / toolResult，而不是一条半截的 assistant。
+        if (currentContext.messages[currentContext.messages.length - 1] === message) currentContext.messages.pop();
+        const recovery = await config.recoverFromModelError({
+          message,
+          context: currentContext,
+          newMessages,
+          attempt: recoveries,
+          ...(signal === undefined ? {} : { signal }),
+        } satisfies ModelFailureRecoveryContext);
+        if (recovery !== undefined) {
+          if (recovery.compaction !== undefined) await emit({ type: "compaction", ...recovery.compaction });
+          if (recovery.stop !== undefined) {
+            await emit({ type: "note", kind: recovery.stop.reason, message: recovery.stop.detail });
+            await emit({ type: "agent_end", messages: newMessages });
+            return;
+          }
+          if (recovery.context !== undefined) currentContext = recovery.context;
+          config = applyTurnUpdate(config, recovery);
+          recoveries += 1;
+          preparedByRecovery = true;
+          await emit({ type: "turn_end", message, toolResults: [] });
+          lastCompletedTurn = { message, toolResults: [], context: currentContext, newMessages };
+          // 重试要接着跑（哪怕这一轮本来没有工具调用）：把内层的循环条件掰回 true。
+          hasMoreToolCalls = true;
+          continue;
+        }
+        // 恢复不了：把失败的那条放回去，按原样收尾（上下文与事件保持一致）。
+        currentContext.messages.push(message);
+      }
+
       // 模型请求失败 / 被取消 / 拒绝：如实收工（不再跑工具，也不问 follow-up）。
       if (message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "refusal") {
         await emit({ type: "turn_end", message, toolResults: [] });
         await emit({ type: "agent_end", messages: newMessages });
         return;
       }
+      // 这一轮正常跑完：溢出恢复的计数清零（下一轮真的又超窗时可以再恢复一次）。
+      recoveries = 0;
 
       const toolCalls = message.content.filter(isToolCall);
       const toolResults: ToolResultMessage[] = [];

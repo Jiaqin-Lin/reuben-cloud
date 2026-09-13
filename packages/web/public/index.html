@@ -39,6 +39,10 @@
       </div>
     </header>
 
+    <!-- 上下文面板（P4 新增的唯一 UI 区块）：收到 `context_compiled` 之前一直 hidden，
+         所以没有编译产物的老 Run 页面上不会多出一块空白。内容全部由 app.js 用 textContent 写。 -->
+    <section class="panel" id="context" aria-label="上下文分区" hidden></section>
+
     <!-- 事件流渲染在这里。aria-live 刻意不加：一次 Run 有上千条增量，
          逐条播报对屏幕阅读器是噪音而不是帮助（状态行本身是 role="status"）。 -->
     <main class="page" id="log"></main>

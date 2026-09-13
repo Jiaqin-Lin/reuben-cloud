@@ -25,22 +25,23 @@
  * 四个 Operations 代理——只说话的一句从头到尾不会碰沙箱（spec 测试要点 10）。
  */
 
-import type { AgentTool, ModelClient, SessionStore } from "@reuben-cloud/agent-runtime";
+import type { AgentTool, CompactionSettings, ModelClient, SessionStore } from "@reuben-cloud/agent-runtime";
 import {
   buildContextEntries,
   buildSystemPrompt,
   initialMessages,
   REPO_DIR,
 } from "@reuben-cloud/agent-runtime";
-import type { AgentMessage, LlmMessage } from "@reuben-cloud/agent-runtime";
+import type { AgentMessage, LlmMessage, ModelFailureRecoveryContext, PrepareNextTurnContext } from "@reuben-cloud/agent-runtime";
 import type { RunOutcome, SessionRunStartInput } from "../agent/session-runtime.ts";
-import type { RunEventSink } from "../agent/events.ts";
+import type { HubEventSink } from "../agent/events.ts";
 import type { Transcript } from "../agent/transcript.ts";
 import { Transcript as TranscriptFile } from "../agent/transcript.ts";
 import { runAgentLoop } from "../agent/run.ts";
 import type { LogFn } from "../log.ts";
 import { noopLog } from "../log.ts";
 import { EntryRecorder } from "./entry-recorder.ts";
+import { createSessionCompaction } from "./compaction.ts";
 import type { RequestRecorder } from "./requests.ts";
 import type { ProvisionedSandbox, SandboxLease } from "./sandbox-lease.ts";
 
@@ -55,7 +56,12 @@ export interface SessionTurnRunnerOptions {
   tools: (acquire: () => Promise<ProvisionedSandbox>) => AgentTool[];
   /** 每个 Run 一个 transcript。缺省写 `/tmp/reuben-cloud-cp/<runId>/transcript.jsonl`。 */
   transcript?: (runId: string) => Promise<Transcript>;
-  events?: RunEventSink;
+  /**
+   * 实时事件出口（观察窗）。会话层自己不往里面塞事件：循环的事件由 `run.ts` 转发，
+   * 这里只在"循环之外的失败"（建库 / clone / 编排自己崩）时补一条 `run_error`
+   * ——否则页面会一直停在"等第一个事件"（Phase 13 的失败模式）。
+   */
+  events?: HubEventSink;
   requests?: RequestRecorder | null;
   /** 沙箱里的仓库根。缺省 `REPO_DIR`（与工具层、提示词同一个常量）。 */
   repoDir?: string;
@@ -65,6 +71,11 @@ export interface SessionTurnRunnerOptions {
   wallClockMs?: number;
   outputTokenBudget?: number;
   maxTokens?: number;
+  /**
+   * 压缩（P3）。缺省 = 按 env 配好（开关默认 on）。
+   * `false` = 这个会话不压缩（测试与企业内网离线部署的退路）。
+   */
+  compaction?: false | { settings?: Partial<CompactionSettings>; forceAtTurn?: number | null };
   log?: LogFn;
 }
 
@@ -130,6 +141,22 @@ async function runSessionTurn(options: SessionTurnRunnerOptions, input: SessionR
 
   const system = options.system ?? buildSystemPrompt({ sandbox: { repoDir } });
 
+  // 压缩（P3）：挂在循环的两个钩子上。条目走 recorder——leaf 链在它手里。
+  const compactionOptions = options.compaction === false ? null : (options.compaction ?? {});
+  const compaction =
+    compactionOptions === null
+      ? null
+      : createSessionCompaction({
+          store,
+          sessionId,
+          runId,
+          model,
+          appendCompaction: (input) => recorder.appendCompaction(input.payload, input.usage),
+          ...(compactionOptions.settings === undefined ? {} : { settings: compactionOptions.settings }),
+          ...(compactionOptions.forceAtTurn === undefined ? {} : { forceAtTurn: compactionOptions.forceAtTurn }),
+          log,
+        });
+
   try {
     const result = await runAgentLoop({
       model,
@@ -144,7 +171,14 @@ async function runSessionTurn(options: SessionTurnRunnerOptions, input: SessionR
       ...(options.wallClockMs === undefined ? {} : { wallClockMs: options.wallClockMs }),
       ...(options.outputTokenBudget === undefined ? {} : { outputTokenBudget: options.outputTokenBudget }),
       ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
+      ...(compaction === null
+        ? {}
+        : {
+            prepareNextTurn: (turn: PrepareNextTurnContext) => compaction.prepareNextTurn(turn),
+            recoverFromModelError: (turn: ModelFailureRecoveryContext) => compaction.recoverFromModelError(turn),
+          }),
       signal: input.signal,
+      sessionId,
       onAgentEvent: (event) => recorder.onAgentEvent(event),
       onRequest: async (info) => {
         await store.touchSession(sessionId);
@@ -197,6 +231,8 @@ async function runSessionTurn(options: SessionTurnRunnerOptions, input: SessionR
         sandboxId: await lease.currentSandboxId(sessionId).catch(() => null),
       })
       .catch(() => undefined);
+    // 观察窗也要看到（这是"循环之外的失败"，run.ts 的 run_end 永远不会发）。
+    options.events?.emit({ type: "run_error", message: error instanceof Error ? error.message : String(error) });
     throw error;
   }
 }
@@ -209,12 +245,16 @@ async function runSessionTurn(options: SessionTurnRunnerOptions, input: SessionR
  * 【为什么不是 `ok ? stopped : failed`】"撞上轮数上限"（`max_turns`）与"模型往返失败"
  * （`model_error`）是两件事：前者是一次正常但未完成的收工（产物照样可取），
  * 后者是基础设施问题。M3 的调度器与看板按这个区分处理。
+ *
+ * 【`compaction_failed` 为什么算 failed】它不是"我们主动停下"，而是"上下文已经到了
+ * 压不动的状态"——重跑同样的输入还会失败，必须有人改环境（换模型 / 调预算 / 拆任务）。
  */
 export function runStatusFor(stopReason: string): "stopped" | "failed" {
   switch (stopReason) {
     case "model_error":
     case "aborted":
     case "run_error":
+    case "compaction_failed":
       return "failed";
     default:
       return "stopped";

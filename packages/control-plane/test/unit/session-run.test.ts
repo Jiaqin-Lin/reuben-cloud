@@ -18,6 +18,7 @@ import {
   MemorySessionStore,
   buildContextEntries,
   createAssistantMessageEventStream,
+  entryForMessage,
 } from "@reuben-cloud/agent-runtime";
 import type {
   AgentMessage,
@@ -27,12 +28,15 @@ import type {
   ModelRequest,
 } from "@reuben-cloud/agent-runtime";
 import { SessionBusyError, SessionRuntime } from "../../src/agent/session-runtime.ts";
+import type { HubEvent, HubEventSink } from "../../src/agent/events.ts";
 import { Transcript } from "../../src/agent/transcript.ts";
 import { createLazySandboxToolkit } from "../../src/agent/sandbox-operations.ts";
 import type { ExecPort, SandboxFilesPort } from "../../src/agent/sandbox-operations.ts";
 import type { FlushRequest, FlushResult, ProvisionedSandbox } from "../../src/session/sandbox-lease.ts";
 import { SandboxLease } from "../../src/session/sandbox-lease.ts";
 import { createSessionTurnRunner } from "../../src/session/session-run.ts";
+import { RunHub } from "../../src/web/hub.ts";
+import { startWebServer } from "../../src/web/server.ts";
 import { REPO_DIR } from "@reuben-cloud/agent-runtime";
 
 // ---------------------------------------------------------------- 脚本化模型
@@ -41,15 +45,25 @@ function textMessage(text: string, stopReason: AssistantMessage["stopReason"] = 
   return { role: "assistant", content: [{ type: "text", text }], stopReason, usage: { inputTokens: 100, outputTokens: 10, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } };
 }
 
-function toolCallMessage(id: string, name: string, args: Record<string, unknown>): AssistantMessage {
+function toolCallMessage(
+  id: string,
+  name: string,
+  args: Record<string, unknown>,
+  usage: AssistantMessage["usage"] = { inputTokens: 100, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+): AssistantMessage {
   const content: Content[] = [
     { type: "text", text: "先看一下" },
     { type: "toolCall", id, name, arguments: args },
   ];
-  return { role: "assistant", content, stopReason: "toolUse", usage: { inputTokens: 100, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } };
+  return { role: "assistant", content, stopReason: "toolUse", usage };
 }
 
-/** 一个按脚本出牌的模型：每次 `stream()` 取下一步。脚本用完就一直重复最后一步。 */
+/**
+ * 一个按脚本出牌的模型：每次 `stream()` 取下一步。脚本用完就一直重复最后一步。
+ *
+ * 【摘要请求不消耗主脚本】P3 的压缩请求靠 `cache: "none"` 认出来（它是唯一不写缓存的调用），
+ * 直接回一条固定摘要——否则"第几步答什么"会被中间插进来的摘要请求整体错位。
+ */
 function scriptedModel(steps: AssistantMessage[]): ModelClient & { requests: ModelRequest[] } {
   const requests: ModelRequest[] = [];
   let index = 0;
@@ -59,8 +73,9 @@ function scriptedModel(steps: AssistantMessage[]): ModelClient & { requests: Mod
     requests,
     stream(request: ModelRequest) {
       requests.push(request);
-      const message = steps[Math.min(index, steps.length - 1)]!;
-      index += 1;
+      const summary = request.cache === "none";
+      const message = summary ? textMessage("（脚本化的摘要）") : steps[Math.min(index, steps.length - 1)]!;
+      if (!summary) index += 1;
       const stream = createAssistantMessageEventStream();
       queueMicrotask(() => {
         stream.push({ type: "start", partial: message });
@@ -79,7 +94,7 @@ function scriptedModel(steps: AssistantMessage[]): ModelClient & { requests: Mod
 
 // ---------------------------------------------------------------- 脚手架
 
-async function createHarness(steps: AssistantMessage[]) {
+async function createHarness(steps: AssistantMessage[], options: { events?: HubEventSink } = {}) {
   const store = new MemorySessionStore();
   const dir = await mkdtemp(path.join(os.tmpdir(), "rc-session-"));
   const model = scriptedModel(steps);
@@ -126,6 +141,8 @@ async function createHarness(steps: AssistantMessage[]) {
     model,
     tools: () => toolkit.tools,
     transcript: (runId) => Transcript.create({ runId, path: path.join(dir, `${runId}.jsonl`) }),
+    // P4：观察窗出口（会话路径也要能把事件交给 hub）。
+    ...(options.events === undefined ? {} : { events: options.events }),
   });
 
   const runtime = new SessionRuntime({ start: runner, newRunId: (() => { let n = 0; return () => `run_${++n}`; })() });
@@ -158,6 +175,76 @@ async function createHarness(steps: AssistantMessage[]) {
 // ---------------------------------------------------------------- 用例
 
 describe("Phase 2 · 会话执行编排", () => {
+  test("观察窗（P4）：run_start 带 sessionId，循环事件按原样到达", async () => {
+    const events: HubEvent[] = [];
+    const sink: HubEventSink = { emit: (event) => void events.push(event) };
+    const harness = await createHarness([textMessage("好的")], { events: sink });
+    const sessionId = await harness.newSession();
+    const handle = await harness.runtime.handleUserMessage(sessionId, "你好");
+    await handle.result;
+
+    // 会话视图靠 `run_start.sessionId` 找到这个会话的 entries（因此它必须真的有值）。
+    const start = events.find((event) => event.type === "run_start");
+    assert.equal(start?.type === "run_start" ? start.sessionId : null, sessionId);
+    assert.equal(start?.type === "run_start" ? start.runId : null, handle.runId);
+    // 循环的原生事件真的到了同一个出口（P4 起不再需要翻译层）。
+    assert.ok(events.some((event) => event.type === "agent_start"));
+    assert.ok(events.some((event) => event.type === "turn_start"));
+    assert.ok(events.some((event) => event.type === "message_end" && event.message.role === "assistant"));
+    assert.ok(events.some((event) => event.type === "run_end"));
+  });
+
+  test("观察窗（P4）：会话跑完一轮之后，会话视图与本次执行切片都能从 HTTP 读到", async () => {
+    // 这一条把"产品路径"（会话编排 → 事件 → hub）与"观察窗的两个读接口"接起来验：
+    // 单测已经分别盖住了两段，但"会话视图真的能看到这一轮"只有连起来才算证到。
+    const hub = new RunHub({ textCoalesceMs: 0 });
+    // 会话运行时生成的第一个 run id 就是 `run_1`（harness 的计数器从 1 起）。
+    const harness = await createHarness([textMessage("好的")], { events: hub.ensure("run_1") });
+    const sessionId = await harness.newSession();
+    const handle = await harness.runtime.handleUserMessage(sessionId, "你好");
+    await handle.result;
+    assert.equal(handle.runId, "run_1");
+
+    const server = await startWebServer({ hub, store: harness.store, port: 0, log: () => undefined });
+    try {
+      // 页面靠 `/info.sessionId` 找到会话视图（没有它就只能显示实时流）。
+      const info = (await (await fetch(`${server.url}/runs/${handle.runId}/info`)).json()) as {
+        sessionId: string | null;
+        status: string;
+      };
+      assert.equal(info.sessionId, sessionId);
+      assert.equal(info.status, "ended");
+
+      const view = (await (await fetch(`${server.url}/sessions/${sessionId}/entries`)).json()) as {
+        runs: Array<{ id: string; startEntryId: string | null; endEntryId: string | null; stopReason: string | null }>;
+        entries: Array<{ id: string; runId: string | null; seq: number; payload: { role?: string } }>;
+      };
+      assert.equal(view.runs.length, 1);
+      assert.equal(view.runs[0]!.id, handle.runId);
+      // 第一轮没有上一条 leaf，所以 startEntryId 是 null；结束时停在 assistant 那条上。
+      assert.equal(view.runs[0]!.startEntryId, null);
+      assert.equal(view.runs[0]!.endEntryId, view.entries.at(-1)!.id);
+      assert.equal(view.runs[0]!.stopReason, "end_turn");
+      assert.deepEqual(
+        view.entries.map((entry) => entry.payload.role),
+        ["user", "assistant"],
+      );
+      assert.ok(view.entries.every((entry) => entry.runId === handle.runId));
+
+      const transcript = (await (await fetch(`${server.url}/runs/${handle.runId}/transcript`)).json()) as {
+        run: { id: string; sessionId: string };
+        entries: Array<{ id: string }>;
+      };
+      assert.equal(transcript.run.sessionId, sessionId);
+      assert.deepEqual(
+        transcript.entries.map((entry) => entry.id),
+        view.entries.map((entry) => entry.id),
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
   test("9/首轮：用户这句话进 entries，回答与用量一起落库，leaf 接上", async () => {
     const harness = await createHarness([textMessage("这段代码在做鉴权")]);
     const sessionId = await harness.newSession();
@@ -319,6 +406,76 @@ describe("Phase 2 · 会话执行编排", () => {
     const third = await runtime.handleUserMessage(sessionId, "第三句");
     release!();
     await third.result;
+  });
+
+  test("19（P3）. 压缩在会话路径上生效：摘要条目落库、账本有 compaction 行、Run 正常收工", async () => {
+    // usage 报"上下文 127.5k"（超过保守窗口 128k - 预留 1k），且历史真的有体积（有东西可压）。
+    const harness = await createHarness([
+      toolCallMessage("call_1", "bash", { command: "echo hi" }, {
+        inputTokens: 127_500,
+        outputTokens: 20,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      }),
+      textMessage("收工"),
+    ]);
+    const sessionId = await harness.newSession();
+    for (let index = 0; index < 6; index += 1) {
+      await harness.store.appendEntry(sessionId, "run_seed", entryForMessage({ role: "user", content: `第 ${index} 轮：${"问".repeat(4000)}` }));
+      await harness.store.appendEntry(
+        sessionId,
+        "run_seed",
+        entryForMessage({ role: "assistant", content: [{ type: "text", text: `答：${"答".repeat(4000)}` }], stopReason: "stop" }),
+      );
+    }
+
+    const tool = {
+      name: "bash",
+      label: "bash",
+      description: "跑命令",
+      parameters: { type: "object", properties: {}, additionalProperties: true } as never,
+      executionMode: "sequential" as const,
+      async execute() {
+        return { content: [{ type: "text" as const, text: "hi\n" }], details: { exitCode: 0 } };
+      },
+    };
+    const runner = createSessionTurnRunner({
+      store: harness.store,
+      lease: new SandboxLease({
+        store: harness.store,
+        sandboxes: { async get() { return null; }, async destroy() {} },
+        provision: async () => ({ sandboxId: "sbx_1", endpoint: "http://x", authToken: "t" }),
+        flush: async () => ({ changed: false, headCommit: null, headRef: null }),
+        image: () => "img",
+      }),
+      model: harness.model,
+      tools: () => [tool],
+      transcript: (runId) => Transcript.create({ runId, path: path.join(os.tmpdir(), `rc-${runId}.jsonl`) }),
+      compaction: { settings: { reserveTokens: 1000, keepRecentTokens: 100 } },
+    });
+    const outcome = await runner({
+      runId: "run_p3",
+      sessionId,
+      text: "跑一下 echo",
+      steering: { push() {}, drain: () => [], get size() { return 0; } },
+      signal: new AbortController().signal,
+    });
+
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.stopReason, "end_turn");
+    const entries = await harness.store.listEntries(sessionId);
+    const compactionEntries = entries.filter((entry) => entry.type === "compaction");
+    assert.equal(compactionEntries.length, 1);
+    const payload = compactionEntries[0]!.payload as { firstKeptEntryId: string; tokensBefore: number };
+    assert.ok(payload.tokensBefore > 127_000, `tokensBefore=${payload.tokensBefore}`);
+    assert.ok(entries.some((entry) => entry.id === payload.firstKeptEntryId), "firstKeptEntryId 指向真实 entry");
+    // 账本里有 compaction 行，且挂在这一次 Run 上。
+    const ledger = harness.store.usageRows().filter((row) => row.kind === "compaction");
+    assert.equal(ledger.length, 1);
+    assert.equal(ledger[0]!.runId, "run_p3");
+    // 摘要请求不写 prompt cache。
+    const summaryRequest = harness.model.requests.find((request) => request.cache === "none");
+    assert.ok(summaryRequest !== undefined);
   });
 
   test("停止原因是模型失败时 run 记 failed（不是 stopped）", async () => {

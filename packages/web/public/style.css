@@ -220,6 +220,78 @@ body {
   height: 1px;
 }
 
+/* ---------------------------------------------------------------- 上下文面板（P4） */
+
+/* 面板与正文同宽（继承 `.page` 的居中容器），一行一个分区。只在收到 `context_compiled`
+   之后显示（`[hidden]` 由 app.js 控制），所以它不影响没有编译产物的老 Run。 */
+.panel {
+  max-width: 880px;
+  margin: 16px auto 0;
+  padding: 12px 20px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.panel__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.panel__title {
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+}
+
+.panel__stat {
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.panel__flag {
+  padding: 1px 8px;
+  border-radius: var(--radius);
+  background: var(--sunken);
+  color: var(--accent-text);
+  font-size: 11px;
+}
+
+.panel__sections {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ctx-section {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) 1fr 1fr 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.ctx-section__name {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.ctx-section__tokens,
+.ctx-section__pct,
+.ctx-section__hash {
+  color: var(--ink-muted);
+  text-align: right;
+}
+
 .card {
   padding: 16px 18px;
   border: 1px solid var(--line);
@@ -330,6 +402,47 @@ body {
   line-height: 1.7;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* 用户消息（题面之后的插话 / 会话视图里的历史）。与助手文字同字号、不同颜色，
+   靠左侧一道强调色细线区分：读 transcript 的人最常问的是"这句是谁说的"。 */
+.say--user {
+  padding-left: 12px;
+  border-left: 2px solid var(--accent);
+  color: var(--ink-muted);
+}
+
+.say__who {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--accent-text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+}
+
+/* 压缩分隔线：上下文"换了一段"的视觉标记（P3 的压缩在页面上只有这一处痕迹）。 */
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 20px 0;
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.divider__label {
+  color: var(--accent-text);
 }
 
 .note {
