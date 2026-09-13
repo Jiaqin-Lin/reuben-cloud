@@ -608,7 +608,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 - [x] 沙箱镜像：多语言运行时 + git + 非 root 用户
 - [x] `LocalDockerProvider`：加固参数 + internal 网络 + named volume（`packages/control-plane/src/provider/`，集成测试 `npm run test:integration`；macOS 上多一个端口转发容器，见 spec Phase 5 实现备注 2）
 - [x] egress-proxy：全局常驻，静态白名单只开依赖源，**不含 github.com**（`deploy/egress-proxy/` + `packages/control-plane/src/provider/egress-proxy.ts`；起停：`npm run proxy:up|down|status`，集成测试 `npm run test:integration`；从沙箱里 `curl https://github.com` 确实 403）
-- [x] CP 持久层：三张表 + 状态机（唯一写入口）+ 审计轨迹 + 启动对账 + TTL 清扫（`packages/control-plane/src/db/`、`manager/`、`client/`；本地：`npm run db:up` → `DATABASE_URL=… npm run db:migrate`；集成测试 `npm run test:integration`，含真容器丢失/孤儿容器/kill -9 三条对账场景，见 spec Phase 8）
+- [x] CP 持久层：三张表 + 状态机（唯一写入口）+ 审计轨迹 + 启动对账 + TTL 清扫（`packages/control-plane/src/db/`、`manager/`、`client/`；本地：`npm run dev:up` 起依赖容器（Postgres + MinIO，见 §8）→ `DATABASE_URL=… npm run db:migrate`；集成测试 `npm run test:integration`，含真容器丢失/孤儿容器/kill -9 三条对账场景，见 spec Phase 8）
 - [x] CP 侧仓库进出：clone → tar → 灌入沙箱；diff → apply → push（**凭据只在 CP**）（`packages/control-plane/src/repo/`；clone/push 走 `-c http.extraHeader`，token 不进 URL、不进沙箱；patch 应用后重算 sha256 与沙箱那份逐字节比对，失败回退 archive；push 用显式 `--force-with-lease=<ref>:<sha>` 做 CAS；集成测试 `npm run test:integration` 用一个本地 smart-HTTP git 服务器证明 token 真的被用过、且哪里都没落盘，见 spec Phase 9）
 - [x] `GET /diff` + `GET /archive`（沙箱侧 Phase 3/7）+ 落对象存储（CP 侧 Phase 10）：销毁前把 diff / `workspace-<sandboxId>.tar.gz` / 被截断的执行日志流式传进 S3/MinIO（边传边算 sha256，不预知 content-length）；失败重试 3 次 → `ERROR(archive_failed)` → 10 分钟宽限后强制销毁（有界）。配置：`S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`（一个都不给 = 不启用）；集成测试 `npm run test:integration` 用一次性 MinIO 容器，含真容器端到端那一条，见 spec Phase 10
 - [x] 冒烟脚本 + 隔离红线 CI：`packages/e2e/` + `.github/workflows/smoke.yml`（含一个反向验证 job：拿掉 CapDrop 之后红线必须变红；**只在 Linux 上算数**）
@@ -693,3 +693,46 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 6. **一切可回放**：模型看到了什么，必须能事后原样重现
 7. **进化必须可回滚**：没有评估集的自进化是随机游走
 8. **不做编排框架**：保持每一步可见，比抽象的图更有价值
+
+---
+
+## 8. 本地开发环境（Docker）
+
+依赖容器只需要两条命令：
+
+```bash
+npm run dev:up        # 起 postgres + minio（等 healthcheck 都过、桶也建好才返回）
+npm run db:migrate    # 建表（幂等，随时可以重跑）
+```
+
+`npm run dev:down` 删掉容器与网络。dev 数据**不保留**（没有 volume）——`db:migrate` 重跑只要几秒，而"每次从零开始"是最可预测的状态；想停下但保留数据用 `docker compose stop`。
+
+### 本地会出现的容器，谁起的、干嘛的
+
+| 容器 | 谁起的 | 干嘛用的 | 怎么停 |
+|---|---|---|---|
+| `reuben-cloud-dev-db` | `npm run dev:up`（`compose.yaml` 的 `db`） | 开发用 Postgres：状态机 / 审计 / 对账全在这里（127.0.0.1:55432） | `npm run dev:down` |
+| `reuben-cloud-dev-minio` | 同上（`minio`） | 开发用对象存储：Phase 10 起归档的落点；控制台 <http://127.0.0.1:9001> | `npm run dev:down` |
+| `reuben-cloud-proxy` | `npm run proxy:up`（**不在 compose 里**） | 沙箱出网代理：白名单只开依赖源，github.com 不可达 | `npm run proxy:down` |
+| `reuben-cloud-sbx-*` / `reuben-cloud-ws-*` | 集成测试 / 冒烟脚本 | 每个用例的临时沙箱容器与 workspace 卷 | 用例自己清；残留由 `npm run smoke` 启动时清 |
+
+> 建桶（`minio-init`）是一次性服务：`dev:up` 用 `docker compose run --rm` 在前台跑完就删，不会留下常驻容器。
+
+**为什么 egress-proxy 不在 compose 里**：它不是依赖，是**产品的一部分**——必须挂在 `reuben-cloud-internal` 内网、带固定的加固参数与标签（spec Phase 6），而 `EgressProxy.ensureRunning()` 会把"配置不一致"的同名容器直接重建掉。放进 compose 就是两套生命周期管理器互相踩；它的入口就是 `npm run proxy:up | proxy:status | proxy:down`。
+
+### 连接串与归档用的 env
+
+```bash
+export DATABASE_URL=$(npm run --silent db:url)   # postgres://postgres:x@127.0.0.1:55432/reuben_cloud
+
+# Phase 10 起：归档落对象存储。四个都不给 = 不启用（裸跑/单测就是这个形态）；
+# 只给一半会在启动时报 config_missing（不让它到"第一次上传"才炸）。
+export S3_ENDPOINT=http://127.0.0.1:9000
+export S3_BUCKET=reuben-cloud
+export S3_ACCESS_KEY_ID=reuben-cloud
+export S3_SECRET_ACCESS_KEY=reuben-cloud-dev
+```
+
+所有变量都有合理缺省（不配也能跑）：`REUBEN_CLOUD_DB_IMAGE / _NAME / _PORT / _PASSWORD`、`REUBEN_CLOUD_MINIO_IMAGE / _PORT / _CONSOLE_PORT / _USER / _PASSWORD / _BUCKET`、`REUBEN_CLOUD_MC_IMAGE`。
+
+**集成测试不用 compose**：它们故意每个文件起自己的一次性容器 + 随机宿主端口（`node --test` 默认并行跑文件，钉死端口就是必然的碰撞）。

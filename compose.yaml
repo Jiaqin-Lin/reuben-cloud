@@ -1,0 +1,102 @@
+# 本地开发的依赖容器（Postgres + MinIO）。
+#
+# 【它管什么、不管什么】
+#  管：跑 CP 需要的**外部依赖**——一个 Postgres（状态机 / 审计 / 对账全在它里面）
+#      和一个 MinIO（Phase 10 之后，沙箱的产出归档要落对象存储）。
+#  不管：egress-proxy。它不是"依赖"，是**产品的一部分**（沙箱出网必须经过它），
+#      生命周期归 `provider/egress-proxy.ts` 的 `EgressProxy` 管——它必须挂在
+#      `reuben-cloud-internal` 内网上、带固定的加固参数与标签，而 `ensureRunning()`
+#      会把"配置不一致"的同名容器直接重建掉。放进 compose 就是两套生命周期管理器
+#      互相踩；它的入口是 `npm run proxy:up | proxy:status | proxy:down`。
+#      看 README §8 的那张"本地会出现的容器"表。
+#
+# 【为什么集成测试不用它】测试**故意**每个文件起自己的一次性容器 + 随机宿主端口：
+#  `node --test` 默认并行跑文件，钉死端口就是必然的碰撞（见 test/support.ts 里
+#  startPostgres / startMinio 的注释）。这份 compose 只服务"人在本地开发"这一条路径。
+#
+# 【为什么没有 volume】沿用原来的 scripts/dev-db.sh 的取舍：dev 数据丢了就丢了，
+#  `npm run db:migrate` 重跑一次只要几秒，而 `down` 之后从零开始是最可预测的状态。
+#  想要"停下但保留"，用 `docker compose stop`；想清空重来，用 `npm run dev:down`。
+#
+# 常用命令（都包成了 npm script，见 package.json）：
+#   npm run dev:up      # 起 db + minio（等 healthcheck 都过了）+ 建好桶才返回
+#   npm run dev:ps      # 看状态
+#   npm run dev:logs    # 跟日志
+#   npm run dev:down    # 删掉容器与网络（数据一起没）
+#
+# 所有变量都有缺省，不需要为了本地开发配任何东西：
+#   REUBEN_CLOUD_DB_IMAGE / _NAME / _PORT / _PASSWORD
+#   REUBEN_CLOUD_MINIO_IMAGE / _PORT / _CONSOLE_PORT / _USER / _PASSWORD / _BUCKET
+
+name: reuben-cloud-dev
+
+services:
+  db:
+    image: ${REUBEN_CLOUD_DB_IMAGE:-postgres:16-alpine}
+    container_name: ${REUBEN_CLOUD_DB_NAME:-reuben-cloud-dev-db}
+    environment:
+      # dev 用的口令，不是凭据（容器只发布到 127.0.0.1）。
+      POSTGRES_PASSWORD: ${REUBEN_CLOUD_DB_PASSWORD:-x}
+      POSTGRES_DB: reuben_cloud
+    ports:
+      - "127.0.0.1:${REUBEN_CLOUD_DB_PORT:-55432}:5432"
+    # healthcheck 让 `docker compose up --wait` 真的等到"能执行查询"。
+    # 只等端口通是不够的：初始化那几秒里连接会被拒（这就是原来 dev-db.sh 里
+    # wait_ready 那段循环的替代品）。
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d reuben_cloud"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  minio:
+    image: ${REUBEN_CLOUD_MINIO_IMAGE:-minio/minio:latest}
+    container_name: ${REUBEN_CLOUD_MINIO_NAME:-reuben-cloud-dev-minio}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      # MinIO 要求 secret 至少 8 个字符；同样是 dev 值，不是凭据。
+      MINIO_ROOT_USER: ${REUBEN_CLOUD_MINIO_USER:-reuben-cloud}
+      MINIO_ROOT_PASSWORD: ${REUBEN_CLOUD_MINIO_PASSWORD:-reuben-cloud-dev}
+    ports:
+      - "127.0.0.1:${REUBEN_CLOUD_MINIO_PORT:-9000}:9000"          # S3 API
+      - "127.0.0.1:${REUBEN_CLOUD_MINIO_CONSOLE_PORT:-9001}:9001" # 控制台（排障用）
+    healthcheck:
+      # MinIO 镜像里自带 curl（实测），用官方健康端点而不是"端口通了"。
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # 一次性服务：建好桶就退出。
+  #
+  # **它不是 `up` 的一部分**：`docker compose up -d --wait` 会把"退出了 0"的容器
+  # 当成失败（compose 的已知行为），所以 `npm run dev:up` 分两步——先
+  # `up -d --wait db minio`，再 `compose run --rm minio-init` 在前台等它建完桶。
+  # 直接 `docker compose up -d` 也会在后台跑它一次，只是不等结果。
+  #
+  # 【为什么要它】`S3ArtifactStore` 只负责往桶里写，**不建桶**——那是运维的事
+  # （真实部署里 bucket 是提前开好的，生命周期策略/SSE 都在 bucket 上配）。
+  # 本地这一下让 `S3_BUCKET` 开箱即用，省掉"第一个归档报 NoSuchBucket"的绕路。
+  #
+  # 【为什么用 mc 而不是我们自己的 SDK】它是官方客户端、一次性的、不碰产品代码；
+  # 让脚本或产品代码去建桶会在"谁负责桶"这件事上多一个出处。
+  minio-init:
+    image: ${REUBEN_CLOUD_MC_IMAGE:-minio/mc:latest}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    # `$$` 是 compose 的转义：它把 `$` 原样交给容器里的 shell。
+    command:
+      - |
+        set -e
+        mc alias set dev "http://minio:9000" "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null
+        mc mb --ignore-existing "dev/$$REUBEN_CLOUD_MINIO_BUCKET" >/dev/null
+        echo "✔ MinIO 桶 $$REUBEN_CLOUD_MINIO_BUCKET 已就绪（http://127.0.0.1:$$REUBEN_CLOUD_MINIO_PORT）"
+    environment:
+      REUBEN_CLOUD_MINIO_BUCKET: ${REUBEN_CLOUD_MINIO_BUCKET:-reuben-cloud}
+      REUBEN_CLOUD_MINIO_PORT: ${REUBEN_CLOUD_MINIO_PORT:-9000}
+      MINIO_ROOT_USER: ${REUBEN_CLOUD_MINIO_USER:-reuben-cloud}
+      MINIO_ROOT_PASSWORD: ${REUBEN_CLOUD_MINIO_PASSWORD:-reuben-cloud-dev}

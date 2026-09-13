@@ -61,6 +61,7 @@
 ```
 reuben-cloud/
 ├─ tsconfig.json                # 根：include packages/*/{src,test}/**/*.ts，让 `npx tsc --noEmit` 在仓库根可用
+├─ compose.yaml                 # 本地开发依赖容器（postgres + minio；Phase 10 之后加的，见 README §8）
 ├─ packages/
 │  ├─ sandbox-agent/            # 容器内执行层（Phase 1–3）
 │  │  ├─ src/
@@ -100,7 +101,7 @@ reuben-cloud/
 │  └─ test/*.smoke.ts           # 按标签分组的用例：isolation / network / exec / files / flow
 ├─ images/sandbox/Dockerfile
 ├─ deploy/egress-proxy/{Dockerfile,allowlist.txt,src/{proxy,allowlist}.ts}   # allowlist.ts 的理由见 Phase 6 实现备注 1
-├─ scripts/{sandbox-image-check.ts,egress-proxy.ts,migrate.ts,dev-db.sh}
+├─ scripts/{sandbox-image-check.ts,egress-proxy.ts,migrate.ts}
 └─ docs/
 ```
 
@@ -1576,7 +1577,9 @@ CP 起来时跑一次，全部动作走 `transition()`：
    provider / manager / sweeper / migrate 都要能注入日志，各写一份类型就是四处改。
    `ulid.ts` 是 CP 自己的 ULID：**不做 `packages/shared`**（§0.4），所以这 40 行
    在两层各有一份，契约测试（`test/unit/ulid.test.ts`）只盯"前缀 + 时间序"。
-   `dev-db.sh` 让「本地起一个一次性 Postgres」变成 `npm run db:up`（§0.5 的落地）。
+   `dev-db.sh` 让「本地起一个一次性 Postgres」变成 `npm run db:up`（§0.5 的落地；
+   Phase 10 之后这条路径并进 `compose.yaml` 的 `db` 服务，脚本已删——`npm run db:up`
+   仍然能用，只是背后换成了 compose）。
 2. **状态机多了一道"边"的检查**（`002_transition.sql`）。§3 只写了"校验旧状态在 `from` 里"，
    但用例 2 要求 `READY→CREATING`、`DESTROYED→BUSY` 被拒——只查 `from` 时前者会成功
    （调用方说"我以为它是 READY"，而它确实是 READY）。所以 SQL 函数里加了第二道检查：
