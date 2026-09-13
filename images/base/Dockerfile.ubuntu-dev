@@ -1,0 +1,25 @@
+# reuben-cloud Layer 1 · ubuntu-dev（spec Phase 5 §5）。
+#
+# 兜底镜像：仓库信号什么都没认出来时用它（空仓库、只有 shell 脚本的仓库、
+# 我们不认识的语言）。spec 测试要点 5「空仓库 → 退化成 ubuntu-dev，不崩」这一条
+# 指向的就是这个文件——它是"推断失败"那条路径的落点，必须永远能建出来。
+#
+# 【为什么叫 ubuntu-dev 却是 Debian】名字来自设计文档 §C.2 的矩阵（沿用 devcontainer
+# 生态的叫法），内容是我们矩阵里最接近"什么都没有"的那一档。为了让名字与内容不互相
+# 欺骗，这里补一句：它是 debian bookworm + git/curl + build-essential，不是 Ubuntu。
+# 改名要动文档、测试与 fixtures 三处，收益只有四个字，所以保持名字、把差异写在这里。
+#
+# 【为什么连它也必须含 node】sandbox-agent 是 Node 程序（common 的注释里写了）；
+# 「最小」指的是语言工具链最小，不是运行时契约最小。
+ARG BASE_IMAGE=reuben-cloud/base-common:dev
+FROM ${BASE_IMAGE}
+
+USER root
+
+# pkg-config 与 build-essential 一起：C 扩展的构建（node-gyp / cffi / cargo 的 -sys crate）
+# 第一句失败几乎都是"找不到 pkg-config"或"找不到头文件"。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+USER 1000:1000

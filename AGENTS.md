@@ -27,8 +27,9 @@ packages/sandbox-agent/   沙箱内的执行服务（文件 API / exec / diff / 
 packages/web/             观察窗前端（零构建的原生 ESM：public/app.js + index.html + style.css）
 packages/e2e/             冒烟与隔离红线（npm run smoke，CI 里跑）
 deploy/                   egress-proxy（白名单出网）与部署相关
-images/sandbox/Dockerfile    沙箱镜像（P5 会把 Layer 1 基础镜像矩阵加在 `images/base/`）
-scripts/                  CLI 入口：agent-run / migrate / sandbox-image-check / egress-proxy / github-app
+images/sandbox/Dockerfile    默认沙箱镜像（P5 起只有 `FROM base-fullstack` + 两个 LABEL）
+images/base/             Layer 1 基础镜像矩阵（P5 建：Dockerfile.{common,node-dev,python-dev,go-dev,rust-dev,fullstack,ubuntu-dev}）
+scripts/                  CLI 入口：agent-run / migrate / build-images / sandbox-image-check / egress-proxy / github-app
 docs/                     设计文档 + 实施规格（见上）
 vendor/                   tree-sitter 的 .wasm（P8 才建：固定版本 + sha256）
 ```

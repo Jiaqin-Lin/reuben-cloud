@@ -1,0 +1,23 @@
+# reuben-cloud Layer 1 · fullstack（spec Phase 5 §5）。
+#
+# 面向：同时要 Node 与 Python 的仓库（也是**默认沙箱镜像** `sandbox-base:dev` 的底座，
+# 见 images/sandbox/Dockerfile）。设计文档 §C.2 的清单在这里是"node + python +
+# postgres-client + redis-tools"。
+#
+# 【为什么可以从 python-dev 叠】node 在 common 里已经有了（sandbox-agent 需要它），
+# 于是 fullstack = python-dev + 两个客户端工具。这不是省事，是让「fullstack 是什么」
+# 只由一条父子关系定义：多一层继承比多复制一段 apt 列表更不容易漂。
+#
+# 【为什么装客户端而不是服务端】沙箱起 Postgres/Redis 服务端需要在容器里跑第二个进程
+# （M0 的边界写得很清楚：沙箱跑的是"一次命令"，不是 compose）。装 psql / redis-cli 是为
+# 了两件事：排查（连得上吗）与"连不上"这件事能被结构化地说出来（P7 的 degraded 判据）。
+ARG BASE_IMAGE=reuben-cloud/base-python-dev:dev
+FROM ${BASE_IMAGE}
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      postgresql-client redis-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+USER 1000:1000

@@ -12,6 +12,10 @@
  * --tmpfs /tmp / --user 1000:1000 / --init）——镜像只有在**那组约束下**能跑才算数，
  * 否则「/ 不可写」在非 root 下会白送通过，检查就变成了自欺。
  *
+ * 【M2 Phase 5 起检查的是哪一层的产出】默认沙箱镜像是 `images/sandbox/Dockerfile`——
+ * 一层只有 FROM 的薄封装；真正的内容在 Layer 1 矩阵（`images/base/`）里。所以构建走
+ * `scripts/build-images.ts`（同一条链、同一个 tag），缓存断言看的是 common 那段输出。
+ *
  * 用法：
  *   node scripts/sandbox-image-check.ts                 # 构建镜像 + 全部检查
  *   node scripts/sandbox-image-check.ts --skip-build    # 用本地已有镜像（CI 里已构建过时）
@@ -24,9 +28,12 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { SseClient, TERMINAL_EVENTS, runCommand } from "../packages/sandbox-agent/test/harness.ts";
+import { sandboxImageRef } from "../packages/control-plane/src/environment/base-images.ts";
+import { buildImages } from "./build-images.ts";
+import type { BuildOutcome, ImageName } from "./build-images.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const IMAGE = process.env.SANDBOX_IMAGE ?? "reuben-cloud/sandbox-base:dev";
+const IMAGE = sandboxImageRef();
 const skipBuild = process.argv.includes("--skip-build");
 const keep = process.argv.includes("--keep");
 
@@ -75,38 +82,28 @@ function delay(ms: number): Promise<void> {
   });
 }
 
-/** 一次构建的产出：完整输出 + 镜像 config digest。 */
-interface BuildOutcome {
-  output: string;
-  /**
-   * `#10 exporting config sha256:…` 里的那个 digest。
-   *
-   * 为什么不用 `docker image inspect .Id` 判"两次构建是不是同一个镜像"：containerd
-   * 镜像存储下 `.Id` 是 **manifest list** 的 digest，而 BuildKit 每构建一次就重写一次
-   * 带时间戳的 attestation manifest，于是它必然每次都变（实测如此）。config digest
-   * 覆盖的才是真正的镜像内容，全缓存命中时它逐字节不变。
-   */
-  configDigest: string | null;
+/**
+ * 一次“建链”的产出：终点（sandbox-base）+ 中间那个最贵的 common。
+ *
+ * 【为什么要把 common 也带回来】P5 把大 Dockerfile 拆成了 Layer 1 矩阵，apt 那一层
+ * 现在在 `Dockerfile.common` 里——缓存断言必须看**那个**构建的输出，看 sandbox-base
+ * 的输出只会看到一行 `FROM`。
+ */
+interface BuildRun {
+  sandbox: BuildOutcome;
+  common: BuildOutcome;
 }
 
-/** 构建镜像。缓存检查要靠输出里的 CACHED 与 exporting config。 */
-async function buildImage(): Promise<BuildOutcome> {
-  const result = await run([
-    "docker",
-    "build",
-    "--progress=plain",
-    "-f",
-    "images/sandbox/Dockerfile",
-    "-t",
-    IMAGE,
-    ".",
-  ]);
-  const output = `${result.stdout}\n${result.stderr}`;
-  if (result.code !== 0) {
-    throw new Error(`docker build 失败（exit ${result.code}）：\n${tail(output, 40)}`);
-  }
-  const digest = /exporting config (sha256:[0-9a-f]+)/.exec(output)?.[1] ?? null;
-  return { output, configDigest: digest };
+/** 构建默认沙箱镜像（会自动先建 common / fullstack）。缓存检查要看 common 那段输出。 */
+async function buildImage(): Promise<BuildRun> {
+  // `--progress=plain`：缓存断言依赖输出里的 `CACHED` 与 `exporting config`。
+  const outcomes = await buildImages(["sandbox-base"], { progress: "plain" });
+  const pick = (name: ImageName): BuildOutcome => {
+    const found = outcomes.find((item) => item.name === name);
+    if (found === undefined) throw new Error(`构建链里没有 ${name}`);
+    return found;
+  };
+  return { sandbox: pick("sandbox-base"), common: pick("common") };
 }
 
 /** 截取输出的最后 n 行（构建失败时最有用的那一段）。 */
@@ -304,13 +301,13 @@ async function main(): Promise<number> {
 
   // 1) 构建。这是整个脚本的前置条件，失败就直接结束——后面每条检查都依赖它。
   //    留下的 outcome 当"基准构建"，缓存检查拿它的 config digest 跟第二次比。
-  let baseline: BuildOutcome | null = null;
+  let baseline: BuildRun | null = null;
   if (skipBuild) {
     console.log("--skip-build：跳过构建，直接用本地镜像\n");
   } else {
     console.log("构建镜像（首次要装 apt 包，几分钟；之后走层缓存）…");
     baseline = await buildImage();
-    console.log(`构建完成（${baseline.output.split("\n").length} 行输出）\n`);
+    console.log(`构建完成（${baseline.sandbox.output.split("\n").length} 行输出）\n`);
   }
   let started = false;
   let volumeCreated = false;
@@ -357,14 +354,17 @@ async function main(): Promise<number> {
       // 断言的意义不变（第二次必须全部命中缓存）。
       const first = baseline ?? (await buildImage());
       const rebuilt = await buildImage();
-      // `#6` 是那条 RUN apt-get 的步骤号。它 CACHED = 最贵的那层复用了。
-      assert(rebuilt.output.includes("#6 CACHED"), "最贵的 apt 层没有命中缓存（步骤号可能变了）");
-      assert(!/Setting up |Get:\d/.test(rebuilt.output), "apt-get 真的跑了——不是缓存命中");
+      // apt 那一层现在在 common 里（P5 拆矩阵之前它在 sandbox 镜像里）。
+      // 不去钉死步骤号（`#6 CACHED` 那种写法会因为 Dockerfile 多一行注释就失效）：
+      // 真正要证明的是"最贵的那层复用了"，由下面两条一起表达——
+      //   ① 输出里有 CACHED；② 输出里没有 apt 真的在装包的痕迹。
+      assert(rebuilt.common.output.includes("CACHED"), "common 的构建一个步骤都没命中缓存");
+      assert(!/Setting up |Get:\d/.test(rebuilt.common.output), "apt-get 真的跑了——不是缓存命中");
       assert(
-        first.configDigest !== null && rebuilt.configDigest === first.configDigest,
-        `镜像 config digest 变了：${first.configDigest} → ${rebuilt.configDigest}`,
+        first.sandbox.configDigest !== null && rebuilt.sandbox.configDigest === first.sandbox.configDigest,
+        `镜像 config digest 变了：${first.sandbox.configDigest} → ${rebuilt.sandbox.configDigest}`,
       );
-      return `${rebuilt.configDigest.slice(0, 19)}…`;
+      return `${(rebuilt.sandbox.configDigest ?? "").slice(0, 19)}…`;
     });
 
     // 3) 起一个加固过的容器，后面全是运行时检查。

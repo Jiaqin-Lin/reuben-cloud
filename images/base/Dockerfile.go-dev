@@ -1,0 +1,37 @@
+# reuben-cloud Layer 1 · go-dev（spec Phase 5 §5）。
+#
+# 面向：go.mod / go.sum 的仓库。Go 从官方 tarball 装（bookworm 自带的 golang 太老，
+# 而 go.mod 里的 `go 1.x` 是会硬性要求最低版本的那一行）。
+#
+# 【为什么没有 gopls】spec 的矩阵里写了"go + gopls"，但 M2 没有任何一处消费 LSP：
+# 符号索引走 tree-sitter WASM（P8），工具面只有 read/write/edit/grep/find/ls/bash（P11）。
+# 装一个几百 MB、无人调用的语言服务器，只会让这个镜像的构建时间与体积双双变难看。
+# 真接 LSP 的那一天，在这里补一行 `go install golang.org/x/tools/gopls@vX.Y.Z` 即可
+# （见附录 A-25）。
+#
+# 【GOPATH 为什么在 /tmp 下】运行时 /tmp 是 tmpfs（provider 传 mode=1777），换容器就没了——
+# 对"模块缓存"来说可以接受，而且比写进 /workspace 命名卷好：卷里的东西会进 git status 与 diff。
+# 【GOTOOLCHAIN=local】沙箱内没有直接出网（只有白名单代理），若 go.mod 要求的版本比装的新，
+# 默认行为会去下载工具链，然后在网络层失败——报错离原因隔一层。钉 local 之后报错是
+# "go.mod 要 1.x，装的是 y"，行动指向明确。
+
+ARG BASE_IMAGE=reuben-cloud/base-common:dev
+FROM ${BASE_IMAGE}
+
+USER root
+
+ARG GO_VERSION=1.27.1
+# dpkg --print-architecture 给的是 amd64 / arm64，与 go.dev 的下载命名一致——不需要
+# 自己猜 `uname -m`（它在 arm64 上给 aarch64，多一层容易写错的映射）。
+RUN arch="$(dpkg --print-architecture)" \
+    && curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" -o /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+
+ENV GOPATH=/tmp/reuben-cloud/go \
+    GOTOOLCHAIN=local
+ENV PATH=/usr/local/go/bin:/tmp/reuben-cloud/go/bin:$PATH
+
+RUN mkdir -p /tmp/reuben-cloud/go && chown -R 1000:1000 /tmp/reuben-cloud
+
+USER 1000:1000

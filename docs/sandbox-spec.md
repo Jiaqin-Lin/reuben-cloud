@@ -738,7 +738,11 @@ CMD ["node", "/app/src/index.ts"]
 
 **`.dockerignore`**（构建上下文是仓库根）：`**/node_modules`、`.git`、`docs`、`*.md`、`packages/control-plane`。
 
-**构建命令**：`docker build -f images/sandbox/Dockerfile -t <registry>/sandbox-base:dev .`。CI 里构建后记录 `docker images --digests` 的 digest；provider 强制用 digest 引用（Phase 5）。
+**构建命令**：`npm run build:image`（M2 Phase 5 起：先按拓扑序建好 Layer 1 矩阵，再建这层薄封装；单独 `docker build -f images/sandbox/Dockerfile .` 需要本地已有 `base-fullstack`）。CI 里构建后记录镜像的 digest；provider 强制用 digest 引用（Phase 5）。
+
+> **M2 Phase 5 的后续改动**：这个文件从"一个大 Dockerfile"变成了 `FROM reuben-cloud/base-fullstack:dev` + 两个 LABEL——
+> 非语言部分搬去了 `images/base/Dockerfile.common`（含 sandbox-agent、uid 1000 契约与 `CMD`），语言工具链各自一档。
+> 本节描述的列/属主/环境变量契约**一条没变**，只是它们现在定义在 common 里；详见 agent-runtime-spec Phase 5 与附录 A-30。
 
 ### 技术边界
 

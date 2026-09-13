@@ -1,0 +1,36 @@
+# reuben-cloud Layer 1 · rust-dev（spec Phase 5 §5）。
+#
+# 面向：Cargo.toml / Cargo.lock 的仓库。工具链用 rustup 装，版本钉在 ARG 里。
+#
+# 【为什么工具链装到 /usr/local 而不是 $HOME/.cargo】运行时的 HOME 是 /tmp/agent，而 /tmp
+# 是 tmpfs（provider 传 mode=1777）——把工具链放进 HOME 等于"换一次容器就没了"，
+# 表现为下次 `cargo build` 突然找不到 cargo。RUSTUP_HOME / CARGO_HOME 必须显式指到
+# 镜像里的固定路径，这是 rust 官方镜像的同一套做法。
+# 同理，`--no-modify-path` 关掉 rustup 往 shell rc 里写 PATH 的行为：那些 rc 文件在
+# HOME 里（tmpfs），写了也留不住；PATH 由 Dockerfile 的 ENV 负责。
+#
+# 【为什么 --profile minimal】默认 profile 带 rust-docs（几百 MB），而沙箱里没有任何人读
+# 本地文档（真要查文档走 docs.rs）。minimal 只留 rustc / cargo / rust-std。
+#
+# 【为什么给 CARGO_HOME 改属主】uid 1000 要往 CARGO_HOME 写 registry 缓存与 .cargo/config；
+# 不改属主的话第一次 `cargo build` 会以 "Permission denied" 失败，而报错指向的是 /usr/local，
+# 与"你自己的代码有问题"隔得很远。
+
+ARG BASE_IMAGE=reuben-cloud/base-common:dev
+FROM ${BASE_IMAGE}
+
+USER root
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo
+
+ARG RUST_VERSION=1.98.1
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${RUST_VERSION}" --no-modify-path \
+    && rm /tmp/rustup-init.sh
+
+ENV PATH=/usr/local/cargo/bin:$PATH
+
+RUN chown -R 1000:1000 /usr/local/cargo /usr/local/rustup
+
+USER 1000:1000

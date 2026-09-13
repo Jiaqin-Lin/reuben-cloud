@@ -1,0 +1,19 @@
+# fixture 的 compose：服务依赖的信号来源。
+#
+# 【为什么它重要】设计文档 §C.3 把"服务依赖"列为 degraded 的判据：这里声明了 postgres 与
+# redis，而沙箱里起不了服务（M2 不跑 compose）——推断必须把这件事说出来，
+# 否则 agent 会反复去跑集成测试然后失败（§C.6 的原话）。
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: fixture
+    ports:
+      - "5432:5432"
+  cache:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:

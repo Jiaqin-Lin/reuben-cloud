@@ -1,0 +1,36 @@
+# reuben-cloud Layer 1 · node-dev（spec Phase 5 §5）。
+#
+# 面向：`package.json` + 锁文件的 JS/TS 仓库。node 本身来自 common（sandbox-agent 就是
+# Node 程序），这里只补包管理器——所以这个镜像与 common 的差距只有几十 MB。
+#
+# 【pnpm 为什么钉 10.x 而不是 latest（12）】锁文件是仓库的事实：pnpm 9/10 写的
+# `lockfileVersion: '9.0'` 是最常见的一档，而 10.x 读得动它、也读得动更老的 v6。
+# 追 latest 的收益是"我们自己的镜像新"，代价是"某个仓库的锁文件读不动了"——
+# 环境镜像的第一职责是能跑起来，不是最新。要升级时在 ARG 里改一个数字，顺便跑一遍 P7。
+#
+# 【谁提供 yarn】node:24-bookworm-slim 自带 yarn 1.22.x（`/opt/yarn-v1.22.22` +
+# `/usr/local/bin/yarn{,pkg}`）。**不要再 `npm i -g yarn`**：那会以
+# `EEXIST: file already exists, /usr/local/bin/yarnpkg` 失败（实测，Phase 5 第一次构建）。
+# 需要升级 yarn 时要么删掉自带的 shim 再装、要么换个基础镜像，不要在两个来源之间摇摆。
+#
+# 【为什么删掉 corepack】它会去下载包管理器（沙箱没有出网），而且 node 25 起已经把它从
+# 发行版里拿掉了——把"能不能装依赖"押在一个正在退场的组件上不划算。
+# 也不装全局 typescript / tsx：那属于仓库自己的 devDependencies，全局版本只会与仓库打架。
+
+ARG BASE_IMAGE=reuben-cloud/base-common:dev
+FROM ${BASE_IMAGE}
+
+# 装包必须回到 root；片段末尾再切回 1000:1000——继承来的 USER 契约不能被语言镜像悄悄改掉
+# （provider 运行时还会再传一次 `--user 1000:1000`，但 `docker run <image> id -u` 这类排查
+# 会直接看到 root，那是最容易被误读成"镜像不安全"的一种形态）。
+USER root
+
+ARG PNPM_VERSION=10.34.5
+# `HOME=/root` 只对这一条 RUN 生效：common 把 HOME 设成 /tmp/agent（运行时的 HOME），
+# 而构建期的 npm 会把缓存写进 `$HOME/.npm`——那里是给 uid 1000 的运行时目录，
+# 不该在构建期被 root 的缓存占住。装完顺手把 /root/.npm 删掉，别让缓存进镜像层。
+RUN rm -f /usr/local/bin/corepack \
+    && HOME=/root npm install --global --no-fund --no-audit "pnpm@${PNPM_VERSION}" \
+    && rm -rf /root/.npm
+
+USER 1000:1000

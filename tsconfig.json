@@ -1,4 +1,5 @@
 {
   "extends": "./tsconfig.base.json",
-  "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts", "deploy/*/src/**/*.ts", "scripts/**/*.ts"]
+  "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts", "deploy/*/src/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["packages/control-plane/test/fixtures/**"]
 }

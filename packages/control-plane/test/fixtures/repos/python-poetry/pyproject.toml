@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "python-poetry"
+version = "0.1.0"
+description = "P5 的 fixture：pyproject.toml + poetry.lock + 自己的 Dockerfile（应当命中 L2 → python-dev）"
+authors = ["fixture <fixture@example.com>"]
+# 这是个应用而不是要发布的库：poetry 不需要它可安装（也让 health check 不必 -e .）。
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+requests = "^2.32.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -685,7 +685,7 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 - [x] P4 事件统一（`AgentEvent` 成为唯一事件协议：CP 的 `RunEvent` 只剩 `run_start` / `run_end` / `run_error` 三个生命周期事件，沙箱命令输出独立成 `ExecEvent` 一小族；SSE 帧带 `event:` 通道名——通道映射只有 `events.ts` 一张 `sseFrameOf` 表（`switch` + `never` 兜底），前端按通道注册监听（`SSE_CHANNELS` 与后端清单逐条比对）；观察窗默认渲染**会话视图**（新增 `GET /sessions/{id}/entries` 与 `GET /runs/{id}/transcript`，都读 `session_entries`，用 `runs.startEntryId` 标每一轮边界），实时部分仍走内存环形缓冲；新增**上下文面板**（分区 token / 占比 / `compiled_hash` 前 8 位 / 压缩标记，数据留给 P10）与压缩分隔线；`web/` 26 条单测覆盖 M0 的 19 条用例 + 面板 / 会话视图 / 未知事件）
 
 **第二部分 · Environment**
-- [ ] P5 环境定义与推断（三层结构；devcontainer 子集 > Dockerfile > 信号）
+- [x] P5 环境定义与推断（**Layer 1 七档镜像矩阵** `images/base/Dockerfile.{common,node-dev,python-dev,go-dev,rust-dev,fullstack,ubuntu-dev}`——非语言部分抽到 `common`（sandbox-agent + git/curl/tar/gzip/procps + uid 1000 契约），语言镜像只加自己的工具链；`images/sandbox/Dockerfile` 只剩 `FROM base-fullstack` + 两个 LABEL，构建入口换成 `npm run build:image` = `scripts/build-images.ts`（按拓扑序建链 + 打印 digest，另有 `build:base-images` 建七档）；CP 侧 `environment/{base-images,signals,devcontainer,infer}.ts` + 最小 `store.ts`——三级判定（**devcontainer 子集** > Dockerfile/compose > 信号）、信号采集（锁文件优先级 / 运行时版本 / 构建入口 / CI / compose 服务 / monorepo，**只读不执行**、**两次采集逐字节相同**）、自带的容错 **JSONC** 解析、**确定性渲染**出完整可构建的 Dockerfile（`checkDockerfileConstraints` 与 P6 共用硬约束，`USER root` 必须切回）；`006_environments.sql`（revision 单调 + `kind`/`level`/`status` 三个 CHECK）；三个 fixture 仓库（`test/fixtures/repos/`）各命中一级，集成测试里**真的 build 成功**且继承 Layer 1 的 `CMD` 与 `1000:1000`）
 - [ ] P6 LLM 生成 Dockerfile + 自愈循环（≤3 轮、错误分类、成本记账）
 - [ ] P7 缓存 + 版本化 + 健康检查（ready / degraded / failed）+ promote
 
@@ -775,6 +775,37 @@ npm run db:migrate    # 建表（幂等，随时可以重跑）
 > 建桶（`minio-init`）是一次性服务：`dev:up` 用 `docker compose run --rm` 在前台跑完就删，不会留下常驻容器。
 
 **为什么 egress-proxy 不在 compose 里**：它不是依赖，是**产品的一部分**——必须挂在 `reuben-cloud-internal` 内网、带固定的加固参数与标签（spec Phase 6），而 `EgressProxy.ensureRunning()` 会把"配置不一致"的同名容器直接重建掉。放进 compose 就是两套生命周期管理器互相踩；它的入口就是 `npm run proxy:up | proxy:status | proxy:down`。
+
+### 基础镜像矩阵（Layer 1，M2 Phase 5 起）
+
+沙箱用的镜像不再是"一个大 Dockerfile"，而是七档基础镜像 + 一层薄封装：
+
+```bash
+npm run build:image          # 默认链：common → python-dev → fullstack → sandbox-base:dev（本地开发与既有测试要的那条）
+npm run build:base-images    # 七档全建（go-dev / rust-dev 慢，按需）
+node scripts/build-images.ts --list                 # 看构建图（谁 FROM 谁）
+node scripts/build-images.ts node-dev --no-cache    # 只建某一档 / 忽略层缓存
+```
+
+| 档 | 多了什么 | 谁在用 |
+|---|---|---|
+| `base-common` | git/curl/tar/gzip/procps + sandbox-agent 源码 + `uid 1000` / `HOME` / 环境变量契约 + `CMD` | 所有语言镜像的父层（也定义了"环境镜像能直接当沙箱用"） |
+| `base-node-dev` | node（来自 common）+ pnpm 10 + yarn（node 镜像自带 1.22.x） | JS/TS 仓库（L3 信号推断的落点） |
+| `base-python-dev` | python3.11 + pip/venv + build-essential + uv | Python 仓库 |
+| `base-go-dev` | Go（官方 tarball，`GOTOOLCHAIN=local`） | Go 仓库 |
+| `base-rust-dev` | rustup/cargo（`minimal` profile，装在 `/usr/local`） | Rust 仓库 |
+| `base-fullstack` | = python-dev + postgresql-client + redis-tools | 同时要 node 与 python 的仓库；**默认沙箱镜像的底座** |
+| `base-ubuntu-dev` | = common + build-essential + pkg-config | 推断不出语言时的兜底 |
+
+业务上"某个仓库的环境"由 P6/P7 从这些档位推导/构建（`reuben-cloud/env-…`），本地开发用的
+`reuben-cloud/sandbox-base:dev` 只是矩阵里 fullstack 那一层薄封装（`SANDBOX_IMAGE` 可覆盖它）。
+
+**环境推断本身怎么验**（不需要 Docker，几秒钟）：
+
+```bash
+node --test packages/control-plane/test/unit/environment-*.test.ts   # 信号采集 / devcontainer 子集 / 三级推断
+npm run test:integration   # 三个 fixture 生成的 Dockerfile 真的 build + environments 表往返（要 Docker + PG）
+```
 
 ### 连接串与归档用的 env
 

@@ -1,0 +1,29 @@
+# reuben-cloud Layer 1 · python-dev（spec Phase 5 §5）。
+#
+# 面向：requirements.txt / pyproject.toml / poetry.lock / uv.lock 的 Python 仓库。
+# 装的是 Debian 12（bookworm）自带的 python3（3.11）+ pip + venv + build-essential。
+#
+# 【为什么不用 python:3.12-slim 当基础】common 里有 sandbox-agent 的 node 运行时，
+# 换基础镜像就得在两个发行版里同时维持 uid 1000 / HOME / 环境变量那套契约。
+# bookworm 的 3.11 覆盖绝大多数目标仓库；真要 3.12 时用自己的语言镜像（P7 的 promote 就是
+# 为这类"这个仓库特殊"准备的），而不是把整个矩阵迁到另一个发行版上。
+#
+# 【为什么 uv 用 pip 装，而不是 `curl … | sh`】P6 给生成的 Dockerfile 定的硬约束 ⑥ 就是
+# 禁止 `curl | sh`；基础镜像自己不该是这个规矩的第一个例外——尤其构建阶段的网络不受
+# egress-proxy 白名单保护（设计文档 §C.7）。pip 走的是同一个 PyPI，可审计、可复现。
+# `--break-system-packages`：Debian 12 的 python3 带 PEP 668 的 EXTERNALLY-MANAGED 标记，
+# 不加这个开关 pip 会直接拒绝安装（这是它该有的行为，所以这里显式承认我们就是要装到系统里）。
+
+ARG BASE_IMAGE=reuben-cloud/base-common:dev
+FROM ${BASE_IMAGE}
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-venv build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG UV_VERSION=0.12.13
+RUN python3 -m pip install --no-cache-dir --break-system-packages "uv==${UV_VERSION}"
+
+USER 1000:1000

@@ -104,7 +104,8 @@ packages/control-plane/src/
 │   ├── postgres.ts
 │   └── requests.ts                      # model_requests 落库（内联 or 对象存储）
 ├── environment/                         # 环境构建（Phase 5-7）
-│   ├── types.ts / signals.ts / devcontainer.ts / infer.ts
+│   ├── base-images.ts / types.ts / signals.ts / devcontainer.ts / infer.ts
+│   ├── store.ts                         # environments 表的读写（P7 的 revision.ts 接着长）
 │   ├── generate.ts                      # LLM 生成 Dockerfile
 │   ├── build.ts                         # docker build 调用 + 日志 + 错误分类
 │   ├── cache.ts / revision.ts / health.ts
@@ -904,6 +905,26 @@ prepareNextTurn（每轮结束、下一轮开始前）：
 - `images/base/Dockerfile.common` + 六个语言镜像（`Dockerfile.{node-dev,python-dev,go-dev,rust-dev,fullstack,ubuntu-dev}`）
 - `images/sandbox/Dockerfile` 改为 `FROM reuben-cloud/base-<x>`（保留一层薄封装）
 - fixture 仓库三个（`test/fixtures/repos/`）
+
+> **实现备注**：P5 落地时有 7 条有意偏差，逐条记在附录 A-24 … A-30——devcontainer 的 `image` 与
+> 仓库 Dockerfile 的 FROM **只当语言信号**，生成的 Dockerfile 的 FROM 永远是 Layer 1（A-24）；
+> environment 目录多 `base-images.ts` 与 `store.ts` 两个文件，`RepoSignals` 多一个 `scripts`、
+> `EnvironmentCandidate` 多一个 `baseImageKind`（A-25）；`go-dev` 不装 gopls（A-26）；"无 root"
+> 实现成"默认非 root + 每个 `USER root` 后面都切回"（A-27）；devcontainer.json 走自带的容错
+> JSONC 解析（A-28）；CI 与 compose 只做**行级扫描**、不引 YAML 库（A-29）；默认沙箱镜像的底座是
+> `fullstack`、构建入口从一条 `docker build` 换成 `scripts/build-images.ts`（A-30）。
+>
+> **验证**：`npm test` 558 项全绿（agent-runtime 124 / control-plane 307 / sandbox-agent 101 /
+> web 26）；`npm run typecheck` 全绿；`node scripts/build-images.ts` 真建出七个镜像（common →
+> python-dev → fullstack → sandbox-base + node-dev + ubuntu-dev，首次约 5 分钟，之后走层缓存）；
+> `npm run test:integration` 的 `environment.integration.test.ts` 把三个 fixture 生成的 Dockerfile
+> **真的 build 成功**，并断言环境镜像继承了 Layer 1 的 `CMD` 与 `1000:1000`；`environments` 表的
+> 真 PG 往返（jsonb / revision 单调 / 三个 CHECK）也在同一个文件里。
+>
+> 本轮**没有做**的两件事，写在这里免得被当成漏了：① 没有 `env:infer` 之类的 CLI——推断这条路径
+> 现在只有测试在跑，运维入口留给 P6/P7（它们才有"构建一个环境"这件事可做）；② `environments`
+> 表没有 `image_digest` / `cache_key` / `parent_revision` / `health*`（spec P7 明确把"剩余字段"
+> 留给了 P7，现在建就只会多一批永远是 NULL 的列）。
 
 ### 具体如何实现
 
@@ -1846,6 +1867,13 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 | A-21 | Phase 4 · 沙箱命令输出的位置 | 映射表里只有一行"（沙箱 exec 事件）→ `exec`"，没说它是哪一族 | 独立的一小族 `ExecEvent`（3 个成员，在 CP 的 `events.ts`），与 Run 生命周期（3 个）并列；三者合成观察窗的 `HubEvent` | 沙箱是另一个进程、另一套词汇（`started` / `stdout` / `completed`，snake_case），而且在循环之外也在用（P7 的健康检查、P6 的构建日志）。塞进 `AgentEvent` 会让"循环事件"这个概念被污染（循环根本不知道这些事件），塞进 `RunEvent` 又违反了"RunEvent 只留生命周期"这条；单独一小族之后，`createSandboxToolkit` 只认 `ExecEventSink`，工具层不认识 Run 生命周期 | `events.ts` 的 `ExecEvent` / `ExecEventSink` / `HubEvent`；`sandbox-operations.ts` 的口；`web-server.test.ts` 的 `exec` 通道用例 |
 | A-22 | Phase 4 · 每个 Run 的 JSONL transcript | "transcript 从 entries 派生"（容易读成"删掉 JSONL 写入"） | 两条都留着：观察窗与 `/runs/{id}/transcript` 读 `session_entries`；`agent/transcript.ts` 继续写每个 Run 的 JSONL | 两者受众不同：JSONL 是**单次执行**的取证文件（`agent:run --export/--keep`、排障脚本、集成测试都在用它），entries 是**会话**的持久形态，每轮真发出去的全文在 `model_requests` 里。删 JSONL 要动 `run.ts` / 脚本 / 三条单测 / 两个 live 脚本，而 P4 要的"观察窗不再依赖内存 JSONL"已经拿到了 | `agent/transcript.ts` 不动；新增的 `web/history.ts` 是另一条读路径；`agent-events.test.ts` 仍断 transcript 的内容（轮次号与三条记录） |
 | A-23 | Phase 4 · 上下文面板的"是否命中压缩" | "显示每个分区的 token 数与占比、`compiled_hash` 前 8 位、是否命中压缩"（没说这个布尔从哪来） | 由流里的 `compaction` 事件点亮（面板上显示"已压缩 / 未压缩"），不新增字段 | P10 的 `context_compiled` 只有分区统计与 `compiled_hash`——"命中压缩"在编译产物里表现为"投影里有一条 `compactionSummary`"，那是投影的属性、不是某个分区的属性；而"这个上下文被压过"在事件流里已经有一条权威记录（P3 的 `compaction`）。等 P10 真需要"这一轮的分区里含多少摘要 token"时再加字段，比现在先编一个字段便宜（加字段不破坏旧客户端，编错了反而误导） | `app.js` 的 `renderCompaction` / `renderContextCompiled`；`web-server.test.ts` 的 `context` / `compaction` 通道用例；`render.test.ts` 的面板用例 |
+| A-24 | Phase 5 · §3/§4（L1 "直接复用"、L2 "复用 + 叠加"） | devcontainer 的 `image` / `build.dockerfile` 直接复用；L2 复用仓库 Dockerfile 再叠加 agent 必需组件 | 生成的 Dockerfile 的 FROM **永远是** Layer 1 的一档（`baseImageRef`）；devcontainer 的 `image` 与仓库 Dockerfile 的 FROM **只当语言信号**（进 `notes`；`image` 另记一条 `ignored`），仓库 Dockerfile 的构建步骤一条都不搬 | ① 硬约束与沙箱契约（sandbox-agent、非 root uid 1000、HOME/环境变量）只有 Layer 1 保证；② 仓库 Dockerfile 常以 `COPY . .` 依赖构建上下文里的仓库内容，而环境构建期仓库还没灌进沙箱（那是创建沙箱时的事）；③ spec 测试要点 7 断言的形态就是"以 Layer 1 镜像为 FROM" | `infer.ts` 的 `pickBaseKind` / `renderEnvDockerfile`；`devcontainer.ts` 给 `image` 记的 ignored；fixture 的期望命中表（`python-poetry` 的 `Dockerfile` 只贡献 `python:3.11-slim` 这个语言信号） |
+| A-25 | Phase 5 · 交付物清单 | `environment/{types,signals,devcontainer,infer}.ts` 四个文件；`RepoSignals` 的字段清单；`EnvironmentCandidate` 的字段清单 | 多 `base-images.ts`（矩阵身份：kind / 引用，被推断、构建脚本、集成测试、P7 共用）与 `store.ts`（插入 / 按 id 取 / 取最新，三个函数）；`RepoSignals` 多一个 `scripts`；`EnvironmentCandidate` 多一个 `baseImageKind` | ① 镜像 tag 必须只有一处定义：构建脚本打的 tag 与生成的 Dockerfile 里 `FROM` 那一行是**同一个事实**，两处各写一份字符串迟早漂；② 验收标准写着"表能存下一份完整候选"，只建表不留写入口的话这条只能靠测试手写 SQL 证明，而 P6/P7 还要再造一次（终态留给 P7 的 `revision.ts`）；③ npm scripts 并进 `makeTargets` 之后，写进 `buildCommands` 的 `build` 到底是 `make build` 还是 `npm run build` 就分不清了；④ P7 的健康检查按语言选命令，从镜像引用反查等于每次解析字符串 | `environment/{base-images,store}.ts`；`types.ts`；`scripts/build-images.ts`；三个 environment 测试文件 |
+| A-26 | Phase 5 · §5 镜像矩阵 | `Dockerfile.go-dev  # FROM common + go + gopls` | 只装 go（官方 tarball，版本钉在 ARG 里），**不装 gopls** | M2 没有任何一处消费 LSP：符号索引走 tree-sitter WASM（P8），工具面是 read/write/edit/grep/find/ls/bash（P11），没有工具会说 LSP。装一个几百 MB、无人调用的语言服务器，只让构建时间与常规镜像体积双双变难看。真接 LSP 时补一行 `go install golang.org/x/tools/gopls@vX.Y.Z` 即可——那时它才有实测需求驱动 | `images/base/Dockerfile.go-dev`（矩阵其余六档一字未改） |
+| A-27 | Phase 5 · 测试要点 7 vs P6 §1 ③ | 测试要点 7"无 CMD/ENTRYPOINT、无 root"；P6 §1 ③"不得出现 `USER root` 之后不切回" | `checkDockerfileConstraints` 按更具体的那句实现："默认用户必须非 root，且每个 `USER root` 后面都要切回非 root"；三个 fixture 的生成结果里**一个 `USER` 都没有**，测试对它们额外断言了这条更强的形态 | devcontainer 的 features（github-cli / git-lfs）只能以 root 装包；把"无 root"读成"永远不许出现 USER root"会让 §3 明确要求支持的 feature 这条路没法实现 | `infer.ts` 的 `checkDockerfileConstraints` / `renderEnvDockerfile`；`environment-infer.test.ts` 的两条用例（三个 fixture 无 USER / github-cli 有 root 但切回） |
+| A-28 | Phase 5 · §3 devcontainer 子集 | 支持字段清单（没提文件格式） | 自带 40 行 JSONC 解析（去行/块注释 + 去尾逗号，扫描时跳过字符串字面量）；解析失败返回 `error`，调用方降级到下一级并记 note | 真实仓库里的 devcontainer.json 是 VS Code 写出来的 JSONC（带注释与尾逗号）——用 `JSON.parse` 会在最常见的一类文件上失败。spec §0.2 的依赖表里没有 JSON5 / jsonc-parser，而这里要做的只有两件事；"读不懂就降级"本来就是测试要点 4 的要求，所以解析器只负责"能读的读懂、读不懂的如实上报" | `devcontainer.ts` 的 `parseJsonc`；fixture 的 `.devcontainer/devcontainer.json` **故意**写成 JSONC |
+| A-29 | Phase 5 · §2 采集清单（CI 配置、compose 的 services） | 从 `.github/workflows/*.yml` 的 `run:` 与 `compose.yaml` 的 services 读环境事实 | 两个 reader 都是**行级扫描**（缩进 + 正则）：CI 只取内联 `run:`（块状 `run: |` 进 `ignored`），compose 只取 `services:` 块里两空格缩进的服务名与 `image:` | 要读的只有两件小事，而且都是启发式——错了顶多少一条信号（`ignored` 里写明"只做了行级扫描"）。spec §0.2 没有 YAML 依赖，为它引一个库要按表格写理由。行级扫描读不到的东西（`depends_on` 关系、YAML 锚点、多文档）对 P5 的产出没有影响：服务名 + "沙箱里起不了它们"这句 degraded 说明已经够 agent 用 | `signals.ts` 的 `readCiHints` / `readServices` / `parseComposeServices`；真需要结构化 YAML 时（例如要判服务版本）再引库 |
+| A-30 | Phase 5 · 交付物（`images/sandbox/Dockerfile` 改为 `FROM reuben-cloud/base-<x>`） | "保留一层薄封装" | 薄封装只剩 FROM + 两个 LABEL，底座选 `base-fullstack`；`npm run build:image` 从一条 `docker build` 改成 `scripts/build-images.ts`（按拓扑序建 common → python-dev → fullstack → sandbox-base 并打印 digest），新增 `npm run build:base-images` 建七档；`scripts/sandbox-image-check.ts` 的缓存断言从"看 sandbox 镜像里的 `#6 CACHED`"改成"看 common 那次构建真的没跑 apt + sandbox 镜像的 config digest 不变" | ① `sandbox-base:dev` 这个 tag 是"本地开发与既有测试的底座"（egress-proxy 的集成测试要 python venv、agent 集成测试要 node、image-check 要 git/tar），矩阵里只有 fullstack 同时满足；② 镜像名是**一个**事实——脚本从 `base-images.ts` 取引用，Dockerfile 的缺省 ARG 只是手工构建时的方便值；③ apt 层随 common 搬走后，旧断言里的步骤号必然失效，而"步骤号"本来就是最脆的断言方式 | `images/sandbox/Dockerfile`、`scripts/build-images.ts`、`scripts/sandbox-image-check.ts`、`package.json`、`docs/sandbox-spec.md` Phase 4 的构建命令、README §8 |
 
 **已经预知的两条偏差**（实施时必须确认并回填）：
 

@@ -1,0 +1,29 @@
+{
+  // fixture 的 devcontainer：作者显式写下的环境定义。
+  //
+  // 【它是 JSONC 而不是 JSON】真实仓库里的 devcontainer.json 几乎都带注释与尾逗号，
+  // 所以这个 fixture 故意两种都有——`devcontainer.test.ts` 用它证明容错解析真的在工作。
+  "name": "monorepo-devcontainer",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:20",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    },
+    // 需要特权容器 → 推断会把它记成 unsupported + degradedRisk（不是静默丢掉）。
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+  },
+  "containerEnv": {
+    "NODE_ENV": "development",
+    "CI": true
+  },
+  "postCreateCommand": "pnpm install",
+  // 下面这些都是"认识但明确忽略"的字段：它们必须出现在 ignored[] 里，带原因。
+  "mounts": ["source=${localWorkspaceFolder}/.pnpm-store,target=/pnpm-store,type=bind"],
+  "forwardPorts": [3000, 5432],
+  "remoteUser": "node",
+  "customizations": {
+    "vscode": {
+      "extensions": ["dbaeumer.vscode-eslint"]
+    }
+  },
+}

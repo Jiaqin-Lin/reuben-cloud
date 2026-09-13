@@ -1,0 +1,14 @@
+{
+  "name": "monorepo-devcontainer",
+  "private": true,
+  "description": "P5 的 fixture：pnpm workspace + devcontainer + compose（应当命中 L1 devcontainer）",
+  "packageManager": "pnpm@10.34.5",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
