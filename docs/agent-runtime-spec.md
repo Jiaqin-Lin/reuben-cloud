@@ -108,6 +108,7 @@ packages/control-plane/src/
 │   ├── store.ts                         # environments 表的读写（P7 的 revision.ts 接着长）
 │   ├── generate.ts                      # LLM 生成 Dockerfile
 │   ├── build.ts                         # docker build 调用 + 日志 + 错误分类
+│   ├── queue.ts                         # 构建队列：并发 1、按 project_key 去重、带 trigger
 │   ├── cache.ts / revision.ts / health.ts
 ├── session/                             # 会话与沙箱租约（Phase 2）
 │   ├── postgres.ts                      # SessionStore 的 PG 实现（pg 只在这里）
@@ -1030,6 +1031,8 @@ hasDockerfile||hasCompose  →  level="dockerfile"（叠加 agent 必需组件�
 
 - `packages/control-plane/src/environment/generate.ts`（prompt + 生成 + 硬约束校验）
 - `packages/control-plane/src/environment/build.ts`（docker build 调用 + 日志采集 + 错误分类）
+- `packages/control-plane/src/environment/queue.ts`（构建队列：并发 1、按 `project_key` 去重，
+  带 `trigger`；触发点与"Run 绝不建环境"的口径见设计文档 §C.8）
 - `packages/control-plane/src/db/migrations/007_env_builds.sql`
 - 假 builder（集成测试用）+ 真 builder（生产路径）两个实现
 
@@ -1094,19 +1097,37 @@ CREATE TABLE env_builds (
   revision     integer NOT NULL,
   attempt      integer NOT NULL,            -- 1..3
   inference    text NOT NULL,               -- devcontainer | dockerfile | signals | llm
+  trigger      text NOT NULL,               -- first_seen | manual | promote（设计文档 §C.8）
   status       text NOT NULL,               -- building | built | failed
   error_class  text,
   dockerfile   text NOT NULL,               -- 每次尝试的实际文本（可复现）
   log_key      text,                        -- 对象存储
   duration_ms  integer,
   image_digest text,
-  created_at   timestamptz NOT NULL DEFAULT now()
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT env_builds_trigger_check CHECK (trigger IN ('first_seen','manual','promote'))
 );
 ```
+
+**6. 队列（`queue.ts`）：入队不等于构建**
+
+触发点只做一件事：把"这个 `project_key` 需要环境"放进队列（设计文档 §C.8）。三件事必须在
+**入队这一层**做完，不能下放到构建里：
+
+- **并发 1**（宿主机 docker daemon 是共享资源）：队列串行执行，不是几个协程抢一个信号量；
+- **去重**：同一个 `project_key` 已有构建在跑 → 复用那一次；已有 `ready` 且 `cache_key` 没变 →
+  直接返回旧 digest（P7 的缓存命中），不产生新的 `env_builds` 行；
+- **失败不阻塞队列**：一个仓库 build 失败只影响它自己，后面排队的照跑（否则一个坏仓库能卡死所有人）。
+
+三个触发来源（`first_seen` / `manual` / `promote`）走的是同一个入队函数，差别只有 `trigger` 字段
+——这也是"触发点只变时机、不变机制"那句落在代码里的样子。
 
 ### 技术边界
 
 - 轮数硬上限 3、单轮超时 10 分钟、构建并发 1（三个约束都是**代码**，不是文档）；
+- **触发点只影响入队**（`first_seen` / `manual` / `promote`），不影响构建流程；队列的并发 1 与
+  去重也是**代码**，不是运维约定（设计文档 §C.8）；
+- `first_seen` 的入队是**异步**的：发起方（会话 / M3 的调度器）不等它，Run 照常跑（P7 §5）；
 - 生成的 Dockerfile 只允许从 Layer 1 出（避免"从零开始"导致 uid/HOME/sandbox-agent 全丢）；
 - **不在构建阶段注入凭据**（构建进程 env 里没有 GitHub token / 模型 key；`--build-arg` 白名单为空）；
 - 不做"构建缓存优化"（M2 用 docker 默认层缓存 + C.5 的镜像级缓存，不做 BuildKit 的高级特性）。
@@ -1123,6 +1144,8 @@ CREATE TABLE env_builds (
 | 6 | 成本记账 | 三轮自愈 → usage_ledger 有 3 行 env_build |
 | 7 | 真 build（集成） | 人为缺依赖的 fixture 仓库 → ≤3 轮成功（真 docker） |
 | 8 | 构建上下文隔离 | 断言临时目录里只有 Dockerfile（没有仓库文件） |
+| 9 | 队列去重 | 同一个 `project_key` 已有构建在跑时再入队 → 复用那一次，不产生第二行 attempt |
+| 10 | 失败不阻塞 | 队列里第一个仓库 build 失败 → 第二个照常被构建 |
 
 ### 验收标准
 
@@ -1142,6 +1165,9 @@ CREATE TABLE env_builds (
 - CLI：`agent:run --env-revision <n>` / `--rebuild-env` / `--promote-env`
 - UI：环境状态与构建日志页（`packages/web/public/env.html` + 一条只读路由）
 - `environments` 表的剩余字段（health / cache_key / parent_revision / image_digest）
+- **触发接线**（设计文档 §C.8）：`--rebuild-env` 与页面上的按钮 → 入队 `trigger: "manual"`；
+  会话创建时首次见到某个 `project_key` → 异步入队 `trigger: "first_seen"`；
+  Run 侧的回退（拿不到 `ready` / `degraded` 就用 Layer 1 镜像 + 一句沙箱事实）
 
 ### 具体如何实现
 
@@ -1192,6 +1218,28 @@ ContextCompiler 把它作为"沙箱事实"写进 system（agent 据此跳过集�
 
 `/env/{projectKey}` 页面：当前 revision、状态徽章、健康细节、历次构建列表（点开看日志）。
 仍然零构建前端；日志走对象存储的只读代理（只允许 `env-logs/` 前缀）。
+页面的"构建/重建"按钮是 `manual` 触发的第二个入口（另一个是 CLI 的 `--rebuild-env`）。
+
+**5. 触发与 Run 侧的回退（设计文档 §C.8）**
+
+三种入队来源（`first_seen` / `manual` / `promote`）走 P6 的同一个队列函数，差别只有 `trigger`：
+
+- `first_seen`：CP 第一次看到某个 `project_key`（会话创建时；M3 的调度器收到 issue 时同理）
+  —— **异步入队，不阻塞**当前这次 Run；
+- `manual`：`--rebuild-env` 与 `/env/{projectKey}` 的按钮；
+- `promote`：会话里验证有效的改动固化回项目级。
+
+Run 侧**只做一次解析**，从不构建：
+
+```
+resolveEnv(projectKey, signals):
+  命中 cache_key 且有 ready|degraded  → 用它的 image_digest（revision 进 runs.env_revision）
+  未命中                              → 用 Layer 1 的语言镜像；把 "项目依赖还没装" 当成
+                                        沙箱事实写进 system（与 degraded 同一条通道）
+                                        + 异步入队 first_seen
+```
+
+这一条让"构建 10 分钟"与"用户第一句话"彻底解耦：用户不等构建，构建也不需要用户。
 
 ### 技术边界
 
@@ -1213,12 +1261,16 @@ ContextCompiler 把它作为"沙箱事实"写进 system（agent 据此跳过集�
 | 7 | degraded 传递 | degraded 环境跑 Run → system 里出现"集成测试不可用"的事实 |
 | 8 | 清理 | 造 12 个 revision + 一个被引用 → 清理后保留 10 个 + 被引用的那个 |
 | 9 | 迁移/幂等 | 重复构建同一 revision 不产生新行 |
+| 10 | 入队去重 | 同一 `project_key` 连发两次 `first_seen` → 只建一次（复用进行中的那次，或缓存命中） |
+| 11 | 环境未就绪也能跑 | 没有 `ready`/`degraded` 的 revision 时起 Run → 用 Layer 1 镜像，system 里有"依赖未装"的事实，Run 正常结束（不报错、不阻塞） |
 
 ### 验收标准
 
 - 同一仓库第二次构建 < 10s（缓存命中）；
 - 健康状态与原因可见（UI + DB）；
-- degraded 环境下的 Run 提示词里含该事实（结构化断言）。
+- degraded 环境下的 Run 提示词里含该事实（结构化断言）；
+- **没有现成环境时 Run 照常结束**（用 Layer 1 镜像 + 一句结构化事实），不等构建、不报错，
+  同时该仓库的构建已在队列里（UI 上看得见进度）。
 
 ---
 

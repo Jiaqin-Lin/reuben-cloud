@@ -274,6 +274,18 @@ Environment 有版本号，可 diff、可回滚。用户手动在会话里装了
 
 **这是"环境自进化"的入口** —— 见 §3.8。
 
+#### 谁发起构建（构建不绑定会话）
+
+环境构建跑在 CP 宿主机上，**与沙箱、会话、对话都无关**：它不需要用户说话，也不需要容器。所以：
+
+- 仓库**第一次被看见**时就后台排队开建（推断 → 命中缓存就用 → 未命中才建 → 体检）；
+  "第二个人秒开"这件事就是靠提前建 + 缓存键拿到的；
+- 操作者随时可以手动重建（CLI `--rebuild-env` / 环境页上的按钮）；
+- **Run 自己从不建环境**：有 `ready`/`degraded` 就用它；没有就先用基础镜像跑，并把"项目依赖还没装"
+  写进上下文告诉 agent——构建失败是合法结果，它不该变成"用户的话没人处理"。
+
+设计细节与三个触发点（`first_seen` / `manual` / `promote`）见 [`docs/agent-runtime.md` §C.8](docs/agent-runtime.md)。
+
 ---
 
 ### 3.3 上下文管理（Context Compiler）
@@ -686,8 +698,8 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 
 **第二部分 · Environment**
 - [x] P5 环境定义与推断（**Layer 1 七档镜像矩阵** `images/base/Dockerfile.{common,node-dev,python-dev,go-dev,rust-dev,fullstack,ubuntu-dev}`——非语言部分抽到 `common`（sandbox-agent + git/curl/tar/gzip/procps + uid 1000 契约），语言镜像只加自己的工具链；`images/sandbox/Dockerfile` 只剩 `FROM base-fullstack` + 两个 LABEL，构建入口换成 `npm run build:image` = `scripts/build-images.ts`（按拓扑序建链 + 打印 digest，另有 `build:base-images` 建七档）；CP 侧 `environment/{base-images,signals,devcontainer,infer}.ts` + 最小 `store.ts`——三级判定（**devcontainer 子集** > Dockerfile/compose > 信号）、信号采集（锁文件优先级 / 运行时版本 / 构建入口 / CI / compose 服务 / monorepo，**只读不执行**、**两次采集逐字节相同**）、自带的容错 **JSONC** 解析、**确定性渲染**出完整可构建的 Dockerfile（`checkDockerfileConstraints` 与 P6 共用硬约束，`USER root` 必须切回）；`006_environments.sql`（revision 单调 + `kind`/`level`/`status` 三个 CHECK）；三个 fixture 仓库（`test/fixtures/repos/`）各命中一级，集成测试里**真的 build 成功**且继承 Layer 1 的 `CMD` 与 `1000:1000`）
-- [ ] P6 LLM 生成 Dockerfile + 自愈循环（≤3 轮、错误分类、成本记账）
-- [ ] P7 缓存 + 版本化 + 健康检查（ready / degraded / failed）+ promote
+- [ ] P6 LLM 生成 Dockerfile + 自愈循环（≤3 轮、错误分类、成本记账）+ **构建队列**（并发 1、按仓库去重、`env_builds.trigger`）
+- [ ] P7 缓存 + 版本化 + 健康检查（ready / degraded / failed）+ promote + **触发接线**（`first_seen` / `manual` / `promote`，Run 拿不到环境就先用基础镜像）
 
 **第三部分 · 索引与上下文**
 - [ ] P8 仓库符号索引（tree-sitter WASM + 文件级引用图 + 增量）
