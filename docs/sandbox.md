@@ -285,8 +285,14 @@ data: {"exit_code":0,"duration_ms":12345,"stdout_bytes":102400,
 | 单条命令默认 | 120s | timeout 事件 |
 | 单条命令硬上限 | 600s | timeout 事件 |
 | 沙箱 TTL（安全兜底） | 6h | 强制 archive + destroy |
+| **会话空闲 TTL**（M2 起，回收的主机制） | 30min（上限 2h） | 回收前先落地改动（取 diff → push），再 destroy |
 
 TTL 是**安全兜底**，不是资源调度策略：一个跑飞的 agent 不能无限占着容器。到点无论什么状态都销毁，in-flight 的 exec 收到 `killed`。
+
+> **M2 起多了一层"会话空闲 TTL"**：沙箱从"一次 Run 一个、用完即销"变成"**会话的工作区租约**"——
+> 按需创建、热着复用（同一会话的下一句不重建）、超过空闲 TTL 才回收（回收前必须把改动落到任务分支）。
+> 上面那张表里的所有超时/状态机/加固参数**一字不改**；变的只是"谁来申请、什么时候申请、什么时候释放"。
+> 五个状态不变。细节见 [`agent-runtime.md`](agent-runtime.md) §A.1 与 [`agent-runtime-spec.md`](agent-runtime-spec.md) P2 §6。
 
 ### CP 重启后的对账
 

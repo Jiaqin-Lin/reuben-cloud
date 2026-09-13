@@ -4,7 +4,7 @@
 >
 > 沙箱子系统的**实施规格**（Phase 拆分、测试要点、验收标准）见 [`docs/sandbox-spec.md`](docs/sandbox-spec.md)；**设计文档与取舍理由**见 [`docs/sandbox.md`](docs/sandbox.md)。
 >
-> M2（环境与上下文：Agent 运行时对齐 pi · Environment 构建管线 · 仓库索引与 Repo Map · ContextCompiler · Tool Registry / Skill / MCP）的**设计文档**见 [`docs/agent-runtime.md`](docs/agent-runtime.md)，**实施规格（14 个 Phase + 工作量）**见 [`docs/agent-runtime-spec.md`](docs/agent-runtime-spec.md)。
+> M2（环境与上下文：Agent 运行时对齐 pi · Environment 构建管线 · 仓库索引与 Repo Map · ContextCompiler · Tool Registry / Skill / MCP）的**设计文档**见 [`docs/agent-runtime.md`](docs/agent-runtime.md)，**实施规格（13 个 Phase + 工作量）**见 [`docs/agent-runtime-spec.md`](docs/agent-runtime-spec.md)。
 >
 > **第一次读代码？** 从 `packages/sandbox-agent/src/index.ts`（沙箱内的执行服务入口）和 `packages/control-plane/src/provider/local-docker.ts`（CP 侧创建沙箱的那层）读起；agent 相关从 `packages/control-plane/src/agent/loop.ts`（M0）与 `packages/agent-runtime/`（M2 起）读起。
 
@@ -49,21 +49,25 @@ Workspace (组织/个人空间)
       ├── Environment   这个仓库的运行环境定义与构建产物（版本化）
       ├── Skill         可复用的能力包（工具 + 提示词 + 约束）
       ├── Memory        这个仓库的长期经验（跨会话）
-      └── Task          一个意图 + 一条长期对话（"修 #123"，可以来回好几轮）
-           ├── Conversation  对话历史（entries 只追加；跨轮、跨沙箱存活）   ← M2
-           └── Run      一次执行（一条用户消息 → 一个沙箱 → 干到停；可重试、可并行、可取消）
-                ├── Session    沙箱实例 = Sandbox + workspace 卷
+      └── Task          一个意图 + 一条长期对话（"修 #123"，可以来回几十句）
+           ├── Conversation  对话历史（entries 只追加；跨句、跨沙箱存活）           ← M2
+           │    └── Sandbox  会话的工作区（按需建 · 热着复用 · 空闲回收 · 回收前落地）← M2
+           └── Run      一次执行 = 处理用户的一句话（可能完全不碰代码）
                 ├── Transcript 本次执行的模型输入输出 + 工具调用流
                 └── Artifact   产出物：patch / PR / 报告
 ```
 
 **关键区分：**
 - **Task ≠ Run**。Task 是"要做什么"，Run 是"这一次尝试"。同一个 Task 可以有多次 Run（重试、换策略、并行试两种方案）。没有这个区分，重试和对比就无从谈起。
-- **对话是长期的，Run 是易失的**。多轮对话是一等场景（不是"交代一个任务就走"）：用户第二句话进来时起一个**新的 Run**（新沙箱），但对话历史与压缩摘要在同一条 Conversation 里。一轮进行中插话（steering）不新开 Run。实现形态见 [`docs/agent-runtime.md`](docs/agent-runtime.md) §A.1。
-- **每轮结束要把改动持久化**（推到任务分支）：沙箱销毁后，下一轮的仓库起点只能是"上一轮的产出"（M2 起）。
+- **对话是长期的，沙箱是会话的**。多轮对话是一等场景（不是"交代一个任务就走"）：两句之间不重建沙箱——
+  热着的那一个直接复用；只有"真要碰代码"（第一次 read/grep/bash）才建。讨论二十句 = **0 个容器**。
+  一句话说完就结束这一次执行；执行进行中插话（steering）不新开执行。实现形态见
+  [`docs/agent-runtime.md`](docs/agent-runtime.md) §A.1。
+- **改动在回收时落地**（取 diff → push 到任务分支）：沙箱热着时改动就在工作区里；
+  沙箱被回收之前（空闲超时 / 出 PR / 会话结束）必须落地——否则容器硬崩会丢那一段改动。
+- **一个会话同时只有一次执行在跑**：第二句话在上一句还没结束时会被明确拒绝（排队是 M3）。
 - **Environment 是一等公民，不是配置项**。它有自己的生命周期、版本、构建日志和健康状态。这是本项目和"随便拉个镜像"的最大区别。
-- **Session 是 Run 的运行时，不是 Run 本身**。一次 Run 一个沙箱，Run 结束即销毁。沙箱是易失的，不持有业务状态——挂起 / 快照 / 跨节点迁移推迟到 M3（见 §3.1）。
-  > 命名提醒：**这里的 Session 指沙箱实例**；pi 的 Session 指对话历史——两份文档里的同一个词不是一个东西，M2 起我们的对话历史叫 Conversation（表名 `sessions`）。
+  > 命名提醒：README 的旧叫法把沙箱实例叫 Session；pi 的 Session 指对话历史——两份文档里的同一个词不是一个东西。M2 起：对话历史叫 Conversation（表名 `sessions`），沙箱就叫沙箱。
 
 ### 状态机
 
@@ -288,7 +292,7 @@ Environment 有版本号，可 diff、可回滚。用户手动在会话里装了
 | 全文检索 | ripgrep（`grep` 工具，无需预建索引） | 精确字符串/正则搜索 | ✅ |
 | 依赖图 | import/call graph | 影响面分析（改了 A 会影响谁） | ⚠️ 只做文件级引用图 |
 | **仓库地图** | 符号图 + PageRank | **最重要：压缩成几 K token 常驻上下文** | ✅ 核心 |
-| 向量索引 | pgvector + code embedding | 语义检索（"错误处理在哪"） | ❌ 触发式（要先有评估集） |
+| 向量索引 | pgvector + code embedding | 语义检索（"错误处理在哪"） | ❌ M2 不做（没有需求驱动） |
 
 **仓库地图（Repo Map）是被验证过最有效的一招**（Aider 的做法）：在符号引用图上跑 PageRank，取排名最高的 N 个符号，连同它们的签名，生成一份"这个仓库长什么样"的骨架，几 K token 就能让模型有全局感。这比向量检索 RAG 更稳定，因为它给的是**结构**而不是**相关片段**。
 
@@ -601,13 +605,13 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 | 前端 | Next.js + SSE/WS | 流式 transcript、diff 视图、构建日志 |
 | 后端 | Node + Hono/Fastify | 轻量、类型好 |
 | 队列 | BullMQ (Redis) → 后期自建 | 起步够用 |
-| 数据库 | Postgres + pgvector | 状态 + 向量索引一把梭，少一个组件 |
+| 数据库 | Postgres | 状态 + 审计 + 会话/用量一把梭，少一个组件（向量索引不在 M2，需要时再加 pgvector 扩展） |
 | 对象存储 | S3/MinIO | 归档、日志、产物 |
 | 沙箱（MVP） | 本地 Docker + hardening | 单租户；`SandboxProvider` 接口圈住实现，换方案不动上层 |
 | 沙箱（接外部用户前） | Docker + gVisor | 共享内核 → 用户态内核，性价比最高的一步 |
 | 沙箱（规模化） | K8s + gVisor | 多节点调度；CP 不再需要持有 docker socket |
 | 沙箱（需要快照时） | Firecracker | 毫秒级冷启动、跨节点恢复 |
-| 代码索引 | tree-sitter（WASM）+ ripgrep；pgvector 触发式 | 符号 + 全文；语义检索没有评估集就不上线 |
+| 代码索引 | tree-sitter（WASM）+ ripgrep | 符号 + 全文；向量检索没有需求驱动，M2 不做 |
 | 工具参数 schema | TypeBox | 一份声明给 TS 类型 / JSON Schema / 运行时校验（与 pi 同版本） |
 | Agent 循环 | **自己写**（契约对齐 pi） | 循环本身很简单；框架的价值在 DAG 编排，而我们已经砍掉它 |
 | MCP | 官方 TS SDK | 生态最全 |
@@ -662,11 +666,11 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 
 ### M2 · 环境与上下文 ← **当前在做**
 > 目标：任意仓库能自动跑起来；agent 真正"懂"仓库
-> 设计文档：[`docs/agent-runtime.md`](docs/agent-runtime.md) · 实施规格（14 个 Phase、44–59 人日、依赖图）：[`docs/agent-runtime-spec.md`](docs/agent-runtime-spec.md)
+> 设计文档：[`docs/agent-runtime.md`](docs/agent-runtime.md) · 实施规格（13 个 Phase、43–58 人日、依赖图）：[`docs/agent-runtime-spec.md`](docs/agent-runtime-spec.md)
 
 **第一部分 · Agent Runtime（对齐 pi：`/Users/reuben/Documents/pi`）**
-- [ ] P1 运行时契约与包拆分（独立 workspace `packages/agent-runtime`；`startRun` 与 `steer` 两个入口）
-- [ ] P2 会话持久化（**会话长期 + Run 一次执行**：多轮对话跨 Run 连续，含压缩摘要；一轮结束推分支，下一轮从分支接起）
+- [ ] P1 运行时契约与包拆分（独立 workspace `packages/agent-runtime`；`handleUserMessage` 与 `steer` 两个入口）
+- [ ] P2 会话持久化 + **沙箱租约**（20 句讨论 0 个容器；干活后同一会话只建 1 个；按需建 / 热着复用 / 空闲回收 / 回收前落地）
 - [ ] P3 compaction（阈值 / 切点 / split turn / 结构化摘要 / 累积文件清单）
 - [ ] P4 事件统一（`AgentEvent` 唯一事件源，观察窗改成会话视图 + 上下文面板）
 
@@ -679,12 +683,12 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 - [ ] P8 仓库符号索引（tree-sitter WASM + 文件级引用图 + 增量）
 - [ ] P9 **仓库地图（Repo Map）**（PageRank + 个性化 + token 预算 + 确定性）
 - [ ] P10 ContextCompiler（分区预算 + 缓存前缀 + 可回放）
-- [ ] P11 向量索引（**触发式**：先有评估报告，指标达标才上线）
+- [ ] ~~向量索引~~：**移出 M2**（没有需求驱动，也没有评估集；先有实测案例再单独立项）
 
 **第四部分 · 工具面**
-- [ ] P12 Tool Registry + 7 个内置工具（`read`/`write`/`edit`/`grep`/`find`/`ls`/`bash`）
-- [ ] P13 Skills（agentskills.io 标准 + progressive disclosure + 项目信任门）
-- [ ] P14 MCP（CP 侧客户端 + 工具白名单 + 管理界面）
+- [ ] P11 Tool Registry + 7 个内置工具（`read`/`write`/`edit`/`grep`/`find`/`ls`/`bash`）
+- [ ] P12 Skills（agentskills.io 标准 + progressive disclosure + 项目信任门）
+- [ ] P13 MCP（CP 侧客户端 + 工具白名单 + 管理界面）
 
 ### M3 · 编排与规模化
 > 目标：多任务、定时、可观测、可授权
@@ -714,7 +718,8 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 |---|---|---|
 | **环境构建做不好** | 只能服务少数仓库，产品不成立 | M2 全力投入；devcontainer 优先；自愈循环；构建缓存 |
 | **沙箱逃逸** | 宿主机失守，全平台受影响 | MVP 限定单租户；**接外部用户前必须切 gVisor**；永不用 `--privileged` / docker.sock / bind mount；隔离红线进 CI |
-| **成本失控** | 沙箱 + token 持续漏钱 | 沙箱 TTL 硬上限 + 用完即销毁（MVP）；预热池复用 / 快照挂起（M3）；配额；成本归因到 Run；模型分级路由 |
+| **成本失控** | 沙箱 + token 持续漏钱 | 会话级空闲 TTL（默认 30min，上限 2h）+ 绝对 TTL 硬上限；用完即销毁；预热池复用 / 快照挂起（M3）；配额；成本归因到 Run；模型分级路由 |
+| **会话热着复用沙箱** | 空闲容器占内存；硬崩会丢"上次落地之后"的改动 | 空闲 TTL 是硬配置（到点必回收）；回收前必须先落地（推送失败就不销毁，最多重试 3 次后落 archive）；`ERROR(container_lost)` 结构化上报丢的时段 |
 | **提示注入** | 供应链攻击，密钥泄露 | 内容分级；**默认无长期 secret**；出网白名单（白名单宽度 = 信任边界，需持续 review）；默认无 push；只交付 PR；审批流 |
 | **产出不可信** | 用户不敢关电脑，产品价值归零 | 验证阶梯；自验证循环；可信度评分；只交付 PR |
 | **赛道拥挤** | 模型厂商把此功能做成赠品 | 练手定位；差异化切口在私有化/垂直场景/内部平台 |

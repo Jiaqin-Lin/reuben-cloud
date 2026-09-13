@@ -39,7 +39,7 @@ ULID 同样是"时间有序 + 全局唯一"，满足 pi 对 id 的两条实际�
 | `@modelcontextprotocol/sdk` | 最新稳定（pin） | MCP 客户端 | 官方 SDK，stdio + streamable HTTP 都覆盖 | 手写 JSON-RPC（协议面大、易错，且没有收益） |
 | `@anthropic-ai/sdk` | 已有 | 模型调用 | 已有 | — |
 
-**明确不引入**：`zod`、`pgvector` 客户端（M2 不做向量）、`dockerode`（M0 已决定用 HTTP API）、
+**明确不引入**：`zod`、`pgvector` 客户端（M2 不做向量；见设计文档 §H）、`dockerode`（M0 已决定用 HTTP API）、
 `langchain` / `llamaindex` 类框架（README §4 已说明：循环自己写，保持每一步可见）、
 `tree-sitter` 原生绑定（见上）。
 
@@ -108,6 +108,10 @@ packages/control-plane/src/
 │   ├── generate.ts                      # LLM 生成 Dockerfile
 │   ├── build.ts                         # docker build 调用 + 日志 + 错误分类
 │   ├── cache.ts / revision.ts / health.ts
+├── session/                             # 会话与沙箱租约（Phase 2）
+│   ├── postgres.ts                      # SessionStore 的 PG 实现（pg 只在这里）
+│   ├── requests.ts                      # model_requests 落库（内联 or 对象存储）
+│   └── sandbox-lease.ts                 # 会话级沙箱：按需建 / 热着复用 / 空闲回收 / 回收前落地
 ├── index/                               # 仓库索引（Phase 8-9）
 │   ├── worker.ts                        # 子进程隔离（WASM 崩了不影响 CP）
 │   ├── parse.ts / symbols.ts / refs.ts
@@ -149,7 +153,7 @@ vendor/tree-sitter/*.wasm                # 固定版本 + 记录 sha256（Phase 
 | # | Phase | 部分 | 依赖 | 人日 | 交付后可验证的事 |
 |---|---|---|---|---|---|
 | P1 | 运行时契约与包拆分 | Runtime | — | 3–4 | `agent:run` 行为不变，但循环/工具/提示词独立成包 |
-| P2 | 会话持久化（**会话长期 + Run 一次执行**） | Runtime | P1 | 5–6 | 一次 Run 的全部消息/用量/工具调用进 PG；同一会话能起第二轮 |
+| P2 | 会话持久化 + **沙箱租约**（会话长期 / 按需建 / 热着复用 / 空闲回收） | Runtime | P1 | 6–7 | 20 句讨论 0 个容器；干活后同一会话只建 1 个；同一会话能连续两句 |
 | P3 | compaction | Runtime | P2 | 3–4 | 超长会话自动压缩并继续 |
 | P4 | 事件统一 | Runtime | P3 | 1–2 | 一条事件流；观察窗加上下文面板 |
 | P5 | 环境定义与推断 | Env | — | 4–5 | 三个 fixture 仓库各命中一级推断 |
@@ -158,10 +162,12 @@ vendor/tree-sitter/*.wasm                # 固定版本 + 记录 sha256（Phase 
 | P8 | 符号索引 | Index | P5 | 4–6 | 中位仓库 < 60s 建出符号表 |
 | P9 | Repo Map | Index | P8 | 3–4 | 首轮上下文里有仓库骨架 |
 | P10 | ContextCompiler | Index | P3,P9 | 4–5 | 分区预算 + 缓存前缀 + 可回放 |
-| P11 | 向量索引（触发式） | Index | P10 | 3 | 评估报告：上或不上 |
-| P12 | Registry + 7 工具 | Tools | P1 | 3–4 | `edit`/`grep`/`find` 可用，bash 改 shell 字符串 |
-| P13 | Skills | Tools | P12 | 2–3 | 仓库自带技能被模型加载 |
-| P14 | MCP | Tools | P12 | 3–5 | 外部 server 的 2/5 个工具可用 |
+| P11 | Registry + 7 工具 | Tools | P1 | 3–4 | `edit`/`grep`/`find` 可用，bash 改 shell 字符串 |
+| P12 | Skills | Tools | P11 | 2–3 | 仓库自带技能被模型加载 |
+| P13 | MCP | Tools | P11 | 3–5 | 外部 server 的 2/5 个工具可用 |
+
+> **向量索引（原 P11）已移出 M2**：它没有需求驱动、也没有评估集（设计文档 §H）。
+> 真出现"符号与全文搜不到、只能靠语义"的实测案例，再单独立项。
 
 ```
 P1 ─► P2 ─► P3 ─► P4          P5 ─► P6 ─► P7
@@ -169,11 +175,10 @@ P1 ─► P2 ─► P3 ─► P4          P5 ─► P6 ─► P7
               └──────► P10 ◄───────┘
                         ▲
               P8 ─► P9 ──┘
-                        P11（触发式，P10 之后）
-P12（P1 之后任意时刻）──► P13 ──► P14
+P11（P1 之后任意时刻）──► P12 ──► P13
 ```
 
-**关键路径 = P1 → P2 → P3 → P5 → P8 → P9 → P10**。P12–P14（工具面）与 P5–P7（环境）可以交错，
+**关键路径 = P1 → P2 → P3 → P5 → P8 → P9 → P10**。P11–P13（工具面）与 P5–P7（环境）可以交错，
 不需要等关键路径。
 
 ---
@@ -196,8 +201,8 @@ P12（P1 之后任意时刻）──► P13 ──► P14
 - `src/prompt/{system,task}.ts`（从 `agent/prompt.ts` 迁出并改成分区组装）
 - CP 侧：`packages/control-plane/src/agent/` 只保留编排（`run.ts`/`events.ts`/`transcript.ts`），
   其余改为从 `@reuben-cloud/agent-runtime` 引入；`scripts/agent-run.ts` 改 import
-- CP 侧两个入口：`startRun(sessionId, userMessage)`（空闲时来了消息 → 起新一轮）与
-  `steer(runId, message)`（一轮进行中插话，注入当前 Run）——见 §A.1 的三层生命周期
+- CP 侧两个入口：`handleUserMessage(sessionId, text)`（用户发来一句话）与
+  `steer(runId, message)`（一句还在处理中，用户插话）——见设计文档 §A.1
 
 ### 具体如何实现
 
@@ -289,7 +294,7 @@ export interface FileOperations {
   write(p, content, opts): Promise<void>
   list(p, opts): Promise<...>
   stat(p): Promise<...>                  // edit 要用（mtime/大小做乐观并发）
-  runExclusive<T>(path: string, fn: () => Promise<T>): Promise<T>   // 文件写入队列（P12 用）
+  runExclusive<T>(path: string, fn: () => Promise<T>): Promise<T>   // 文件写入队列（P11 用）
 }
 ```
 
@@ -314,14 +319,15 @@ export const MODEL_CATALOG: Record<string, { contextWindow: number; maxTokens: n
 **8. Run 与 Session 的两个入口（多轮对话的接线点）**
 
 ```
-startRun(sessionId, userMessage)          // 空闲时来了消息：新一轮
-  → latestLeaf(sessionId)                 //   从会话当前 leaf 往后追加
-  → appendEntry(user message)             //   （真实的落库在 P2；本 Phase 用内存 store）
-  → 返回一个 runId；同一个循环，只是 context 从 entries 重建而非空数组
+handleUserMessage(sessionId, text)        // 用户发来一句话
+  → 抢会话锁（P2 落地：sessions.active_run_id）
+  → appendEntry(user message, parent = 当前 leaf)
+  → 返回一个 runId；跑循环。**沙箱不在这里建**——第一次要用工具时才建（P2 §6）
+  → 锁在 P1 先用内存实现（单进程），P2 换成 PG 条件更新
 
-steer(runId, message)                     // 一轮进行中插话：注入当前 Run
+steer(runId, message)                     // 一句还在处理中，用户插话
   → 队列入 AgentLoopConfig.getSteeringMessages
-  → 不新开 Run、不中断当前工具
+  → 不新开执行、不中断当前工具
 ```
 
 **这两个入口的分工必须在 P1 就定下**：它们是"多轮对话"与"中途插话"两个不同场景的接口，
@@ -350,7 +356,7 @@ steer(runId, message)                     // 一轮进行中插话：注入当�
 | 10 | 重复调用检测（M0 的能力，挂在 `beforeToolCall`） | 第 3 次注入提示，第 4 次停止 |
 | 11 | prefix 稳定性 | 同一输入两次构造的 system 字节相同 |
 | 12 | 依赖方向 | 读 import 图断言 agent-runtime 不含 pg/octokit/@aws-sdk |
-| 13 | `startRun` 与 `steer` 的分工 | 空闲时来的消息进新的 Run；一轮进行中来的消息注入当前 Run（不新开） |
+| 13 | `handleUserMessage` 与 `steer` 的分工 | 空闲时来的消息开一次新执行；一句进行中来的消息注入当前执行（不新开）；两者都不主动建沙箱 |
 
 ### 验收标准
 
@@ -367,9 +373,10 @@ steer(runId, message)                     // 一轮进行中插话：注入当�
 - `packages/control-plane/src/db/migrations/005_agent_runtime.sql`
 - `packages/agent-runtime/src/session/{store,memory,entries,export}.ts`
 - `packages/control-plane/src/session/postgres.ts`（`SessionStore` 的 PG 实现）
+- `packages/control-plane/src/session/sandbox-lease.ts`（会话级沙箱：按需建 / 热着复用 / 空闲回收 / 回收前落地）
 - `packages/control-plane/src/session/requests.ts`（`model_requests`：内联 or 对象存储）
-- 接线：`run.ts` 在 Run 开始时创建/读取 session，每轮写 entry/usage，工具调用写 intent/settlement；
-  一份 `startRun` 编排（读历史 → 建沙箱 → 跑 → 推送改动 → 关 Run）
+- 接线：`run.ts` 在会话开始时创建/读取 session，每句写 entry/usage，工具调用写 intent/settlement；
+  一份 `handleUserMessage` 编排（抢锁 → 读历史 → 按需建沙箱 → 跑 → 释放锁）
 
 ### 具体如何实现
 
@@ -389,10 +396,18 @@ CREATE TABLE sessions (
   head_commit   text,                           -- 当前分支的 head（下一轮的仓库起点）
   cwd           text NOT NULL,                  -- 沙箱内的仓库根
   title         text,                           -- 给 UI 用的一句话（第一轮后生成，可空）
-  leaf_entry_id text,                           -- 当前 leaf；下一轮从这里往后接
+  leaf_entry_id text,                           -- 当前 leaf；下一句从这里往后接
+  sandbox_id    text,                           -- 当前热着的沙箱（可空：还没干活）
+  sandbox_last_used_at timestamptz,             -- 最后一次用到沙箱的时间（空闲回收用）
+  active_run_id text,                           -- 正在跑的执行；不为空 = 本会话忙（并发保护）
   created_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now()
 );
+
+-- M0 的 sandboxes 表加一列：沙箱归属**会话**（不是归属某一次执行）。
+-- 只需 ALTER（既有行 session_id 为 NULL，对账逻辑一字不改）。
+ALTER TABLE sandboxes ADD COLUMN session_id text;
+CREATE INDEX sandboxes_session_idx ON sandboxes (session_id, last_active_at DESC);
 
 -- Run：一次执行（一个沙箱）。干完就结束；用户回话是新的 Run。
 CREATE TABLE runs (
@@ -535,25 +550,61 @@ serialized_messages ≤ 256 KiB  →  inline_messages（jsonb）
 **5. 续轮（多轮对话的数据面）**
 
 ```
-startRun(sessionId, userMessage):
-  ① session = getSession()             // leaf_entry_id / head_ref / head_commit
-  ② appendEntry(user message)          // parent = leaf_entry_id；更新 leaf
-  ③ startRun({ session_id, start_entry_id: 上一步的 parent })
-  ④ 重建上下文：listEntries(sessionId) → buildContextEntries（含压缩条目）
-  ⑤ 建沙箱时仓库起点 = session.head_commit（不是 base_commit）
-  ⑥ 跑循环；结束时
-       · 有改动 → 推送到 reuben-cloud/<task> 分支 → updateSessionHead(head_commit)
-       · endRun({ end_entry_id, stop_reason }) → updateSessionHead(leaf_entry_id)
+handleUserMessage(sessionId, text):
+  ① 抢会话锁：UPDATE sessions SET active_run_id = $runId
+       WHERE id = $sessionId AND active_run_id IS NULL
+       （抢不到 → 明确拒绝 "session_busy"，**不排队**：排队是 M3）
+  ② session = getSession()；appendEntry(user message, parent = leaf_entry_id)
+  ③ 重建上下文：listEntries(sessionId) → buildContextEntries（含压缩摘要）
+  ④ 跑循环。沙箱**不在这里建**——第一次真的要用工具时才 acquireSandbox()（见 §6）
+  ⑤ 结束时 endRun({ end_entry_id, stop_reason })；updateSessionHead(leaf_entry_id)
+  ⑥ 释放会话锁：active_run_id = NULL
 ```
 
-**两个容易写错的点**：
+**三条容易写错的点**：
 
-1. **仓库起点是 `head_commit` 而不是 `base_commit`**：沙箱销毁后改动只在分支上；
-   不这么做，第二轮会在原始代码上重做一遍（而且看起来"第一轮白干了"）。
-2. **没有改动的一轮也要更新 leaf**：用户可能只是问了一句"这段代码干嘛的"，
-   那一轮没有任何文件改动，但历史必须接得上（下一轮要能看到这轮的回答）。
+1. **沙箱不在这一步建**：模型可能整句都在说话（讨论、解释），一个容器都不该建。
+   建沙箱的时机是"第一次要读/写/跑命令"，实现上就是 `acquireSandbox()`（§6）。
+2. **没有改动的一句也要更新 leaf**：用户可能只是问"这段代码干嘛的"，那一句没有任何文件改动，
+   但历史必须接得上（下一句要能看到这句的回答）。
+3. **`head_commit` 只在"冷启动重建沙箱"时用**：沙箱热着时改动就在工作区里，不需要推也不需要拉。
 
-**6. JSONL 降级为导出格式**
+**6. 沙箱租约（会话级：按需建、热着复用、空闲回收）**
+
+> 这是 v1.2 改过的地方：沙箱**不是**"一次执行一个"。用户可能先讨论二十句需求
+> （一个容器都不该建），然后才开工。沙箱是**会话的工作区**。
+
+```
+acquireSandbox(sessionId):                     // 工具层第一次要用沙箱时调它
+  ① session.sandbox_id 有值，且沙箱状态 ∈ {READY,BUSY} 且未过空闲 TTL
+        → touchSession()；直接返回（热着复用，不重建）
+  ② 否则（没有，或已冷）：
+        a. 旧沙箱存在 → flush(session)（取 diff → apply → push）→ destroy
+        b. provider.create()：image = 当前 env revision 的 digest；
+           仓库起点 = session.head_commit ?? session.base_commit
+        c. UPDATE sessions SET sandbox_id, sandbox_last_used_at = now()
+  ③ 返回 SandboxTarget（工具层拿到的东西与 M0 完全一样）
+
+reapIdleSessions(now):                         // 扩展现有 manager/sweeper.ts
+  for session where sandbox_id is not null
+                 and now() - sandbox_last_used_at > IDLE_TTL:
+      flush(session)                           // 有改动才推；无改动跳过
+      destroy(sandbox)；UPDATE sessions SET sandbox_id = null
+```
+
+**三条硬规则**：
+
+1. **一个会话同时只有一次执行在跑**：靠 `sessions.active_run_id` 的条件更新抢锁（不用 advisory lock，
+   因为它是事务级的，而一次执行跨很多事务）。抢不到就拒，明确错误码 `session_busy`。
+2. **空闲 TTL 是硬配置**：默认 30 分钟，上限 2 小时（env 可调）。到点一定回收——
+   热着复用的代价就是容器占着内存，不能没有上限。
+3. **回收前必须落地**：`flush()` 失败（推送失败/网络）→ **不销毁沙箱**，标 `flush_failed`，
+   下个周期重试；连续 3 次仍失败 → 按 M0 Phase 10 的兜底落 archive 到对象存储再销毁。
+
+**为什么不用"一句一沙箱 + 每句推送"**（v1 草案）：讨论型的一句也要建沙箱、装依赖、推 Git；
+十句就是十次 clone + 十次 push。它把"每句都付固定成本"当成了常态。
+
+**7. JSONL 降级为导出格式**
 
 `session/export.ts` 提供 `exportSession(store, sessionId)`（**整个会话，跨 Run**）→ 与 M0 的
 `transcript.jsonl` **逐字段兼容**（`run_start`/`request`/`response`/`tool_call`/`note`/`run_end`），
@@ -563,7 +614,9 @@ startRun(sessionId, userMessage):
 ### 技术边界
 
 - **不做恢复**：`status='intent'` 的孤儿只在 M3 处理；M2 只保证它们**可见**；
-- **不做调度**：会话/运行可以连续起（`startRun`），但没有队列、优先级、并发限制与触发器（M3）；
+- **不做调度**：会话与执行可以连续起，但没有队列、优先级、并发限制与触发器；
+  同一会话并发第二次请求是**直接拒绝**，不是排队（M3）；
+- **不做沙箱预热池 / 跨会话复用 / 快照挂起**：M2 的复用范围只在"同一个会话热着的时候"；
 - 不做 `values/lists` 表（没有消费者：session 名、队列都不是持久状态）；
 - entries 不可修改、不可删除（M4 的合规删除不在范围内）；
 - 不在 `session_entries.payload` 里存二进制（图片等大对象走对象存储，payload 存引用）。
@@ -580,17 +633,24 @@ startRun(sessionId, userMessage):
 | 6 | 导出兼容 | 10 个真实 Run 的导出通过 M0 JSONL 的 schema 断言（字段名一致） |
 | 7 | 压缩条目 | `type='compaction'` 的 payload 有 `firstKeptEntryId` / `tokensBefore` / `details` |
 | 8 | 迁移可重跑 | `db:migrate` 两次幂等（沿用 M0 的迁移测试） |
-| 9 | 续轮上下文 | 第 1 轮结束后 `startRun` 第二轮 → 第二轮的 messages 里含第一轮的 entries（结构化断言） |
-| 10 | 续轮起点 | 第 1 轮推送了分支 → 第二轮的 `head_commit` 是那个分支的 head（不是 `base_commit`） |
-| 11 | 空改动的一轮 | 没有任何文件改动的一轮也能正常 `endRun` 并更新 leaf（历史接得上） |
-| 12 | 轮次标记 | `listRuns(sessionId)` 返回两轮；每轮的 `start_entry_id`/`end_entry_id` 能把 entries 切成两段而不重叠 |
+| 9 | 续轮上下文 | 第 1 句结束后发第 2 句 → 第 2 句的 messages 里含第 1 句的 entries（结构化断言） |
+| 10 | 纯讨论不建沙箱 | 20 句只用文字的会话 → `sandboxes` 表**零行** |
+| 11 | 沙箱复用 | 同一会话连续 5 次工具调用 → `provider.create` 只被调用 **1** 次 |
+| 12 | 空闲回收 | 拨快时钟 → 回收：有改动则推分支 + 销毁 + `sessions.sandbox_id = null` |
+| 13 | 回收后重建 | 回收后下一次工具调用 → 新建 1 个，仓库起点 = 任务分支 head（不是 `base_commit`） |
+| 14 | 并发保护 | 同一会话两个 `handleUserMessage` 并发 → 第二个明确被拒（`session_busy`） |
+| 15 | 落地失败不丢数据 | 注入 push 失败 → 沙箱**不**被销毁、状态 `flush_failed`；重试成功后销毁 |
+| 16 | 硬崩 | 直接删容器 → `ERROR(container_lost)`；会话保留，下一句能重建沙箱 |
+| 17 | 轮次标记 | `listRuns(sessionId)` 返回两句；每句的 `start_entry_id`/`end_entry_id` 能把 entries 切成两段而不重叠 |
 
 ### 验收标准
 
 - 一次真实 Run（`agent:run --local … --pr`）之后，`sessions` / `runs` / `session_entries` / `usage_ledger` /
   `tool_invocations` / `model_requests` 六张表都有正确数据；
-- 同一会话能起第二轮：上下文含第一轮历史，仓库起点是第一轮的产出（§J.1 第 9 条）；
-- 导出 JSONL（跨轮）能被现有观察窗与人工排查流程直接使用；
+- **20 句纯讨论 → 0 个容器；干活后同一会话连续多句 → 只有 1 个容器**（`sandboxes` 一行）；
+- 空闲回收后回来 → 1 个新容器，工作区接得上（从任务分支，不是从原始 base commit）；
+- 同一会话并发第二个请求被明确拒绝（不是静默串行、也不是两句话混进一个工作区）；
+- 导出 JSONL（跨句）能被现有观察窗与人工排查流程直接使用；
 - kill -9 集成测试进 `test:integration` 且通过。
 
 ---
@@ -764,7 +824,7 @@ prepareNextTurn（每轮结束、下一轮开始前）：
    SSE 的**实时**部分仍走内存缓冲（观察窗的环形缓冲不变）。
 
 4. **上下文面板**：显示每个分区的 token 数与占比、`compiled_hash` 前 8 位、是否命中压缩。
-   这是 M2 唯一新增的 UI 区块（其余 UI 在 P7/P14 各自加）。
+   这是 M2 唯一新增的 UI 区块（其余 UI 在 P7/P13 各自加）。
 
 ### 技术边界
 
@@ -1199,7 +1259,7 @@ import 路径直接给出高权重边（weight=2）
 ### 技术边界
 
 - **不做类型解析 / 精确 call graph**（那是每语言一套编译器前端的量级）；文件级边足够 Repo Map 用；
-- **不做向量**（P11 才做，且要过评估）；
+- **不做向量**（M2 不做；见设计文档 §H）；
 - 不支持的语言静默降级（不报错、不阻塞）；
 - 索引是派生物：任何时刻可 `DELETE` 后重建，没有"唯一真相"；
 - 不在沙箱里跑索引（理由见设计文档 §D.2）。
@@ -1348,7 +1408,7 @@ compile({ system, tools, messages, repoMap, task, seed }):
   3. 组装 system 分区：
       角色与规则（常量）
       + 沙箱事实（REPO_DIR / 出网白名单 / 环境健康 degraded 事实）
-      + 技能清单（XML，P13）
+      + 技能清单（XML，P12）
       + "已改动文件"提醒
   4. repo_map（P9 的渲染结果，超预算截断）
   5. task（issue 原文 + 任务书）
@@ -1421,66 +1481,9 @@ Anthropic：在 `system` 末尾与 `repo_map` 末尾各打一个 `cache_control:
 
 ---
 
-## Phase 11 · 向量索引（触发式，默认不上线）
-
-### 交付物
-
-- `packages/control-plane/src/index/vector/{embed,chunk,search}.ts`
-- `packages/control-plane/src/db/migrations/010_pgvector.sql`（扩展 + 表）
-- 评估脚本与任务集：`packages/control-plane/test/eval/retrieval-tasks.json` + `npm run eval:retrieval`
-- `semantic_search` 工具（**作为工具**，不是自动注入）
-
-### 具体如何实现
-
-**1. 评估先行（这一步不能省）**
-
-```
-任务集：15 个真实任务（从历史成功的 Run 反向构造），每个带"期望被读到的文件"金标准
-指标：read/grep 工具的调用轮数、首个相关文件被读到的轮次、任务成功率
-对照：A 组（P10，无向量） vs B 组（有向量 + semantic_search 工具）
-门槛：B 组在中位轮数上下降 ≥ 10%，且任务成功率不降，才允许上线
-```
-
-**2. 索引**
-
-- `CREATE EXTENSION IF NOT EXISTS vector`（dev compose 的 Postgres 要换成 `pgvector/pgvector:pg16` 镜像——
-  这是一次**基础设施变更**，要在 README §8 的容器表里更新）；
-- chunk = 符号级（用 P8 的符号表切块），embedding 维度与模型在配置里固定（换模型 = 重建索引）；
-- embedding 来源：优先本地（`@xenova/transformers` 之类）或 provider API（可配置）；
-- 索引幂等：`(repo_key, commit, chunk_hash)` 唯一；失败重试 3 次后放弃（不影响 Run）。
-
-**3. 检索作为工具**
-
-`semantic_search(query, k=5)` 返回**路径 + 符号名 + 首行摘要**（不返回正文），模型要细节自己 read。
-默认**关闭**（`REUBEN_CLOUD_SEMANTIC_SEARCH=off`），开启后工具出现在 Registry 里。
-
-### 技术边界
-
-- 没有评估报告不上线；默认关闭；
-- 不把检索结果自动注入上下文（只作为工具）；
-- embedding 成本进 usage_ledger（`kind='skill_analysis'` 之外新增 `kind='embedding'`）；
-- 索引不可用（未建/过期）时工具返回明确的"未建索引"，不静默空结果。
-
-### 测试要点
-
-| # | 用例 | 断言 |
-|---|---|---|
-| 1 | 索引幂等 | 同一 commit 索引两次 → 行数不变 |
-| 2 | 检索质量 | 任务集里 80% 的查询在 top-5 里命中金标准文件 |
-| 3 | 降级 | 未建索引 → 工具返回结构化错误 |
-| 4 | 成本记账 | 每次 embedding 调用进账本 |
-| 5 | 评估脚本 | 能跑出 A/B 对照报告（可复现） |
-
-### 验收标准
-
-- **一份评估报告**（含结论：上或不上）。如果指标不达标，P11 的代码可以保留但**保持默认关闭**，
-  并在 README 里注明"未通过评估"。
-
----
-
 # 第四部分 · 工具面
 
-## Phase 12 · Tool Registry + 7 个内置工具
+## Phase 11 · Tool Registry + 7 个内置工具
 
 ### 交付物
 
@@ -1588,7 +1591,7 @@ FROM tool_invocations WHERE status = 'settled' GROUP BY tool;
 
 ---
 
-## Phase 13 · Skills
+## Phase 12 · Skills
 
 ### 交付物
 
@@ -1677,7 +1680,7 @@ CREATE TABLE skill_runs (
 
 ---
 
-## Phase 14 · MCP
+## Phase 13 · MCP
 
 ### 交付物
 
@@ -1802,7 +1805,7 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 | `packages/coding-agent/src/core/tools/truncate.ts` | `agent-runtime/src/tools/truncate.ts` | 同语义（2000 行 / 50KB / 不返回半行） |
 | `packages/coding-agent/src/core/system-prompt.ts` | `agent-runtime/src/prompt/system.ts` | 同结构（分区）；技能 XML 格式一致 |
 | `packages/coding-agent/src/core/skills.ts` | `agent-runtime/src/skills/*` | 同一标准（agentskills.io）、同一 progressive disclosure |
-| `packages/coding-agent/src/core/project-trust.ts` | 信任门（P13） | 同一原则：项目资源要信任后才加载 |
+| `packages/coding-agent/src/core/project-trust.ts` | 信任门（P12） | 同一原则：项目资源要信任后才加载 |
 | `packages/ai`（Model / Models / streamFn） | `agent-runtime/src/model/*` | 我们只有 2 家 provider，不做注册表与插件 |
 | `packages/agent/src/harness/**`（operation 状态机 / lanes / forks） | **不搬** | M3 的参考实现（设计文档 §B.7） |
 | `packages/coding-agent/src/core/extensions/**` | **不搬** | 我们的扩展点是 Skill 与 MCP |
@@ -1822,7 +1825,7 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 | `model_requests` | Trace / 回放 UI | 不能把 trace 当唯一真相（entries 才是） |
 | `ToolMeta.requiresApproval` | 审批流挂起与放行 | 不能在 M2 就拦截（单租户，拦截只会妨碍自己） |
 | `environments.revision` | 环境自进化（构建失败自愈结果固化回项目级） | 不能静默改 revision（每次都要有构建记录） |
-| `repo_symbols` / `repo_refs` | 向量索引与依赖图分析 | 不能把索引当唯一真相（它是派生物） |
+| `repo_symbols` / `repo_refs` | 影响面分析（"改了 A 会碰谁"）等分析类功能 | 不能把索引当唯一真相（它是派生物） |
 | `skills` / `skill_runs` | 技能效果统计（哪个技能真的有用） | — |
 | ContextCompiler 的分区 | Project Memory 作为新分区注入 | 不能破坏确定性（记忆注入必须可复现） |
 
@@ -1838,4 +1841,3 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 | `dockerfiles/*.Dockerfile` | `test/fixtures/dockerfiles/` | P6（错误分类与硬约束校验） |
 | `build-logs/*.log` | 同上 | P6（错误分类样本） |
 | `index/*.{ts,py,go,rs,java,rb,php}` | `test/fixtures/index/` | P8（每语言符号金标准） |
-| `eval/retrieval-tasks.json` | `test/eval/` | P11（评估集） |
