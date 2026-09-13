@@ -137,6 +137,15 @@ function readFileRoute(url: URL, res: ServerResponse): void {
   const offset = Number(url.searchParams.get("offset") ?? "0");
   const rawLimit = url.searchParams.get("limit");
   const limit = rawLimit === null ? null : Number(rawLimit);
+  // 与真沙箱同一套参数校验（Phase 2）：`limit` 必须是正数。**假的比真的宽松会让用例放过
+  // 真实存在的 bug**——`limit=0` 那条就是这么漏出去的（真跑 agent 时 `bash` 对空日志发了
+  // `limit=0`，沙箱回 400 `invalid_range`，工具白降级一次）。
+  if (offset < 0 || !Number.isInteger(offset)) {
+    return error(res, 400, "invalid_range", "offset 不能是负数");
+  }
+  if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
+    return error(res, 400, "invalid_range", "limit 必须是正数");
+  }
   const available = Math.max(0, content.length - offset);
 
   if (url.searchParams.get("raw") === "1") {
@@ -544,6 +553,23 @@ describe("Phase 11 · bash", () => {
     // 命令确实发出去了，而且 cwd 显式给了仓库根（沙箱的默认 cwd 是 /workspace，
     // 模型心里的 cwd 是 /workspace/repo——不显式给就会在错的目录里跑）。
     assert.deepEqual(exec.calls, [{ cmd: ["bash", "-lc", "make test"], cwd: "/workspace/repo" }]);
+  });
+
+  test("空日志：命令没有输出时不发 limit=0 的请求，也不降级到事件流", async () => {
+    const logPath = "/tmp/reuben-cloud/exec/empty.log";
+    state.files.set(logPath, Buffer.alloc(0));
+    const exec = fakeExec({ result: { exitCode: 0, logPath } });
+    state.requests.length = 0;
+
+    const result = await runBash({ cmd: ["true"] }, makeContext(exec));
+    assert.equal(result.isError, false, result.content);
+    assert.equal(result.content.includes("(no output)"), true, result.content);
+
+    // 只发一次 `/files`（拿 size 的探针）：那次 `limit=0` 的窗口读在真沙箱上会被
+    // `invalid_range` 拒掉，于是把一次成功的命令降到事件流路径上。
+    const fileRequests = state.requests.filter((request) => request.pathname === "/files");
+    assert.equal(fileRequests.length, 1, JSON.stringify(fileRequests.map((r) => r.query.toString())));
+    assert.notEqual(fileRequests[0]!.query.get("limit"), "0");
   });
 
   test("日志读不回来时退回事件流内容，并如实说明（不把成功的命令报成失败）", async () => {

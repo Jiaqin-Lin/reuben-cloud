@@ -555,6 +555,47 @@ describe("Phase 10 · 归档与对象存储", () => {
     assert.equal(rows[0]!.size_bytes, archiveBytes.length);
   });
 
+  test("repoPath：agent 流程把 /diff 指到 /workspace/repo（不传就是 workspace 根）", async () => {
+    // Phase 11 起仓库落在 `/workspace/repo`，而 `/diff` 的缺省路径是 workspace 根——
+    // 那样它会回 `not_a_git_repository`，diff 永远不会落对象存储（只降级成 warning，
+    // 不阻断销毁，所以真跑 agent 流程时很容易一直没人发现）。
+    const archiveBytes = await makeTarGz(await tempDir("repo-path"));
+    const seen: Array<string | null> = [];
+    const agent = await startAgent({
+      onDiff: (query) => {
+        seen.push(query.get("path"));
+        return {
+          body: {
+            base: "b".repeat(40),
+            head: "c".repeat(40),
+            files: [{ path: "a.txt", status: "added", additions: 1, deletions: 0, binary: false }],
+            patch: "patch",
+            patch_bytes: 5,
+            truncated: false,
+            patch_log_path: null,
+          },
+        };
+      },
+      onArchive: (query) =>
+        query.get("dryRun") === "1" ? { dryRun: { size_bytes: archiveBytes.length, file_count: 1 } } : { stream: archiveBytes },
+    });
+
+    // ① agent 流程：显式给 repoPath。
+    const withRepoPath = await seedSandbox({ endpoint: agent.url });
+    const configured = makeManager({ artifacts: { store, repoPath: "/workspace/repo" } });
+    await configured.manager.destroySandbox(withRepoPath.id, "test_repo_path");
+    assert.deepEqual(seen, ["/workspace/repo"]);
+    const configuredRows = await listArtifacts(db, { sandboxId: withRepoPath.id, kind: "diff" });
+    assert.equal(configuredRows.length, 1, "diff 没有落对象存储");
+
+    // ② Phase 8/9 的默认流程：不传 = 不发送 path（沙箱按 workspace 根处理）。
+    seen.length = 0;
+    const defaulted = await seedSandbox({ endpoint: agent.url });
+    const plain = makeManager({ artifacts: { store } });
+    await plain.manager.destroySandbox(defaulted.id, "test_default_path");
+    assert.deepEqual(seen, [null]);
+  });
+
   test("沙箱从来没有 endpoint（create 失败）时跳过归档、照常销毁", async () => {
     const row = await seedSandbox({ endpoint: null, token: null });
     const { manager, provider } = makeManager({ artifacts: { store } });

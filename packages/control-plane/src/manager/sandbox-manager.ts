@@ -127,6 +127,11 @@ export interface ArtifactOffloadOptions {
   graceMs?: number;
   /** 归档体积软配额，不给就用沙箱的 `limits.diskMb`。 */
   maxArchiveBytes?: number;
+  /**
+   * 仓库在沙箱里的位置（透给 `ArtifactOffloader`，见那里的注释）。
+   * **agent 流程要传 `/workspace/repo`**；Phase 8/9 的默认流程不传（仓库就在 workspace 根）。
+   */
+  repoPath?: string;
   /** 可注入时钟（宽限期判断用；测试会拨快它）。 */
   now?: () => Date;
 }
@@ -294,6 +299,7 @@ export class SandboxManager {
             db: this.#db,
             store: this.#offload.store,
             api: this.#api,
+            ...(this.#offload.repoPath === undefined ? {} : { repoPath: this.#offload.repoPath }),
             ...(this.#offload.maxArchiveBytes === undefined
               ? {}
               : { maxArchiveBytes: this.#offload.maxArchiveBytes }),

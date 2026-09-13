@@ -25,7 +25,8 @@
     "db:url": "echo postgres://postgres:${REUBEN_CLOUD_DB_PASSWORD:-x}@127.0.0.1:${REUBEN_CLOUD_DB_PORT:-55432}/reuben_cloud",
     "db:migrate": "node scripts/migrate.ts",
     "smoke": "node packages/e2e/src/smoke.ts",
-    "agent:run": "node scripts/agent-run.ts",
+    "agent:run": "node --env-file-if-exists=.env scripts/agent-run.ts",
+    "app:installations": "node --env-file-if-exists=.env scripts/github-app-installations.ts",
     "proxy:up": "node scripts/egress-proxy.ts up",
     "proxy:down": "node scripts/egress-proxy.ts down",
     "proxy:status": "node scripts/egress-proxy.ts status"

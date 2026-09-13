@@ -159,6 +159,21 @@ async function readLogTail(logPath: string, context: ToolContext): Promise<Outpu
     signal: context.signal,
   });
   const size = probe.size;
+  // **空日志直接返回**：命令一行输出都没产生时 `size = 0`，而 `limit` 必须是正数
+  // （Phase 2 的 `invalid_range`）——不去发那次一定失败的请求，也就不会凭空把一次成功的
+  // 命令降到事件流路径上（真跑 agent 时这条 warning 挂过一次：`git status` 输出为空的那种命令）。
+  if (size === 0) {
+    return {
+      content: "",
+      truncated: false,
+      windowStart: 0,
+      logBytes: 0,
+      totalLines: 0,
+      lastLinePartial: false,
+      outputLines: 0,
+      logError: null,
+    };
+  }
   const windowStart = Math.max(0, size - TAIL_WINDOW_BYTES);
 
   // ② 再读窗口。`raw=1` 不校验编码，也不会因为日志里有二进制字节而 400。

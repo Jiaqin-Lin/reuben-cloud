@@ -60,10 +60,27 @@ export type RepoErrorReason =
   | "apply_failed"
   /** apply 成功但重新算出来的 diff 与沙箱给的 patch sha256 不一致。 */
   | "patch_unfaithful"
+  /** 提交之后工作区仍然不干净（Phase 12：拒绝为一个“还在变”的树建 PR）。 */
+  | "dirty_worktree"
   /** push 被拒（non-fast-forward / fetch first）。 */
   | "push_rejected"
   /** push 被 force-with-lease 拒（远端分支不是我们以为的那个 sha）。 */
   | "push_lease_rejected"
+  /** 远端因为**分支保护规则**拒绝（GH006 / protected branch）——不是我们的 lease 问题。 */
+  | "branch_protected"
+  /** 远端那条分支上有**不是我们推的**提交（committer 不是 bot 身份）——拒绝覆盖。 */
+  | "branch_owned_by_others"
+  // ---- GitHub PR API（Phase 12）
+  /** 403 且不是限流：installation 缺少 `pull_requests:write`。 */
+  | "pr_permission_denied"
+  /** 403/429 + retry-after：限流。带 `details.retryAfterMs`。 */
+  | "pr_rate_limited"
+  /** 404：仓库被删 / App 被卸载 / token 没有这个仓库的范围。 */
+  | "pr_not_found"
+  /** 422：请求本身不合法（base 分支不存在、head 与 base 相同…）。 */
+  | "pr_conflict"
+  /** 其他 PR API 错误。`details.status` 里有原文。 */
+  | "pr_api_error"
   /** 认证失败（token 过期/权限不足）。git 与 GitHub API 都会用这一条。 */
   | "auth_failed"
   /** 想推 protected 分支（main/master，或不在 `reuben-cloud/` 命名空间下的分支）。 */
@@ -141,7 +158,7 @@ export interface RepoApi {
     endpoint: string,
     token: string,
     request: { cmd: string[]; cwd?: string; timeoutMs?: number },
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; maxCaptureBytes?: number },
   ): Promise<AgentExecOutcome>;
   diff(
     endpoint: string,

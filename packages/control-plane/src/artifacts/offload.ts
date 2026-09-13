@@ -121,6 +121,16 @@ export interface ArtifactOffloaderOptions {
   store: ArtifactStore;
   api?: SandboxApiClient;
   /**
+   * 仓库在沙箱里的位置（`/diff?path=`）。缺省 = workspace 根。
+   *
+   * 【为什么需要它】Phase 9 把仓库解到 `/workspace`，而 Phase 11 起 agent 流程把它解到
+   * `/workspace/repo`（`prompt.ts` 的 `REPO_DIR`）——那时 `/diff` 对着 workspace 根会回
+   * `not_a_git_repository`，于是"销毁前把 diff 转存"在 agent 流程里永远拿不到东西
+   * （只是降级成一条 warning，不会阻断销毁——所以很容易一直没人发现）。
+   * 归档（`/archive`）仍然对整个 workspace，它本来就该带上仓库目录。
+   */
+  repoPath?: string;
+  /**
    * 归档体积的**软**配额（字节）。不给就用沙箱自己的 `limits.diskMb`——
    * 卷的大小是"这份归档大概能长到多大"最自然的参照物（附录 A-6）。
    */
@@ -139,6 +149,7 @@ export class ArtifactOffloader {
   readonly #db: Db;
   readonly #store: ArtifactStore;
   readonly #api: SandboxApiClient;
+  readonly #repoPath: string | null;
   readonly #maxArchiveBytes: number | null;
   readonly #log: LogFn;
 
@@ -146,6 +157,7 @@ export class ArtifactOffloader {
     this.#db = options.db;
     this.#store = options.store;
     this.#api = options.api ?? new SandboxApiClient();
+    this.#repoPath = options.repoPath ?? null;
     this.#maxArchiveBytes = options.maxArchiveBytes ?? null;
     this.#log = options.log ?? noopLog;
   }
@@ -181,7 +193,11 @@ export class ArtifactOffloader {
 
     // ---- ① diff：非致命
     try {
-      const diff = await this.#api.diff(endpoint, token);
+      const diff = await this.#api.diff(
+        endpoint,
+        token,
+        this.#repoPath === null ? {} : { path: this.#repoPath },
+      );
       // 超限的 patch 正文不在 JSON 里（Phase 3 备注 4）：走 raw 读回来，
       // 与归档同样是流式的。内联的 patch 本来就只有 2 MiB 上限，直接包成流即可。
       const body =

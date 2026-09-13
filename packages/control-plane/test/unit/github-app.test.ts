@@ -25,7 +25,9 @@ import {
   GithubAppCredentials,
   assertPrivateKeyParses,
   githubCloneUrl,
+  keyPathCandidates,
   parseRepoRef,
+  privateKeyFromEnv,
   repoSlug,
 } from "../../src/repo/github-app.ts";
 import type { GithubAppRequest } from "../../src/repo/github-app.ts";
@@ -172,6 +174,30 @@ describe("Phase 9 · GitHub App 凭据", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  test("私钥路径：绝对路径一个候选，相对路径 cwd → 仓库根两步兜底", async () => {
+    assert.deepEqual(keyPathCandidates("/etc/key.pem", "/a", "/b"), ["/etc/key.pem"]);
+    assert.deepEqual(keyPathCandidates("./github-app.pem", "/a/cwd", "/a/root"), [
+      "/a/cwd/github-app.pem",
+      "/a/root/github-app.pem",
+    ]);
+
+    // 两边都没有时，错误里要把试过的两条路径都写出来（“找不到文件”最难受的就是不知道放哪）。
+    // 这条用例是 `test:live` 真的踩到之后补的：它的 cwd 在 `packages/control-plane`，
+    // 而 `.env` 里的 `./github-app.pem` 是相对仓库根写的。
+    await assert.rejects(
+      privateKeyFromEnv({ [ENV_PRIVATE_KEY_PATH]: "./definitely-missing.pem" }),
+      (error: unknown) => {
+        const repoError = error as RepoError;
+        assert.equal(repoError.reason, "config_invalid");
+        const tried = repoError.details["tried"] as string[];
+        assert.equal(tried.length, 2, JSON.stringify(tried));
+        assert.ok(tried.every((candidate) => candidate.endsWith("definitely-missing.pem")), JSON.stringify(tried));
+        assert.notEqual(tried[0], tried[1]);
+        return true;
+      },
+    );
   });
 
   test("tokenFor：JWT 是真签的，payload 的 scope 与权限正确，且 token 限定到仓库", async () => {

@@ -24,6 +24,14 @@ import { CreateBucketCommand, S3Client } from "@aws-sdk/client-s3";
 import { Client } from "pg";
 import type { Db } from "../src/db/client.ts";
 import { ProviderError } from "../src/provider/types.ts";
+import type { RepoRef } from "../src/repo/types.ts";
+import { RepoError } from "../src/repo/types.ts";
+import type {
+  CreatePullRequestInput,
+  PullRequestApi,
+  PullRequestRecord,
+  UpdatePullRequestInput,
+} from "../src/repo/pr.ts";
 import type {
   ManagedSandbox,
   SandboxHandle,
@@ -1157,10 +1165,13 @@ export async function createGitFixtureRepo(options: {
   owner?: string;
   repo?: string;
   branch?: string;
+  /** 覆盖初始文件（key 是相对仓库根的路径）。缺省用上面那份公共 fixture。 */
+  files?: Record<string, string | Buffer>;
 }): Promise<GitFixtureRepo> {
   const owner = options.owner ?? "fixture";
   const repo = options.repo ?? "repo";
   const branch = options.branch ?? "main";
+  const files = options.files ?? FIXTURE_FILES;
   const bareDir = path.join(options.server.root, owner, `${repo}.git`);
   await mkdir(path.dirname(bareDir), { recursive: true });
   await gitOrFail(["init", "--bare", "--initial-branch", branch, bareDir]);
@@ -1170,7 +1181,7 @@ export async function createGitFixtureRepo(options: {
   const workDir = await mkdtemp(path.join(os.tmpdir(), "rc-fixture-"));
   try {
     await gitOrFail(["init", "-q", "--initial-branch", branch], workDir);
-    for (const [relative, content] of Object.entries(FIXTURE_FILES)) {
+    for (const [relative, content] of Object.entries(files)) {
       const target = path.join(workDir, relative);
       await mkdir(path.dirname(target), { recursive: true });
       await writeFile(target, content);
@@ -1180,7 +1191,7 @@ export async function createGitFixtureRepo(options: {
     const baseSha = (await gitOrFail(["-C", workDir, "rev-parse", "HEAD"])).trim();
     await gitOrFail(["-C", workDir, "push", "-q", bareDir, `${branch}:refs/heads/${branch}`]);
     await gitOrFail(["-C", bareDir, "symbolic-ref", "HEAD", `refs/heads/${branch}`]);
-    return { bareDir, url: `${options.server.url}/${owner}/${repo}.git`, baseSha, branch, files: Object.keys(FIXTURE_FILES) };
+    return { bareDir, url: `${options.server.url}/${owner}/${repo}.git`, baseSha, branch, files: Object.keys(files) };
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
@@ -1345,5 +1356,76 @@ async function createBucket(config: {
     if (name !== "BucketAlreadyOwnedByYou" && name !== "BucketAlreadyExists") throw error;
   } finally {
     client.destroy();
+  }
+}
+
+// ---------------------------------------------------------------- Phase 12：假 GitHub（PR API）
+
+/**
+ * 一个记录调用、并按脚本发挥的假 GitHub PR API。
+ *
+ * 【为什么放进 support.ts 而不是某个测试文件】单测（幂等 / 限流 / 权限）与集成测试
+ * （`finishRun` 的整条收尾路径）都要用它。放进 `.test.ts` 会让另一个 import 它的
+ * 文件把那整份用例也跑一遍——这是 support.ts 文件头记过的那条规矩。
+ *
+ * 【为什么不逐个 mock 函数】幂等这条逻辑要回答的是"最后仓库里到底有几条 PR"，
+ * 而不是"第几个函数被调了几次"。所以这里维护一份**真的 PR 列表**：`create` 往列表里
+ * 塞、`update` 改列表里的那一条，与 GitHub 的行为同构。
+ */
+export class FakePullRequestApi implements PullRequestApi {
+  readonly pullRequests: PullRequestRecord[] = [];
+  readonly calls: string[] = [];
+  /** 抛错队列：每次调用先弹一个出来（用来测权限 403 / 限流 403+retry-after）。 */
+  createFailures: unknown[] = [];
+  updateFailures: unknown[] = [];
+  listFailures: unknown[] = [];
+  defaultBranch = "main";
+  /** 每次 create 收到的 token 之外的东西（断言 draft / base 用）。 */
+  readonly creates: CreatePullRequestInput[] = [];
+  #nextNumber = 101;
+
+  async listOpenByHead(_ref: RepoRef, head: string): Promise<PullRequestRecord[]> {
+    this.calls.push(`list:${head}`);
+    this.#throwNext(this.listFailures);
+    return this.pullRequests.filter((item) => item.state === "open" && item.head.endsWith(`:${head}`));
+  }
+
+  async create(ref: RepoRef, input: CreatePullRequestInput): Promise<PullRequestRecord> {
+    this.calls.push(`create:${input.head}:draft=${input.draft}`);
+    this.#throwNext(this.createFailures);
+    this.creates.push(input);
+    const number = this.#nextNumber++;
+    const record: PullRequestRecord = {
+      number,
+      htmlUrl: `https://github.com/${ref.owner}/${ref.repo}/pull/${number}`,
+      state: "open",
+      draft: input.draft,
+      title: input.title,
+      body: input.body,
+      head: `${ref.owner}:${input.head}`,
+      base: input.base,
+    };
+    this.pullRequests.push(record);
+    return record;
+  }
+
+  async update(_ref: RepoRef, input: UpdatePullRequestInput): Promise<PullRequestRecord> {
+    this.calls.push(`update:${input.number}`);
+    this.#throwNext(this.updateFailures);
+    const found = this.pullRequests.find((item) => item.number === input.number);
+    if (found === undefined) throw new RepoError("pr_not_found", "没有这条 PR");
+    if (input.title !== undefined) found.title = input.title;
+    if (input.body !== undefined) found.body = input.body;
+    if (input.base !== undefined) found.base = input.base;
+    return found;
+  }
+
+  async getDefaultBranch(): Promise<string> {
+    return this.defaultBranch;
+  }
+
+  #throwNext(queue: unknown[]): void {
+    const next = queue.shift();
+    if (next !== undefined) throw next;
   }
 }

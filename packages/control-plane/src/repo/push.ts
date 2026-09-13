@@ -37,12 +37,30 @@ import {
   gitOrThrow,
   looksLikeAuthFailure,
   looksLikeLeaseRejection,
+  looksLikeProtectedBranch,
   looksLikePushRejection,
+  looksLikeTransientNetworkFailure,
   redactedCommand,
+  retryTransientGit,
   runGit,
   tokenAuthArgs,
 } from "./git.ts";
+import type { GitRunResult } from "./git.ts";
 import { RepoError } from "./types.ts";
+
+/** push 的缺省重试次数与间隔（真跑 GitHub 时 500 是见过的）。 */
+/**
+ * push 的重试次数。**故意比读操作少**：一次尝试的预算是 180s（大仓库的真推送需要），
+ * 重试三次就是九分钟——那比失败还糟。一次重试已经能盖住绝大部分“请求建立阶段抖动”。
+ */
+export const GIT_PUSH_ATTEMPTS = 2;
+export const GIT_PUSH_RETRY_DELAY_MS = 3_000;
+
+/**
+ * `ls-remote` 自己的时限。**不能拿 push 的 180s 去等它**：那是一次几十字节的查询，
+ * 弱网下一次挂住就是一个 3 分钟的洞（还要乘上重试次数）。真跑 live 时吃够了。
+ */
+export const LS_REMOTE_TIMEOUT_MS = 15_000;
 
 /** 分支命名空间（§0.1 / 附录 A-12）：`reuben-cloud/<taskId>`。 */
 export const BRANCH_PREFIX = "reuben-cloud/";
@@ -109,6 +127,9 @@ export interface CommitAndPushInput {
    * 显式传一个**过时**的值可以验证"第三方改过分支 → 推被拒"这条保护是真的（测试这么做）。
    */
   expectedRemoteSha?: string | null;
+  /** push 的总尝试次数（含第一次）。默认 `GIT_PUSH_ATTEMPTS`；测试把它调小。 */
+  pushAttempts?: number;
+  pushRetryDelayMs?: number;
   author?: { name: string; email: string };
   timeoutMs?: number;
   log?: LogFn;
@@ -189,7 +210,7 @@ export async function commitAndPush(input: CommitAndPushInput): Promise<PushResu
   const commitSha = (await gitOrThrow(["-C", input.dir, "rev-parse", "HEAD"], { reason: "not_a_repository" })).trim();
 
   // ---- ④ CAS 的参照值：远端现在在这条分支的哪个 sha 上（不存在就是 null）。
-  const remoteShaBefore = await lsRemoteSha(input.url, input.branch, input.token, timeoutMs);
+  const remoteShaBefore = await resolveRemoteShaBefore(input, log);
   const expect = input.expectedRemoteSha !== undefined ? input.expectedRemoteSha : remoteShaBefore;
 
   // ---- ⑤ push。即使分支不存在也带 lease（空 expect = 必须不存在），把"并发创建"也挡掉。
@@ -206,27 +227,43 @@ export async function commitAndPush(input: CommitAndPushInput): Promise<PushResu
     input.url,
     `HEAD:refs/heads/${input.branch}`,
   ];
-  const result = await runGit(pushArgs, { timeoutMs });
-  if (result.spawnError !== null) {
-    throw new RepoError("git_unavailable", `git 起不来：${result.spawnError.message}`, {
-      details: { command: redactedCommand(pushArgs) },
-    });
-  }
-  if (result.timedOut) {
-    throw new RepoError("git_timeout", `push 超过 ${timeoutMs}ms 没有结束`, { details: { branch: input.branch } });
-  }
-  if (result.code !== 0) {
+  // 重试循环。**push 的重试在这里是安全的**，因为 lease 的期望值 `expect` 是固定的：
+  //   · 上一次没落地 → 远端仍是旧值 → 重试与第一次完全等价；
+  //   · 上一次其实落地了（超时 / 服务端 500 之后其实推成功了）→ 远端是我们的新 commit
+  //     → lease 以 `stale info` 拒，而"远端 sha == 本地 HEAD"正是"上一次成功了"的证据，
+  //     这时按**成功**收尾（见下），而不是把一次成功的发布报成失败。
+  // 确定性失败（认证 / 分支保护 / 非快进）一律不重试。
+  const pushAttempts = Math.max(1, input.pushAttempts ?? GIT_PUSH_ATTEMPTS);
+  const pushRetryDelayMs = input.pushRetryDelayMs ?? GIT_PUSH_RETRY_DELAY_MS;
+  let remoteShaNow: string | null = null;
+  for (let attempt = 1; ; attempt += 1) {
+    const result = await runGit(pushArgs, { timeoutMs });
+    if (result.spawnError !== null) {
+      throw new RepoError("git_unavailable", `git 起不来：${result.spawnError.message}`, {
+        details: { command: redactedCommand(pushArgs) },
+      });
+    }
+    if (result.code === 0) break; // 成功
+
     // **`--porcelain` 把拒绝的原因写在 stdout 里**（`!\trefs/…\t[rejected] (stale info)`），
     // 而 `error: failed to push some refs` 在 stderr 里。两处都要看，缺一边就分不出"被拒"。
     const stderrText = result.stderr.toString("utf8");
     const porcelain = result.stdout.toString("utf8");
     const combined = `${porcelain}\n${stderrText}`;
+
     if (looksLikeAuthFailure(combined)) {
       throw gitFailure(pushArgs, result, { reason: "auth_failed" });
     }
     if (looksLikeLeaseRejection(combined)) {
       // 拒绝也要给出**现在的**远端 sha：报告里"我们以为是什么 / 实际是什么"才是可行动的。
-      const remoteShaNow = await lsRemoteSha(input.url, input.branch, input.token, timeoutMs).catch(() => null);
+      remoteShaNow = await lsRemoteSha(input.url, input.branch, input.token, LS_REMOTE_TIMEOUT_MS, { log }).catch(() => null);
+      if (leaseRejectionMeansAlreadyPushed(remoteShaNow, commitSha)) {
+        log("warn", `push 的 lease 被拒，但远端已经是本地 HEAD——上一次其实推成功了，按成功收尾`, {
+          branch: input.branch,
+          commitSha,
+        });
+        break;
+      }
       throw new RepoError(
         "push_lease_rejected",
         `远端分支 ${input.branch} 不是我们预期的 ${expect ?? "(不存在)"}，拒绝覆盖`,
@@ -241,8 +278,25 @@ export async function commitAndPush(input: CommitAndPushInput): Promise<PushResu
         },
       );
     }
+    if (isTransientPushFailure(result, combined) && attempt < pushAttempts) {
+      log(
+        "warn",
+        `push 失败（${result.timedOut ? "超时" : "远端瞬时错误"}），${pushRetryDelayMs}ms 后重试（第 ${attempt}/${pushAttempts - 1} 次）`,
+        { branch: input.branch, stderr: stderrText.trim().slice(0, 300) },
+      );
+      await new Promise((resolve) => {
+        setTimeout(resolve, pushRetryDelayMs);
+      });
+      continue;
+    }
+    if (result.timedOut) {
+      throw new RepoError("git_timeout", `push 超过 ${timeoutMs}ms 没有结束`, { details: { branch: input.branch } });
+    }
     if (looksLikePushRejection(combined)) {
-      throw new RepoError("push_rejected", `push 被拒（${input.branch}）：${summarizePushRejection(porcelain, stderrText)}`, {
+      // 分支保护是 push 被拒里最需要人动手的一类：报告保护规则，停止（不改写、不轮询重试）。
+      const reason = looksLikeProtectedBranch(combined) ? "branch_protected" : "push_rejected";
+      const detail = summarizePushRejection(porcelain, stderrText);
+      throw new RepoError(reason, `push 被拒（${input.branch}）：${detail}`, {
         details: { branch: input.branch, porcelain: porcelain.trim().slice(0, 1_000), stderr: stderrText.trim().slice(0, 1_000) },
       });
     }
@@ -267,27 +321,94 @@ export async function commitAndPush(input: CommitAndPushInput): Promise<PushResu
 }
 
 /**
+ * push 失败但**值得重试**吗。
+ *
+ *  · 超时：连接挂住（弱网）或响应丢了——重试由 lease 兜底（见 push 循环的注释）；
+ *  · 远端 5xx：GitHub 的 receive-pack 偶发 `remote: Internal Server Error`（真跑 live 时见过）；
+ *  · 其余网络类信号（`git.ts` 里那一套）。
+ *
+ * 确定性失败（认证 / 分支保护 / 非快进）**绝不重试**：重试只是把错误延后。
+ */
+export function isTransientPushFailure(result: GitRunResult, combined: string): boolean {
+  // 超时**且一点都没动**才算抖动：连 “Counting objects” 都没有，说明连接没建立起来。
+  // 真在传、只是太慢（大仓库）时不该重试——那是事实，不是抖动。
+  if (result.timedOut) return !looksLikePushStarted(combined);
+  if (/internal server error|service unavailable|bad gateway|gateway timeout|rpc failed/i.test(combined)) return true;
+  return looksLikeTransientNetworkFailure(combined);
+}
+
+/** push 是否真的开始传了（git 的进度输出）。用来把“连接没建立”和“传得太慢”分开。 */
+export function looksLikePushStarted(stderr: string): boolean {
+  return /Counting objects|Compressing objects|Enumerating objects|Writing objects|remote:/i.test(stderr);
+}
+
+/**
+ * lease 被拒之后的判定：远端 sha 等于本地 HEAD，就说明**上一次其实推成功了**
+ * （请求发出去了、响应丢了 / 远端回 500 但其实写进去了）。
+ *
+ * 这是"push 重试安全"的另一半：只有这一条能证明重试没必要再试。
+ */
+export function leaseRejectionMeansAlreadyPushed(actualRemoteSha: string | null, localHead: string): boolean {
+  return actualRemoteSha !== null && actualRemoteSha !== "" && actualRemoteSha === localHead;
+}
+
+/**
+ * push 之前想知道“远端现在在哪”。
+ *
+ * 【显式给了期望值时不再多问一次】`expectedRemoteSha` 是调用方**刚刚验证过**的值
+ * （`publishRun` 就是先 `ls-remote` + `fetch` 验过归属才推的），再问一次只是多一次
+ * 可能在弱网下挂住的往返。报告里的 `remoteShaBefore` 语义本来就是“我们相信远端是什么”。
+ */
+async function resolveRemoteShaBefore(input: CommitAndPushInput, log: LogFn): Promise<string | null> {
+  return input.expectedRemoteSha !== undefined
+    ? input.expectedRemoteSha
+    : await lsRemoteSha(input.url, input.branch, input.token, LS_REMOTE_TIMEOUT_MS, { log });
+}
+
+/**
  * 问远端一条分支的 sha。不存在返回 null。
  *
  * `ls-remote` 与 push 都会带 token：这两条请求都是"以 App 的身份问 GitHub"，
  * 而 auth 失败在这里的分类与 push 里完全一样（`auth_failed`）。
+ *
+ * **弱网下会自动重试**（`retryTransientGit`）：它是一次只读查询，重试是幂等的。
+ * 真跑 GitHub 的 live 用例踩到过"同一个 token 的 ls-remote 连续几次卡死 60s"——
+ * 那一次直接让整条发布流程失败，而其实只是网络抖了一下。
  */
+export interface LsRemoteOptions {
+  /** 总尝试次数（含第一次）。默认 `GIT_TRANSIENT_ATTEMPTS`（3）。 */
+  attempts?: number;
+  retryDelayMs?: number;
+  log?: LogFn;
+}
+
 export async function lsRemoteSha(
   url: string,
   branch: string,
   token: string | null | undefined,
   timeoutMs: number,
+  options: LsRemoteOptions = {},
 ): Promise<string | null> {
-  const args = [...tokenAuthArgs(token), "ls-remote", "--heads", url, `refs/heads/${branch}`];
-  const result = await runGit(args, { timeoutMs });
-  if (result.spawnError !== null) {
-    throw new RepoError("git_unavailable", `git 起不来：${result.spawnError.message}`);
-  }
-  if (result.timedOut) throw new RepoError("git_timeout", `ls-remote 超过 ${timeoutMs}ms 没有结束`);
-  if (result.code !== 0) throw gitFailure(args, result, { reason: "git_failed", context: { branch } });
-  const line = result.stdout.toString("utf8").trim().split("\n")[0] ?? "";
-  const sha = line.split(/\s+/)[0] ?? "";
-  return /^[0-9a-f]{7,64}$/.test(sha) ? sha : null;
+  return retryTransientGit(
+    async () => {
+      const args = [...tokenAuthArgs(token), "ls-remote", "--heads", url, `refs/heads/${branch}`];
+      const result = await runGit(args, { timeoutMs });
+      if (result.spawnError !== null) {
+        throw new RepoError("git_unavailable", `git 起不来：${result.spawnError.message}`);
+      }
+      if (result.timedOut) throw new RepoError("git_timeout", `ls-remote 超过 ${timeoutMs}ms 没有结束`);
+      if (result.code !== 0) throw gitFailure(args, result, { reason: "git_failed", context: { branch } });
+      const line = result.stdout.toString("utf8").trim().split("\n")[0] ?? "";
+      const sha = line.split(/\s+/)[0] ?? "";
+      return /^[0-9a-f]{7,64}$/.test(sha) ? sha : null;
+    },
+    {
+      ...(options.attempts === undefined ? {} : { attempts: options.attempts }),
+      ...(options.retryDelayMs === undefined ? {} : { delayMs: options.retryDelayMs }),
+      ...(options.log === undefined ? {} : { log: options.log }),
+      describe: `ls-remote ${branch}`,
+    },
+  );
 }
 
 /** porcelain 输出里挑一条"被拒"的行；没有就退回 stderr 的第一行。 */

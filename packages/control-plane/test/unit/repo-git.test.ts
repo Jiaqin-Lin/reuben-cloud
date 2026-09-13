@@ -19,16 +19,28 @@ import { assertRunId, removeRunDir, runDirOf, sweepStaleRunDirs } from "../../sr
 import {
   assertNoUserInfo,
   basicAuthHeader,
+  isTransientGitError,
   looksLikeAuthFailure,
   looksLikeLeaseRejection,
+  looksLikeTransientNetworkFailure,
   redactArgs,
   redactedCommand,
+  retryTransientGit,
   tokenAuthArgs,
   writeWorktreeDiff,
 } from "../../src/repo/git.ts";
+import type { GitRunResult } from "../../src/repo/git.ts";
 import { auditCloneConfig, scanForSecrets } from "../../src/repo/pack.ts";
-import { assertPushableBranch, branchNameForTask, lsRemoteSha, parseShortStat } from "../../src/repo/push.ts";
-import type { RepoError } from "../../src/repo/types.ts";
+import {
+  assertPushableBranch,
+  branchNameForTask,
+  isTransientPushFailure,
+  leaseRejectionMeansAlreadyPushed,
+  looksLikePushStarted,
+  lsRemoteSha,
+  parseShortStat,
+} from "../../src/repo/push.ts";
+import { RepoError } from "../../src/repo/types.ts";
 import { run } from "../support.ts";
 
 const TOKEN = "ghs_unit_token_0123456789abcdef";
@@ -154,6 +166,129 @@ describe("Phase 9 · push 的产品语义", () => {
     const sha = await initRepo(work);
     await gitIn(work, ["push", "-q", bare, "HEAD:refs/heads/reuben-cloud/one"]);
     assert.equal(await lsRemoteSha(bare, "reuben-cloud/one", null, 30_000), sha);
+  });
+
+  test("isTransientPushFailure：超时与远端 5xx 算，保护/非快进/认证不算", () => {
+    const result = (overrides: Partial<GitRunResult> = {}): GitRunResult => ({
+      code: 1,
+      signal: null,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+      timedOut: false,
+      overflow: false,
+      spawnError: null,
+      stdoutBytes: 0,
+      stdoutSha256: null,
+      ...overrides,
+    });
+    // 超时**且一点都没动**（没有 git 的进度输出）= 连接没建立起来 → 值得重试。
+    assert.equal(isTransientPushFailure(result({ timedOut: true }), ""), true);
+    // 超时但已经在传（大仓库真推送太慢）= 事实，不是抖动 → 不重试。
+    assert.equal(
+      isTransientPushFailure(result({ timedOut: true }), "Writing objects:  42% (1/2), 1.00 MiB | 20.00 KiB/s"),
+      false,
+    );
+    assert.equal(looksLikePushStarted("remote: Resolving deltas: 100%"), true);
+    assert.equal(looksLikePushStarted(""), false);
+    // GitHub receive-pack 的偶发 5xx：真跑 live 时遇过 `remote: Internal Server Error`。
+    assert.equal(isTransientPushFailure(result(), "remote: Internal Server Error"), true);
+    assert.equal(isTransientPushFailure(result(), "error: RPC failed; curl 56 Recv failure"), true);
+    // 确定性失败：重试只是把错误延后。
+    assert.equal(isTransientPushFailure(result(), "! [rejected]\trefs/heads/x\t(stale info)"), false);
+    assert.equal(isTransientPushFailure(result(), "remote: error: GH006: Protected branch update failed"), false);
+    assert.equal(isTransientPushFailure(result(), "fatal: Authentication failed for 'https://github.com/o/r.git/'"), false);
+  });
+
+  test("leaseRejectionMeansAlreadyPushed：远端 == 本地 HEAD 才是“上一次成功了”", () => {
+    const head = "a".repeat(40);
+    assert.equal(leaseRejectionMeansAlreadyPushed(head, head), true);
+    assert.equal(leaseRejectionMeansAlreadyPushed("b".repeat(40), head), false, "远端不是我们的 commit，不能当成功");
+    assert.equal(leaseRejectionMeansAlreadyPushed(null, head), false);
+    assert.equal(leaseRejectionMeansAlreadyPushed("", head), false);
+  });
+});
+
+describe("Phase 12 · 弱网重试（真跑 GitHub 时踩出来的）", () => {
+  test("looksLikeTransientNetworkFailure 只认网络类信号，不认认证/仓库类", () => {
+    for (const transient of [
+      "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com",
+      "error: RPC failed; curl 56 Recv failure: Connection reset by peer",
+      "fatal: unable to access '...': Failed to connect to github.com port 443",
+      "fatal: the remote end hung up unexpectedly",
+      // `http.lowSpeed*` 把“永久挂住”变成的那条：真跑 GitHub 时见过两次。
+      "fatal: unable to access 'https://github.com/o/r.git/': Operation too slow. Less than 1000 bytes/sec transferred the last 60 seconds",
+    ]) {
+      assert.equal(looksLikeTransientNetworkFailure(transient), true, transient);
+    }
+    for (const deterministic of [
+      "fatal: Authentication failed for 'https://github.com/o/r.git/'",
+      "remote: Repository not found.",
+      "remote: error: GH006: Protected branch update failed",
+      "! [rejected] main -> main (stale info)",
+    ]) {
+      assert.equal(looksLikeTransientNetworkFailure(deterministic), false, deterministic);
+    }
+  });
+
+  test("isTransientGitError：git_timeout 算；auth_failed / protected_branch 不算", () => {
+    assert.equal(isTransientGitError(new RepoError("git_timeout", "卡住了")), true);
+    assert.equal(
+      isTransientGitError(new RepoError("git_failed", "网络", { details: { stderr: "Recv failure: Connection reset" } })),
+      true,
+    );
+    assert.equal(isTransientGitError(new RepoError("auth_failed", "401")), false);
+    assert.equal(isTransientGitError(new RepoError("protected_branch", "GH006")), false);
+    // stderr 里没有网络信号就当作确定性失败（重试只是把错误延后）。
+    assert.equal(isTransientGitError(new RepoError("git_failed", "别的原因", { details: { stderr: "nope" } })), false);
+    assert.equal(isTransientGitError(new Error("不是 RepoError")), false);
+  });
+
+  test("retryTransientGit：瞬时失败重试、确定性失败直接抛、用尽后抛原错", async () => {
+    const warnings: string[] = [];
+    const log = (_level: string, message: string): void => void warnings.push(message);
+
+    // ① 前两次卡死，第三次成功。
+    let calls = 0;
+    const ok = await retryTransientGit(
+      async () => {
+        calls += 1;
+        if (calls < 3) throw new RepoError("git_timeout", `第 ${calls} 次卡住`);
+        return "done";
+      },
+      { attempts: 3, delayMs: 5, log },
+    );
+    assert.equal(ok, "done");
+    assert.equal(calls, 3);
+
+    // ② 确定性失败不重试（只调一次）。
+    let authCalls = 0;
+    await assert.rejects(
+      retryTransientGit(
+        async () => {
+          authCalls += 1;
+          throw new RepoError("auth_failed", "401");
+        },
+        { attempts: 3, delayMs: 5, log },
+      ),
+      (error: unknown) => (error as RepoError).reason === "auth_failed",
+    );
+    assert.equal(authCalls, 1, "认证失败被重试了");
+
+    // ③ 一直瞬时失败：重试用尽后抛最后一次的原错，且每次重试前都记一条 warn。
+    let always = 0;
+    const retryLogs: number[] = [];
+    await assert.rejects(
+      retryTransientGit(
+        async () => {
+          always += 1;
+          throw new RepoError("git_timeout", "一直卡");
+        },
+        { attempts: 2, delayMs: 1, log: (_level, message) => void retryLogs.push(message.length) },
+      ),
+      (error: unknown) => (error as RepoError).reason === "git_timeout",
+    );
+    assert.equal(always, 2);
+    assert.equal(retryLogs.length, 1, "重试前应该记一条 warn");
   });
 });
 

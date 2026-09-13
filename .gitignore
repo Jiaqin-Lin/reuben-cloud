@@ -3,3 +3,10 @@ dist/
 *.log
 .DS_Store
 .claude/
+# 本地凭据（模型 key / DB 连接串）。.env.example 之类的模板可以进 git。
+.env
+.env.local
+.env.*.local
+
+# GitHub App 私钥（本地开发用，绝不要提交）
+*.pem

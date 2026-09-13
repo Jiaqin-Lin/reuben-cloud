@@ -14,12 +14,18 @@ import { describe, test } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import {
   AnthropicModelClient,
+  DEEPSEEK_BASE_URL,
+  DEFAULT_DEEPSEEK_MODEL,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  ENV_DEEPSEEK_API_KEY,
+  ENV_PROVIDER,
   MAX_MODEL_OUTPUT_TOKENS,
   ModelError,
   anthropicFromEnv,
   maxTokensFromEnv,
+  modelFromEnv,
+  selectProvider,
   toModelError,
   toSdkMessages,
   toSdkTools,
@@ -237,6 +243,45 @@ describe("Phase 11 · 配置与错误分类", () => {
     assert.equal(maxTokensFromEnv({ REUBEN_CLOUD_MAX_TOKENS: "1000" }), 1000);
     assert.equal(maxTokensFromEnv({ REUBEN_CLOUD_MAX_TOKENS: "999999" }), MAX_MODEL_OUTPUT_TOKENS);
     assert.throws(() => maxTokensFromEnv({ REUBEN_CLOUD_MAX_TOKENS: "abc" }));
+  });
+
+  test("selectProvider：显式 provider 优先，其次看模型名前缀，再看哪个 key 在", () => {
+    // ① 显式指定（两个 key 都在时唯一的确定性来源）。
+    assert.deepEqual(selectProvider({ [ENV_PROVIDER]: "deepseek", ANTHROPIC_API_KEY: "a", [ENV_DEEPSEEK_API_KEY]: "d" }), {
+      provider: "deepseek",
+      model: DEFAULT_DEEPSEEK_MODEL,
+      apiKeyEnv: ENV_DEEPSEEK_API_KEY,
+    });
+    // ② 模型名前缀。
+    assert.equal(selectProvider({ REUBEN_CLOUD_MODEL: "deepseek-flash" })?.provider, "deepseek");
+    assert.equal(selectProvider({ REUBEN_CLOUD_MODEL: "claude-haiku-4-5" })?.provider, "anthropic");
+    // ③ key 在就用（Anthropic 在前，它是 §2 的文档默认值）。
+    assert.equal(selectProvider({ ANTHROPIC_API_KEY: "a", [ENV_DEEPSEEK_API_KEY]: "d" })?.provider, "anthropic");
+    assert.equal(selectProvider({ [ENV_DEEPSEEK_API_KEY]: "d" })?.provider, "deepseek");
+    // ④ 什么都没说 → null，以及显式写了不认识的名字 → 报错。
+    assert.equal(selectProvider({}), null);
+    assert.throws(
+      () => selectProvider({ [ENV_PROVIDER]: "openai" }),
+      (error: unknown) => (error as ModelError).reason === "config_missing",
+    );
+  });
+
+  test("modelFromEnv：DeepSeek 走兼容端点，默认模型是 deepseek-flash", () => {
+    const deepseek = modelFromEnv({ REUBEN_CLOUD_MODEL: "deepseek-flash", [ENV_DEEPSEEK_API_KEY]: "sk-ds" });
+    assert.equal(deepseek.model, "deepseek-flash");
+    // baseURL 是构造参数，不在 model 字段上——用一次真实请求把它断言下来（走假 SDK 注入不了，
+    // 所以这里断言的是“装配选对了 provider 与模型”这一层，端点的实际可达性由 @live 层负责）。
+    assert.equal(DEEPSEEK_BASE_URL, "https://api.deepseek.com/anthropic");
+
+    const anthropic = modelFromEnv({ ANTHROPIC_API_KEY: "sk-a" });
+    assert.equal(anthropic.model, DEFAULT_MODEL);
+
+    // 没有凭据 / 选了 provider 但缺 key：都是启动时就暴露的 config_missing。
+    assert.throws(() => modelFromEnv({}), (error: unknown) => (error as ModelError).reason === "config_missing");
+    assert.throws(
+      () => modelFromEnv({ [ENV_PROVIDER]: "deepseek" }),
+      (error: unknown) => (error as ModelError).message.includes(ENV_DEEPSEEK_API_KEY),
+    );
   });
 
   test("toModelError 按状态码分类", () => {

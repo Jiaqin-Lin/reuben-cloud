@@ -12,8 +12,9 @@
  * 它必须对着一个**真的启动起来**的容器搜一遍。测试在 CP 进程里塞一个哨兵值，
  * 然后按生产路径建沙箱；将来谁往 `SandboxSpec.env` 里加了这个 key，这条会立刻红。
  *
- * 【可选的真模型用例】`RUN_LIVE_AGENT=1` 且 `ANTHROPIC_API_KEY` 存在时，会真的跑一遍
+ * 【可选的真模型用例】`RUN_LIVE_AGENT=1` 且环境里有模型凭据时，会真的跑一遍
  * agent 循环（spec 测试要点 8 与 §K 第 9 步："给一个真实 issue，产出一个 patch"）。
+ * provider 由 `modelFromEnv()` 选（看 key / `REUBEN_CLOUD_PROVIDER`）。
  * 默认跳过：它要花钱，而且结果不完全确定。
  *
  * 【跑之前】`npm run build:image`（`resolveImageRef()` 把 tag 解析成 digest）。
@@ -34,7 +35,7 @@ import { LocalDockerProvider } from "../../src/provider/local-docker.ts";
 import { forwardContainerName, sandboxContainerName } from "../../src/provider/types.ts";
 import { cloneRepo, removeRunDir } from "../../src/repo/clone.ts";
 import { injectRepo } from "../../src/repo/inject.ts";
-import { anthropicFromEnv } from "../../src/agent/model.ts";
+import { modelFromEnv, selectProvider } from "../../src/agent/model.ts";
 import { runAgentLoop } from "../../src/agent/loop.ts";
 import { Transcript } from "../../src/agent/transcript.ts";
 import { REPO_DIR, buildSystemPrompt } from "../../src/agent/prompt.ts";
@@ -72,6 +73,19 @@ const BUGGY_MATH = "exports.add = (a, b) => a - b; // BUG: 应该相加\n";
  * 不在任何文件里；随机值能保证"搜不到"是真的搜过（Phase 9 的 token 用例同一条理由）。
  */
 const API_KEY_SENTINEL = `sk-ant-sentinel-${randomBytes(12).toString("hex")}`;
+
+/**
+ * 模块加载时先看清环境里到底有没有真凭据。
+ *
+ * 【为什么要在 before() 之前捕获】红线用例会把 CP 自己的两个 key 环境变量都换成哨兵
+ * （随机串——写死一个字符串的话，"搜不到"可能只是因为它碰巧不在任何文件里）。
+ * 而真模型用例需要那把**真** key：它在 before() 之后跑，所以必须先把原值留下来。
+ * （这也是 Phase 11 原来的一个 bug：哨兵覆盖了真 key，`RUN_LIVE_AGENT=1` 跑起来会 401。）
+ */
+const liveSelection = selectProvider(process.env);
+const liveRealKey = liveSelection === null ? "" : (process.env[liveSelection.apiKeyEnv] ?? "");
+/** 红线用例要确认哨兵真的在 CP 环境里，用的是这个变量名。 */
+const liveKeyEnv = liveSelection?.apiKeyEnv ?? "ANTHROPIC_API_KEY";
 
 /** 在宿主上造一个带失败测试的小仓库。 */
 async function makeFixtureRepo(): Promise<{ dir: string; baseSha: string }> {
@@ -145,7 +159,9 @@ before(async () => {
   manager = new SandboxManager({ db, provider: new LocalDockerProvider(), api, image: imageRef });
 
   // CP 的进程环境里**故意**放上哨兵 key：这条红线测的是"它没有漏进沙箱"。
+  // 两个 provider 的变量都塞：不管这次用的是哪一家，容器里的搜索都覆盖到了。
   process.env["ANTHROPIC_API_KEY"] = API_KEY_SENTINEL;
+  process.env["DEEPSEEK_API_KEY"] = API_KEY_SENTINEL;
 
   const fixture = await makeFixtureRepo();
   runId = `run_agent_${randomBytes(4).toString("hex")}`;
@@ -264,6 +280,7 @@ describe("Phase 11 · 工具在真沙箱里", () => {
     ]);
     assert.equal(containerEnv.includes(API_KEY_SENTINEL), false, `容器 env 里有哨兵：${containerEnv}`);
     assert.equal(containerEnv.includes("ANTHROPIC_API_KEY"), false, containerEnv);
+    assert.equal(containerEnv.includes("DEEPSEEK_API_KEY"), false, containerEnv);
   });
 
   test("§F.3 红线：在容器里全盘搜不到模型 API key（含 /proc/*/environ）", async () => {
@@ -294,17 +311,19 @@ describe("Phase 11 · 工具在真沙箱里", () => {
     assert.equal(procs.stdout.trim(), "0", `某个进程的环境里有哨兵：${procs.stdout}`);
 
     // 顺便确认哨兵**确实**在 CP 的进程环境里（否则上面两条断言是空转）
-    assert.equal(process.env["ANTHROPIC_API_KEY"], API_KEY_SENTINEL);
+    assert.equal(process.env[liveKeyEnv], API_KEY_SENTINEL, `CP 环境里的 ${liveKeyEnv} 不是哨兵`);
   });
 });
 
 describe("Phase 11 · 真模型跑一遍（RUN_LIVE_AGENT=1 才跑）", () => {
-  const live = process.env["RUN_LIVE_AGENT"] === "1" && (process.env["ANTHROPIC_API_KEY"] ?? "") !== "";
+  const live = process.env["RUN_LIVE_AGENT"] === "1" && liveRealKey !== "";
 
   test(
     "§K 第 9 步：给一个真实 issue，跑完产出一个 patch",
-    { skip: live ? false : "需要 RUN_LIVE_AGENT=1 且 ANTHROPIC_API_KEY" },
+    { skip: live ? false : `需要 RUN_LIVE_AGENT=1 且 ${liveKeyEnv} 有真 key` },
     async () => {
+      // 把前面红线用例换掉的哨兵换回真 key（见 liveRealKey 的注释）。
+      process.env[liveKeyEnv] = liveRealKey;
       // 把 fixture 恢复到"测试失败"的状态，让模型有活可干。
       const reset = await runWrite({ path: "src/math.js", content: BUGGY_MATH }, context);
       assert.equal(reset.isError, false, reset.content);
@@ -315,7 +334,7 @@ describe("Phase 11 · 真模型跑一遍（RUN_LIVE_AGENT=1 才跑）", () => {
       });
       const toolkit = createToolkit({ sandboxId, exec: manager, api, target: { endpoint, authToken, sandboxId } });
       const result = await runAgentLoop({
-        model: anthropicFromEnv(),
+        model: modelFromEnv(),
         tools: toolkit,
         transcript,
         system: buildSystemPrompt(),

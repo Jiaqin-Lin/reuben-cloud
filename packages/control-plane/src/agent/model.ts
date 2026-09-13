@@ -21,6 +21,14 @@
  *
  * 【不传 temperature / top_p / top_k】当前模型上已被移除，传了会 400（§2 的原话）。
  * 这不是"先不设置"，是"不能设置"。
+ *
+ * 【DeepSeek 为什么也在这个文件里，而且不是第二份实现】DeepSeek 提供**同一套 Messages
+ * API**（`https://api.deepseek.com/anthropic`），字段名、`stop_reason`、`usage`
+ * （含 `cache_read_input_tokens`）与工具调用形状都一致。所以接第二家 provider 的动作是
+ * **换 baseURL + 换 key**，不是再写一个客户端：手写 OpenAI 格式的客户端要多一层
+ * `reasoning_content ↔ thinking`、`tool_calls ↔ tool_use` 的翻译，那层翻译正是会出错的地方。
+ * 两者的差异写在 `selectProvider()` / `modelFromEnv()` 的注释里（缓存是自动的、
+ * `temperature` 支持但我们不传、`refusal` 不会出现）。
  */
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -34,8 +42,19 @@ import type {
 
 // ---------------------------------------------------------------- 常量
 
-/** 默认模型。env `REUBEN_CLOUD_MODEL` 可覆盖（§2）。 */
+/** 默认模型（provider = anthropic）。env `REUBEN_CLOUD_MODEL` 可覆盖（§2）。 */
 export const DEFAULT_MODEL = "claude-opus-4-8";
+
+/**
+ * DeepSeek 的 Anthropic 兼容端点。**它是第二家 provider 的全部实现**——
+ * 协议一致，差别只在 baseURL、模型名与下面注释里那几条语义。
+ */
+export const DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic";
+
+/** DeepSeek 的默认模型（`REUBEN_CLOUD_MODEL` 可覆盖）。 */
+export const DEFAULT_DEEPSEEK_MODEL = "deepseek-flash";
+
+export type ModelProvider = "anthropic" | "deepseek";
 
 /**
  * 单次请求的输出上限。64000 是当前模型的硬上限：给足的理由是"一次 tool_use 里写
@@ -51,6 +70,10 @@ export const DEFAULT_EFFORT = "high";
 
 /** 读 key 的 env 名。**只在 CP 进程里**。 */
 export const ENV_API_KEY = "ANTHROPIC_API_KEY";
+/** DeepSeek 的 key。与 `ANTHROPIC_API_KEY` 并列：谁在、就用谁（见 `selectProvider`）。 */
+export const ENV_DEEPSEEK_API_KEY = "DEEPSEEK_API_KEY";
+/** 显式指定 provider（`anthropic` | `deepseek`）。两个 key 都在时才需要它。 */
+export const ENV_PROVIDER = "REUBEN_CLOUD_PROVIDER";
 /** 覆盖模型的 env 名。 */
 export const ENV_MODEL = "REUBEN_CLOUD_MODEL";
 /** 覆盖 effort 的 env 名（扫 medium/high/xhigh 时用，§2 结尾那条）。 */
@@ -182,6 +205,11 @@ export interface AnthropicModelOptions {
   apiKey: string;
   model?: string;
   effort?: Effort;
+  /**
+   * 覆盖 API 端点。给 DeepSeek 用（它说的是同一套 Messages 协议）。
+   * 缺省走 SDK 自己的 api.anthropic.com。
+   */
+  baseURL?: string;
   /** 打开 adaptive thinking。默认开（§2）。关掉只有一个理由：测试要可预测的输出形状。 */
   thinking?: boolean;
   /** 注入 SDK 客户端（测试用；生产不走这条）。 */
@@ -201,7 +229,12 @@ export class AnthropicModelClient implements ModelClient {
     this.model = options.model ?? DEFAULT_MODEL;
     this.#effort = options.effort ?? DEFAULT_EFFORT;
     this.#thinking = options.thinking ?? true;
-    this.#client = options.client ?? new Anthropic({ apiKey: options.apiKey });
+    this.#client =
+      options.client ??
+      new Anthropic({
+        apiKey: options.apiKey,
+        ...(options.baseURL === undefined ? {} : { baseURL: options.baseURL }),
+      });
   }
 
   async create(request: ModelRequest): Promise<ModelResponse> {
@@ -242,7 +275,7 @@ export class AnthropicModelClient implements ModelClient {
   }
 }
 
-/** 从 env 建一个客户端。缺 key → `config_missing`（**不**给默认 key、不延迟到第一轮）。 */
+/** 从 env 建一个 Anthropic 客户端。缺 key → `config_missing`（**不**给默认 key、不延迟到第一轮）。 */
 export function anthropicFromEnv(env: NodeJS.ProcessEnv = process.env): AnthropicModelClient {
   const apiKey = env[ENV_API_KEY] ?? "";
   if (apiKey === "") {
@@ -255,6 +288,106 @@ export function anthropicFromEnv(env: NodeJS.ProcessEnv = process.env): Anthropi
     ...(rawModel === undefined || rawModel === "" ? {} : { model: rawModel }),
     ...(isEffort(effort) ? { effort } : {}),
   });
+}
+
+/**
+ * 一个 provider 选择结果。**只有模型名与 key 的出处**——不含客户端，因为
+ * `selectProvider` 是无副作用的纯判断，测试与 `@live` 层都靠它提前知道“有没有凭据”。
+ */
+export interface ProviderSelection {
+  provider: ModelProvider;
+  /** 这次要用的模型名（`REUBEN_CLOUD_MODEL` 有值时是它）。 */
+  model: string;
+  /** 这个 provider 需要的 env 名——报错时要说清缺的是哪一个。 */
+  apiKeyEnv: string;
+}
+
+/**
+ * 选 provider。**这是“多 provider”的全部——没有注册表、没有插件**（§2 的边界）。
+ *
+ * 优先级（顺序就是排查问题时的顺序）：
+ *  1. `REUBEN_CLOUD_PROVIDER` 显式指定（两个 key 都在时唯一的确定性来源）；
+ *  2. `REUBEN_CLOUD_MODEL` 的前缀（`deepseek-*` → deepseek，`claude-*` → anthropic）；
+ *  3. 哪个 key 在就用哪个（Anthropic 在前——它是 §2 的文档默认值）；
+ *  4. 都没有 → `null`（调用方报一句同时提到两个 env 的错）。
+ *
+ * 显式指定时不检查 key 在不在：让 `modelFromEnv()` 去报“缺 DEEPSEEK_API_KEY”比在这里
+ * 报“没有可用凭据”可行动得多。
+ *
+ * @returns `null` = 环境里一件事都没说（既没 provider、也没模型名、也没任何 key）。
+ * @throws `ModelError(config_missing)` 当显式指定的 provider 名不认识时。
+ */
+export function selectProvider(env: NodeJS.ProcessEnv = process.env): ProviderSelection | null {
+  const explicit = (env[ENV_PROVIDER] ?? "").trim().toLowerCase();
+  if (explicit !== "") {
+    if (explicit !== "anthropic" && explicit !== "deepseek") {
+      throw new ModelError("config_missing", `${ENV_PROVIDER} 只认 anthropic / deepseek，收到 ${JSON.stringify(explicit)}`);
+    }
+    return { provider: explicit, model: modelFor(explicit, env), apiKeyEnv: keyEnvFor(explicit) };
+  }
+
+  const rawModel = (env[ENV_MODEL] ?? "").trim();
+  if (rawModel.startsWith("deepseek")) {
+    return { provider: "deepseek", model: rawModel, apiKeyEnv: ENV_DEEPSEEK_API_KEY };
+  }
+  if (rawModel.startsWith("claude")) {
+    return { provider: "anthropic", model: rawModel, apiKeyEnv: ENV_API_KEY };
+  }
+
+  if ((env[ENV_API_KEY] ?? "") !== "") {
+    return { provider: "anthropic", model: modelFor("anthropic", env), apiKeyEnv: ENV_API_KEY };
+  }
+  if ((env[ENV_DEEPSEEK_API_KEY] ?? "") !== "") {
+    return { provider: "deepseek", model: modelFor("deepseek", env), apiKeyEnv: ENV_DEEPSEEK_API_KEY };
+  }
+  return null;
+}
+
+/**
+ * 从 env 建一个模型客户端，provider 由 `selectProvider()` 决定。
+ *
+ * 【两个 provider 的语义差异，写在这里免得日后有人对着代码猜】
+ *  - **缓存**：Anthropic 要显式 `cache_control` 断点（我们打在 system 最后一块上）；
+ *    DeepSeek 是**自动**上下文缓存，但请求形状与 Anthropic 逐字相同——`cache_control`
+ *    被忽略，不影响正确性。所以两边都报 `cache_read_input_tokens`，而 DeepSeek 的
+ *    `cache_creation_input_tokens` 恒为 0。
+ *  - **`refusal`**：DeepSeek 不会返回这个 `stop_reason`（循环里的分支留着，是防御）。
+ *  - **`output_config.effort`**：两家都认；`temperature` 我们一律不传（Anthropic 上会 400，
+ *    DeepSeek 上支持但传了就是另一份默认值）。
+ *
+ * @throws `ModelError(config_missing)` 环境里没有可用凭据，或选中的 provider 缺 key。
+ */
+export function modelFromEnv(env: NodeJS.ProcessEnv = process.env): AnthropicModelClient {
+  const selection = selectProvider(env);
+  if (selection === null) {
+    throw new ModelError(
+      "config_missing",
+      `没有可用的模型凭据：设 ${ENV_DEEPSEEK_API_KEY} 或 ${ENV_API_KEY}（两个都有时用 ${ENV_PROVIDER} 明确选一个）`,
+    );
+  }
+  const apiKey = env[selection.apiKeyEnv] ?? "";
+  if (apiKey === "") {
+    throw new ModelError("config_missing", `provider=${selection.provider} 需要 ${selection.apiKeyEnv}`);
+  }
+  const effort = env[ENV_EFFORT];
+  const common = {
+    apiKey,
+    model: selection.model,
+    ...(isEffort(effort) ? { effort } : {}),
+  };
+  return selection.provider === "deepseek"
+    ? new AnthropicModelClient({ ...common, baseURL: DEEPSEEK_BASE_URL })
+    : new AnthropicModelClient(common);
+}
+
+function modelFor(provider: ModelProvider, env: NodeJS.ProcessEnv): string {
+  const raw = (env[ENV_MODEL] ?? "").trim();
+  if (raw !== "") return raw;
+  return provider === "deepseek" ? DEFAULT_DEEPSEEK_MODEL : DEFAULT_MODEL;
+}
+
+function keyEnvFor(provider: ModelProvider): string {
+  return provider === "deepseek" ? ENV_DEEPSEEK_API_KEY : ENV_API_KEY;
 }
 
 /** 循环要用的默认单轮输出上限：`REUBEN_CLOUD_MAX_TOKENS` 可覆盖，硬顶在 `MAX_MODEL_OUTPUT_TOKENS`。 */

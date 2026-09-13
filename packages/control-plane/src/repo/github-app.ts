@@ -208,21 +208,7 @@ export class GithubAppCredentials {
       throw new RepoError("config_missing", `GitHub App 配置不全：缺 ${missing.join("、")}`, { details: { missing } });
     }
 
-    let privateKey = inlineKey ?? "";
-    if (privateKey === "") {
-      try {
-        privateKey = await readFile(keyPath!, "utf8");
-      } catch (error) {
-        throw new RepoError("config_invalid", `读不到 ${ENV_PRIVATE_KEY_PATH}=${keyPath}：${messageOf(error)}`, {
-          details: { path: path.resolve(keyPath!) },
-        });
-      }
-    }
-    // env 里的换行常常被写成字面量 `\n`（`.env` 文件、CI secret）。只有"整串里
-    // 一个真换行都没有"时才替换——否则一份正常的 PEM 会被二次转义。
-    if (privateKey.includes("\\n") && !privateKey.includes("\n")) privateKey = privateKey.replace(/\\n/g, "\n");
-    assertPrivateKeyParses(privateKey);
-
+    const privateKey = await privateKeyFromEnv(env);
     return new GithubAppCredentials({ appId: appId!, installationId: installationId!, privateKey, ...options });
   }
 
@@ -292,6 +278,74 @@ export function assertPrivateKeyParses(privateKey: string): void {
       details: { hint: "PEM 文本（含 BEGIN/END 行），不是路径；env 里的 \\n 会被还原" },
     });
   }
+}
+
+/**
+ * 仓库根（`packages/control-plane/src/repo` 往上四级：`repo → src → control-plane → packages → 根`）。
+ * **只用于相对私钥路径的兜底解析**：
+ * `.env` 是整个仓库共用的一份，而 npm workspace 脚本的 cwd 在 `packages/control-plane`、
+ * 根目录脚本的 cwd 在仓库根——同一个 `./github-app.pem` 不可能同时对两边都对。
+ */
+const REPO_ROOT = path.resolve(import.meta.dirname, "../../../..");
+
+/**
+ * 私钥路径的候选列表，按顺序试。
+ *
+ * 绝对路径只有一个候选；相对路径先按**进程 cwd**（`agent:run` 在仓库根，它是对的），
+ * 再退到**仓库根**（`test:live` / `test:integration` 的 cwd 在 `packages/control-plane`，
+ * 这一步把它们救回来）。两个都不存在时错误里会把两条路径都列出来——
+ * "找不到文件"最难受的就是不知道该把它放哪。
+ */
+export function keyPathCandidates(
+  keyPath: string,
+  cwd: string = process.cwd(),
+  repoRoot: string = REPO_ROOT,
+): string[] {
+  if (path.isAbsolute(keyPath)) return [keyPath];
+  return [path.resolve(cwd, keyPath), path.resolve(repoRoot, keyPath)];
+}
+
+/**
+ * 从 env 读 PEM 私钥（`GITHUB_APP_PRIVATE_KEY` 内联，或 `GITHUB_APP_PRIVATE_KEY_PATH` 指的
+ * 文件）。**读、转义、验解析三件事只在这一处**。
+ *
+ * 单独导出是因为 `scripts/github-app-installations.ts` 需要在拿到 installation id **之前**
+ * 就用私钥签 JWT（它只缺 installation id，别的都该能建），而那份脚本不该再抄一遍这里的规矩。
+ */
+export async function privateKeyFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const inlineKey = env[ENV_PRIVATE_KEY];
+  const keyPath = env[ENV_PRIVATE_KEY_PATH];
+  if ((inlineKey === undefined || inlineKey === "") && (keyPath === undefined || keyPath === "")) {
+    throw new RepoError("config_missing", `缺 ${ENV_PRIVATE_KEY}（或 ${ENV_PRIVATE_KEY_PATH}）`);
+  }
+
+  let privateKey = inlineKey ?? "";
+  if (privateKey === "") {
+    const candidates = keyPathCandidates(keyPath!);
+    let readPath: string | null = null;
+    let lastError: unknown = null;
+    for (const candidate of candidates) {
+      try {
+        privateKey = await readFile(candidate, "utf8");
+        readPath = candidate;
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (readPath === null) {
+      throw new RepoError(
+        "config_invalid",
+        `读不到 ${ENV_PRIVATE_KEY_PATH}=${keyPath}（试过 ${candidates.join(" 与 ")}）：${messageOf(lastError)}`,
+        { details: { path: keyPath, tried: candidates } },
+      );
+    }
+  }
+  // env 里的换行常常被写成字面量 `\n`（`.env` 文件、CI secret）。只有"整串里
+  // 一个真换行都没有"时才替换——否则一份正常的 PEM 会被二次转义。
+  if (privateKey.includes("\\n") && !privateKey.includes("\n")) privateKey = privateKey.replace(/\\n/g, "\n");
+  assertPrivateKeyParses(privateKey);
+  return privateKey;
 }
 
 // ---------------------------------------------------------------- 错误映射

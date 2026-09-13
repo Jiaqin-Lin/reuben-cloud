@@ -27,6 +27,8 @@ import { createWriteStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Readable } from "node:stream";
+import type { LogFn } from "../log.ts";
+import { noopLog } from "../log.ts";
 import { RepoError } from "./types.ts";
 import type { RepoErrorReason } from "./types.ts";
 
@@ -54,6 +56,14 @@ export const GIT_STDERR_TAIL_BYTES = 64 * 1024;
  *    于是"token 到底有没有被用上"变得不可知，而 401 用例在某些机器上不成立。
  *  - `core.autocrlf=false`：clone / apply / diff 三个环节的行为都不随宿主漂移。
  *  - `commit.gpgsign=false`：CI runner 上没有签名密钥，不该因为宿主的全局配置挂掉。
+ *  - `http.lowSpeedLimit` / `http.lowSpeedTime`：弱网（跨国 / 代理）访问 github.com 时连接
+ *    会**挂住**——不报错、也不传字节，而 curl 默认没有任何超时，于是唯一的兜底是我们自己
+ *    的墙钟 kill（60s–300s 全白等）。这两项让它「1 KB/s 以下持续 20 秒就断开」，
+ *    失败才变得可判定——`retryTransientGit` 正是认这个信号重试的。
+ *    （真跑 GitHub 的 live 用例踩到的：同一个 token 的 ls-remote 能连续几次卡死 60s，
+ *    而匿名请求一秒内就回。窗口一开始写的 60 秒，实测太长了：一个死连接要占满 60 秒，
+ *    再乘上 3 次重试，一次 live 跑能拖到 6 分钟——20 秒已经足够区分"慢"与"死"，
+ *    真正在传的链路不会低于 1 KB/s。）
  */
 export const BASE_GIT_CONFIG: readonly string[] = [
   "--no-pager",
@@ -65,6 +75,10 @@ export const BASE_GIT_CONFIG: readonly string[] = [
   "core.safecrlf=false",
   "-c",
   "commit.gpgsign=false",
+  "-c",
+  "http.lowSpeedLimit=1000",
+  "-c",
+  "http.lowSpeedTime=20",
 ];
 
 /**
@@ -86,8 +100,26 @@ export const DIFF_GIT_CONFIG: readonly string[] = [
   "diff.interHunkContext=0",
 ];
 
-/** `git env` 里从宿主透传的键。别的都不继承（理由见 `gitEnv`）。 */
-const ENV_PASSTHROUGH = ["PATH", "HOME", "TMPDIR"] as const;
+/**
+ * `git env` 里从宿主透传的键。别的都不继承（理由见 `gitEnv`）。
+ *
+ * 代理三个变量（大小写都收）是**必须**的：CP 自己也要直连 github.com，而在需要代理的
+ * 网络里，没有它们就是"每两三次卡一次、每次卡到墙钟超时"。真跑 GitHub 的 live 用例踩到过：
+ * 本机明明有 7890 端口的代理，git 却一直在直连（因为这里把变量滤掉了）。
+ * `NO_PROXY` 同样重要——fixture 的 smarthttp 服务器与沙箱都在 127.0.0.1，不能被代理带走。
+ * （沙箱自己的出网代理是另一套东西：Phase 6 的 egress-proxy，与这里无关。）
+ */
+const ENV_PASSTHROUGH = [
+  "PATH",
+  "HOME",
+  "TMPDIR",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+] as const;
 
 // ---------------------------------------------------------------- 进程
 
@@ -215,6 +247,78 @@ function emptyResult(overrides: Partial<GitRunResult>): GitRunResult {
     stdoutSha256: null,
     ...overrides,
   };
+}
+
+/** `retryTransientGit` 的旋钮。 */
+export interface TransientRetryOptions {
+  /** 总尝试次数（含第一次）。默认 3。 */
+  attempts?: number;
+  /** 两次尝试之间的等待。默认 1s。 */
+  delayMs?: number;
+  /** 记日志（重试前记一条 warn）。 */
+  log?: LogFn;
+  /** 日志里的动作名，例如 `ls-remote reuben-cloud/x`。 */
+  describe?: string;
+}
+
+/**
+ * 弱网读操作的缺省重试次数与间隔。
+ *
+ * 4 次是实测定的：这台机器到 github.com 的连接大约每 2 次就有 1 次卡在**请求建立阶段**
+ * （HTTP/1.1 与 HTTP/2 一样，`http.lowSpeed*` 也拦不到——它只管传输阶段），
+ * 单次成功的概率很低；4 次能把“一次发布里每个远端操作都能成功”抬到 90% 以上，
+ * 而每次尝试的代价很小（时限在调用方，都是十几秒）。
+ */
+export const GIT_TRANSIENT_ATTEMPTS = 4;
+export const GIT_TRANSIENT_RETRY_DELAY_MS = 1_000;
+
+/**
+ * 弱网 / 代理导致的瞬时失败（**可重试**）。
+ *
+ * 只认这几类字符串：认证失败（401）、仓库不存在（404）、分支保护…… 都是**确定性**的，
+ * 重试一百次也一样。把它们和网络抖动分开是重试的前提——不分开的重试只是把错误延后。
+ */
+export function looksLikeTransientNetworkFailure(stderr: string): boolean {
+  return /could not resolve host|failed to connect|connection timed out|couldn't connect|operation timed out|recv failure|empty reply from server|ssl_error|stream error|unexpected eof|hung up unexpectedly|rpc failed|connection reset|too slow|bytes\/sec/i.test(
+    stderr,
+  );
+}
+
+/** 这个错误值不值得重试。`git_timeout` 算（我们的墙钟到点 / lowSpeed 断开），其他看 stderr。 */
+export function isTransientGitError(error: unknown): boolean {
+  if (!(error instanceof RepoError)) return false;
+  if (error.reason === "git_timeout") return true;
+  if (error.reason !== "git_failed") return false;
+  const stderr = typeof error.details["stderr"] === "string" ? error.details["stderr"] : "";
+  return looksLikeTransientNetworkFailure(stderr);
+}
+
+/**
+ * 把一次**只读的**远端操作重试几次（`ls-remote` / `fetch`）。
+ *
+ * 【重试的边界】只用于读：`ls-remote`、`fetch`。**push 绝不在这里重试**——
+ * 「超时」对写操作有两种含义（请求根本没发出去 / 发出去了但响应丢了），重试可能把一个
+ * 已经成功的推送再推一遍、也可能把一个失败的当成成功的。写操作失败了就如实上报，
+ * 由人重跑（重跑本来就是幂等的：同一个 Task 同一条分支同一条 PR）。
+ */
+export async function retryTransientGit<T>(fn: () => Promise<T>, options: TransientRetryOptions = {}): Promise<T> {
+  const attempts = Math.max(1, options.attempts ?? GIT_TRANSIENT_ATTEMPTS);
+  const delayMs = options.delayMs ?? GIT_TRANSIENT_RETRY_DELAY_MS;
+  const log = options.log ?? noopLog;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt >= attempts || !isTransientGitError(error)) throw error;
+      log(
+        "warn",
+        `${options.describe ?? "git 远端操作"}失败（${(error as RepoError).reason}），${delayMs}ms 后重试（第 ${attempt}/${attempts - 1} 次）`,
+      );
+      await new Promise((resolve) => {
+        setTimeout(resolve, delayMs);
+      });
+    }
+  }
 }
 
 /**
@@ -403,6 +507,16 @@ export function looksLikeLeaseRejection(stderr: string): boolean {
 /** push 被拒（non-fast-forward / fetch first）。 */
 export function looksLikePushRejection(stderr: string): boolean {
   return /non-fast-forward/i.test(stderr) || /fetch first/i.test(stderr) || /\[rejected\]/i.test(stderr);
+}
+
+/**
+ * 远端因为**分支保护规则**拒了这次 push（Phase 12 的失败模式表）：
+ * GitHub 的 `remote: error: GH006: Protected branch update failed`，或语言/版本不同的
+ * `protected branch` / `branch protection` 措辞。
+ * 它和 lease 被拒是两件事：前者要人去改保护规则，后者说明有人动过分支。
+ */
+export function looksLikeProtectedBranch(stderr: string): boolean {
+  return /GH006/i.test(stderr) || /protected branch/i.test(stderr) || /branch protection/i.test(stderr);
 }
 
 function firstLines(text: string): string {

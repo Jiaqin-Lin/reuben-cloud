@@ -1,33 +1,35 @@
 /**
- * Phase 11 · 手工验收：给一个真实 issue，产出一个 patch（spec §K 第 9 步）。
+ * Phase 11/12 · 手工验收：给一个真实 issue，跑完产出一个 patch（或一条 PR）。
  *
  * 这不是产品代码，是把已经存在的零件按生产顺序串起来的一次性驱动：
- *   建沙箱 → clone → 灌入 → 跑 agent 循环 → 取 diff → 落 patch → 销毁沙箱
+ *   建沙箱 → clone → 灌入 → 跑 agent 循环 → 验证 → 取改动 → （可选）commit + push + PR → 销毁沙箱
  * 每一步用的都是 `docs/sandbox-spec.md` 里那几个 Phase 的实现（manager / repo / agent），
- * 所以它同时是"这些零件能不能拼起来"的验证。
+ * 而"取改动之后怎么办"那一段与集成测试共用 `agent/run.ts` 的 `finishRun()`——
+ * 脚本与测试走同一条生产路径，才不会出现"手工能跑、测试测的是另一份"的漂移。
  *
  * 【用法】
  *   # 先起依赖：Postgres（状态机）+ MinIO（可选，存 transcript 与产出）
  *   npm run dev:up && export DATABASE_URL=$(npm run --silent db:url)
- *   export ANTHROPIC_API_KEY=sk-...
+ *   # 模型凭据写在仓库根的 .env（npm run agent:run 会自动读它）
+ *   #   DEEPSEEK_API_KEY=sk-...  REUBEN_CLOUD_PROVIDER=deepseek  REUBEN_CLOUD_MODEL=deepseek-flash
  *   npm run build:image                       # 沙箱镜像（第一次要跑）
  *   npm run proxy:up                          # 出网代理：模型要装依赖时用它
  *
- *   # 本地仓库（最省事，不需要 GitHub App）
+ *   # ① 本地仓库 → 只产一个 patch（最省事，不需要 GitHub App）
  *   node scripts/agent-run.ts --local ~/code/my-project --base HEAD \
+ *     --verify "npm test" \
  *     --issue "npm test 里 login.spec.ts 的第三条用例失败了，修好它"
  *
- *   # GitHub 仓库（需要 GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY_PATH / GITHUB_APP_INSTALLATION_ID）
- *   node scripts/agent-run.ts --repo owner/name --issue-file issue.md
+ *   # ② GitHub 仓库 → 一条 draft PR（需要 GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY_PATH /
+ *   #    GITHUB_APP_INSTALLATION_ID；同一个 --task-id 重跑会更新同一条 PR）
+ *   node scripts/agent-run.ts --repo owner/name --issue-file issue.md \
+ *     --verify "npm test" --pr
  *
  *   # 看它到底干了什么：--keep 留着沙箱（可以 docker exec 进去看），
  *   # transcript 在 /tmp/reuben-cloud-cp/<runId>/transcript.jsonl
- *
- * 【它不做的事】不 commit、不 push、不建 PR —— 那些是 Phase 12。这里只产出 patch。
  */
 
 import { readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
@@ -41,8 +43,10 @@ import { artifactStoreFromEnv } from "../packages/control-plane/src/artifacts/st
 import { cloneRepo, removeRunDir } from "../packages/control-plane/src/repo/clone.ts";
 import { githubCloneUrl, GithubAppCredentials, parseRepoRef } from "../packages/control-plane/src/repo/github-app.ts";
 import { injectRepo } from "../packages/control-plane/src/repo/inject.ts";
-import { anthropicFromEnv, maxTokensFromEnv } from "../packages/control-plane/src/agent/model.ts";
+import { OctokitPullRequestApi } from "../packages/control-plane/src/repo/pr.ts";
+import { maxTokensFromEnv, modelFromEnv } from "../packages/control-plane/src/agent/model.ts";
 import { runAgentLoop } from "../packages/control-plane/src/agent/loop.ts";
+import { finishRun, taskIdForIssue } from "../packages/control-plane/src/agent/run.ts";
 import { Transcript } from "../packages/control-plane/src/agent/transcript.ts";
 import { REPO_DIR, buildSystemPrompt } from "../packages/control-plane/src/agent/prompt.ts";
 import { createToolkit } from "../packages/control-plane/src/agent/tools/index.ts";
@@ -58,6 +62,12 @@ interface Args {
   issue: string;
   base: string | null;
   out: string;
+  taskId: string | null;
+  attempt: number;
+  baseBranch: string | null;
+  verify: string | null;
+  pr: boolean;
+  draft: boolean;
   keep: boolean;
   maxTurns: number;
 }
@@ -69,6 +79,12 @@ function parseArgs(argv: string[]): Args {
     issue: "",
     base: null,
     out: "agent-patch.diff",
+    taskId: null,
+    attempt: 1,
+    baseBranch: null,
+    verify: null,
+    pr: false,
+    draft: true,
     keep: false,
     maxTurns: 40,
   };
@@ -99,8 +115,29 @@ function parseArgs(argv: string[]): Args {
       case "--out":
         args.out = next();
         break;
+      case "--task-id":
+        args.taskId = next();
+        break;
+      case "--attempt":
+        args.attempt = parsePositiveInt(current, next());
+        break;
+      case "--base-branch":
+        args.baseBranch = next();
+        break;
+      case "--verify":
+        args.verify = next();
+        break;
+      case "--pr":
+        args.pr = true;
+        break;
+      case "--draft":
+        args.draft = true;
+        break;
+      case "--no-draft":
+        args.draft = false;
+        break;
       case "--max-turns":
-        args.maxTurns = Number(next());
+        args.maxTurns = parsePositiveInt(current, next());
         break;
       case "--keep":
         args.keep = true;
@@ -116,23 +153,39 @@ function parseArgs(argv: string[]): Args {
   }
   if (args.local === null && args.repo === null) throw new Error("必须给 --local 或 --repo");
   if (args.issue.trim() === "") throw new Error("必须给 --issue 或 --issue-file");
+  // PR 只能建在真远端上：`--local` 的 remote 是宿主目录，没有地方建 PR（也推不上去）。
+  if (args.pr && args.repo === null) throw new Error("--pr 只支持 --repo（本地仓库没有远端可以建 PR）");
   return args;
+}
+
+function parsePositiveInt(flag: string, raw: string): number {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${flag} 必须是正整数，收到 ${raw}`);
+  return value;
 }
 
 function printUsage(): void {
   console.log(`用法：
-  node scripts/agent-run.ts --local <仓库路径> --issue "<issue 正文>" [--base <sha>]
-  node scripts/agent-run.ts --repo <owner/name> --issue-file <文件> [--base <sha>]
+  node scripts/agent-run.ts --local <仓库路径> --issue "<issue 正文>" [选项]
+  node scripts/agent-run.ts --repo <owner/name> --issue-file <文件> [--pr] [选项]
 
 选项：
-  --out <文件>       patch 落点（默认 agent-patch.diff）
-  --max-turns <n>    轮数上限（默认 40）
-  --keep             跑完不销毁沙箱（排障用）
+  --out <文件>          patch 落点（默认 agent-patch.diff）
+  --verify <命令>       在沙箱里跑的验证命令（shell 字符串，结果写进 PR 正文）
+  --pr                  commit + push + 建/更新 draft PR（需要 GitHub App 凭据）
+  --task-id <id>        同一个 Task 固定一条分支/一条 PR（默认按 issue 内容算一个稳定的 id）
+  --attempt <n>         第几次尝试（写进 commit 与 PR 正文，默认 1）
+  --base-branch <名>    PR 的 base（默认问 GitHub / 本地取当前分支）
+  --no-draft            PR 不用 draft（默认 draft）
+  --max-turns <n>       轮数上限（默认 40）
+  --keep                跑完不销毁沙箱（排障用）
 
 环境：
   DATABASE_URL              必填（npm run dev:up && npm run db:url）
-  ANTHROPIC_API_KEY         必填（只在 CP 里）
-  REUBEN_CLOUD_MODEL        可选，默认 claude-opus-4-8
+  DEEPSEEK_API_KEY          模型凭据（或 ANTHROPIC_API_KEY；两个都有时用 REUBEN_CLOUD_PROVIDER 选）
+  REUBEN_CLOUD_PROVIDER     anthropic | deepseek（默认看 key / 模型名前缀）
+  REUBEN_CLOUD_MODEL        可选，默认 deepseek-flash / claude-opus-4-8
+  GITHUB_APP_ID / GITHUB_APP_INSTALLATION_ID / GITHUB_APP_PRIVATE_KEY_PATH   --pr 必填
   SANDBOX_IMAGE             可选，默认 reuben-cloud/sandbox-base:dev
   S3_ENDPOINT/S3_BUCKET/…   可选，给了就把 transcript 与产出上传`);
 }
@@ -169,12 +222,19 @@ async function main(): Promise<void> {
   }
 
   const runId = prefixedId("run");
+  // `--task-id` 的缺省规则在 `agent/run.ts`（脚本 import 即执行，放这里测不了）。
+  const taskId = args.taskId ?? taskIdForIssue(args.issue);
   const image = await resolveImageRef(process.env["SANDBOX_IMAGE"] ?? "reuben-cloud/sandbox-base:dev");
   const store = artifactStoreFromEnv();
   const db = new Db({ connectionString: databaseUrl });
   await runMigrations(db);
 
-  // 出网代理：模型要装依赖时才需要。装不上就记一条警告继续——本地仓库 + 已有依赖
+  // ---- GitHub 凭据（只有 --repo 才可能需要：clone 与 PR 都用它）
+  const ref = args.repo === null ? null : parseRepoRef(args.repo);
+  const credentials = ref === null ? null : await GithubAppCredentials.fromEnv();
+  const freshToken = async (): Promise<string> => (await credentials!.tokenFor(ref!)).token;
+
+  // ---- 出网代理：模型要装依赖时才需要。装不上就记一条警告继续——本地仓库 + 已有依赖
   // 的场景不需要它，为它中断一次真实 Run 不值。
   try {
     const proxy = new EgressProxy({
@@ -195,7 +255,10 @@ async function main(): Promise<void> {
     db,
     provider,
     image,
-    ...(store === null ? {} : { artifacts: { store } }),
+    // `repoPath` 必须给：agent 流程把仓库解到 `/workspace/repo`，而归档的 `/diff` 缺省对着
+    // workspace 根——那时它会回 `not_a_git_repository`，于是 diff 永远不落对象存储
+    // （只降级成一条 warning，不会阻断销毁，所以很容易一直没人发现）。
+    ...(store === null ? {} : { artifacts: { store, repoPath: REPO_DIR } }),
     log,
   });
 
@@ -209,7 +272,7 @@ async function main(): Promise<void> {
     // ---- clone
     const remote =
       args.local === null
-        ? await githubRemoteFor(args.repo!)
+        ? { url: githubCloneUrl(ref!), token: await freshToken() }
         : { url: path.resolve(args.local), token: null };
     const base =
       args.base ??
@@ -226,15 +289,18 @@ async function main(): Promise<void> {
     log("info", `仓库已 clone（base ${clone.baseSha.slice(0, 12)}）`, { dir: clone.dir });
 
     // ---- 灌进沙箱（仓库落在 /workspace/repo：工具层与提示词都按这个路径说话）
-    const injected = await injectRepo({ api: new SandboxApiClient(), target, clone, log });
+    // 【workspaceDir 必须显式传】它缺省是 workspace 根，而 Phase 11 起工具层的相对路径
+    // 按 `REPO_DIR`（/workspace/repo）解析、`GET /diff?path=` 也只看那里。不传的话仓库被解到
+    // `/workspace`，模型只能靠绝对路径"绕"过去，而最后取 diff 会以 `spawn_failed` 失败——
+    // 这条是 §K 第 9 步手工验收第一次真跑时抓到的。
+    const injected = await injectRepo({ api: new SandboxApiClient(), target, clone, workspaceDir: REPO_DIR, log });
     log("info", `仓库已灌入沙箱（${injected.bytes} 字节，HEAD ${injected.headSha.slice(0, 12)}）`);
 
     // ---- 跑循环
     const api = new SandboxApiClient();
     const transcript = await Transcript.create({ runId, log });
     const toolkit = createToolkit({ sandboxId: sandbox.sandboxId, exec: manager, api, target, log });
-    const model = anthropicFromEnv();
-    const textChunks: string[] = [];
+    const model = modelFromEnv();
     log("info", `agent 开始（model=${model.model}，maxTurns=${args.maxTurns}）`);
 
     const result = await runAgentLoop({
@@ -245,42 +311,74 @@ async function main(): Promise<void> {
       system: buildSystemPrompt(),
       maxTurns: args.maxTurns,
       maxTokens: maxTokensFromEnv(),
-      onText: (delta) => {
-        textChunks.push(delta);
-        process.stdout.write(delta);
-      },
+      onText: (delta) => process.stdout.write(delta),
       log,
     });
-    if (textChunks.length > 0) process.stdout.write("\n");
+    if (result.usage.outputTokens > 0) process.stdout.write("\n");
 
-    // ---- 产出：diff → patch 文件
-    const diff = await api.diff(target.endpoint, target.authToken, { base: clone.baseSha, path: REPO_DIR });
-    const patch =
-      diff.truncated && diff.patchLogPath !== null
-        ? await readStream(await api.readRaw(target.endpoint, target.authToken, diff.patchLogPath))
-        : Buffer.from(diff.patch ?? "", "utf8");
-    const outPath = path.resolve(args.out);
-    await mkdir(path.dirname(outPath), { recursive: true });
-    await writeFile(outPath, patch);
-    patchPath = outPath;
-
-    // ---- transcript 上传（配了对象存储才做）
+    // ---- transcript 上传（配了对象存储才做；PR 正文里要放它的位置）
+    let transcriptUrl: string | null = null;
     if (store !== null) {
       const stored = await transcript.upload(store);
+      transcriptUrl = `s3://${store.bucket}/${stored.objectKey}`;
       log("info", `transcript 已上传：${stored.objectKey}（${stored.sizeBytes} 字节）`);
     }
 
+    // ---- 收尾：验证 → 取改动 → （PR 或 patch）。脚本与集成测试共用 `finishRun()`。
+    const baseBranch =
+      args.baseBranch ?? (ref === null ? await localBranchOf(args.local!) : await defaultBranchOf(ref, credentials!));
+    const finished = await finishRun({
+      api,
+      target,
+      clone,
+      run: result,
+      issue: args.issue,
+      taskId,
+      runId,
+      model: model.model,
+      sandboxId: sandbox.sandboxId,
+      repoDir: REPO_DIR,
+      verify: args.verify === null ? null : { cmd: ["bash", "-lc", args.verify] },
+      patchOut: args.out,
+      publish:
+        args.pr && ref !== null && credentials !== null
+          ? {
+              ref,
+              remoteUrl: githubCloneUrl(ref),
+              baseBranch,
+              taskTitle: firstLine(args.issue),
+              token: freshToken,
+              draft: args.draft,
+              attempt: args.attempt,
+              transcriptUrl,
+              retry: { log },
+            }
+          : null,
+      log,
+    });
+    patchPath = finished.patchFile;
+
+    const published = finished.published;
     summary = [
       "",
       "──────────── 结果 ────────────",
       `Run            ${runId}`,
+      `Task           ${taskId}`,
       `挂起原因       ${result.stopReason}（${result.detail}）`,
       `轮数 / 工具调用 ${result.turns} / ${result.toolCalls}`,
       `用量           in=${result.usage.inputTokens} out=${result.usage.outputTokens} ` +
         `cache_read=${result.usage.cacheReadInputTokens} cache_write=${result.usage.cacheCreationInputTokens}`,
-      `改动的文件     ${diff.files.length} 个（+${sum(diff.files.map((file) => file.additions))} / -${sum(diff.files.map((file) => file.deletions))}）`,
-      `patch          ${outPath}（${patch.length} 字节）`,
+      `改动的文件     ${finished.changes.files.length} 个（+${sum(finished.changes.files.map((file) => file.additions))} / -${sum(finished.changes.files.map((file) => file.deletions))}）`,
+      `改动来源       ${finished.changes.source}${finished.changes.fallbackReason === null ? "" : `（回退原因：${finished.changes.fallbackReason}）`}`,
+      `验证           ${describeVerification(finished.verification)}`,
+      `patch          ${patchPath ?? "（未写入）"}`,
       `transcript     ${transcript.path}`,
+      ...(published === null
+        ? ["PR             未创建（没有 --pr）"]
+        : [
+            `PR             #${published.pullRequest.number} ${published.created ? "（新建）" : "（更新）"} ${published.pullRequest.htmlUrl}`,
+            `分支           ${published.push.branch} → ${baseBranch}`,
+          ]),
       `沙箱           ${args.keep ? `保留着：${sandbox.sandboxId}（用完自己 destroy）` : "即将销毁"}`,
       "──────────────────────────────",
     ].join("\n");
@@ -304,22 +402,36 @@ async function main(): Promise<void> {
   if (patchPath === null) process.exitCode = 1;
 }
 
-/** GitHub 模式下现签一个限定到单仓的 installation token（只在 CP 内存里用一次）。 */
-async function githubRemoteFor(repoInput: string): Promise<{ url: string; token: string | null }> {
-  const ref = parseRepoRef(repoInput);
-  const credentials = await GithubAppCredentials.fromEnv();
-  const token = await credentials.tokenFor(ref);
-  return { url: githubCloneUrl(ref), token: token.token };
+/** issue 的第一行当题面（PR 标题 / commit message 用）。太长就截断。 */
+function firstLine(issue: string, maxChars = 72): string {
+  const line = issue.trim().split("\n")[0]!.trim();
+  return line.length > maxChars ? `${line.slice(0, maxChars)}…` : line;
+}
+
+/** 本地仓库的当前分支（`--local` 模式的 base）。detached HEAD 时退回报给 `main`。 */
+async function localBranchOf(dir: string): Promise<string> {
+  try {
+    const branch = (await hostGit(["symbolic-ref", "--short", "HEAD"], path.resolve(dir))).trim();
+    return branch === "" ? "main" : branch;
+  } catch {
+    return "main";
+  }
+}
+
+/** 远端仓库的默认分支（PR 的 base）。**问 GitHub，不猜**：`main` 与 `master` 都可能。 */
+async function defaultBranchOf(ref: { owner: string; repo: string }, credentials: GithubAppCredentials): Promise<string> {
+  const token = (await credentials.tokenFor(ref)).token;
+  return new OctokitPullRequestApi({ token }).getDefaultBranch(ref);
+}
+
+function describeVerification(verification: { passed: boolean; cmd: string[]; state: string; exitCode: number | null } | null): string {
+  if (verification === null) return "没有跑（未提供 --verify）";
+  const code = verification.exitCode === null ? verification.state : `exit ${verification.exitCode}`;
+  return `${verification.passed ? "通过" : "没有通过"}：${verification.cmd.join(" ")}（${code}）`;
 }
 
 function sum(values: number[]): number {
   return values.reduce((total, value) => total + value, 0);
-}
-
-async function readStream(stream: NodeJS.ReadableStream): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks);
 }
 
 await main().catch((error: unknown) => {
