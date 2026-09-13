@@ -49,17 +49,21 @@ Workspace (组织/个人空间)
       ├── Environment   这个仓库的运行环境定义与构建产物（版本化）
       ├── Skill         可复用的能力包（工具 + 提示词 + 约束）
       ├── Memory        这个仓库的长期经验（跨会话）
-      └── Task          一个意图（"修 #123"）
-           └── Run      一次执行尝试（可重试、可并行、可取消）
+      └── Task          一个意图 + 一条长期对话（"修 #123"，可以来回好几轮）
+           ├── Conversation  对话历史（entries 只追加；跨轮、跨沙箱存活）   ← M2
+           └── Run      一次执行（一条用户消息 → 一个沙箱 → 干到停；可重试、可并行、可取消）
                 ├── Session    沙箱实例 = Sandbox + workspace 卷
-                ├── Transcript 完整的模型输入输出 + 工具调用流
+                ├── Transcript 本次执行的模型输入输出 + 工具调用流
                 └── Artifact   产出物：patch / PR / 报告
 ```
 
 **关键区分：**
 - **Task ≠ Run**。Task 是"要做什么"，Run 是"这一次尝试"。同一个 Task 可以有多次 Run（重试、换策略、并行试两种方案）。没有这个区分，重试和对比就无从谈起。
+- **对话是长期的，Run 是易失的**。多轮对话是一等场景（不是"交代一个任务就走"）：用户第二句话进来时起一个**新的 Run**（新沙箱），但对话历史与压缩摘要在同一条 Conversation 里。一轮进行中插话（steering）不新开 Run。实现形态见 [`docs/agent-runtime.md`](docs/agent-runtime.md) §A.1。
+- **每轮结束要把改动持久化**（推到任务分支）：沙箱销毁后，下一轮的仓库起点只能是"上一轮的产出"（M2 起）。
 - **Environment 是一等公民，不是配置项**。它有自己的生命周期、版本、构建日志和健康状态。这是本项目和"随便拉个镜像"的最大区别。
 - **Session 是 Run 的运行时，不是 Run 本身**。一次 Run 一个沙箱，Run 结束即销毁。沙箱是易失的，不持有业务状态——挂起 / 快照 / 跨节点迁移推迟到 M3（见 §3.1）。
+  > 命名提醒：**这里的 Session 指沙箱实例**；pi 的 Session 指对话历史——两份文档里的同一个词不是一个东西，M2 起我们的对话历史叫 Conversation（表名 `sessions`）。
 
 ### 状态机
 
@@ -661,10 +665,10 @@ Debug agent 比 debug 普通程序难十倍，因为不确定性来自模型。*
 > 设计文档：[`docs/agent-runtime.md`](docs/agent-runtime.md) · 实施规格（14 个 Phase、44–59 人日、依赖图）：[`docs/agent-runtime-spec.md`](docs/agent-runtime-spec.md)
 
 **第一部分 · Agent Runtime（对齐 pi：`/Users/reuben/Documents/pi`）**
-- [ ] P1 运行时契约与包拆分（独立 workspace `packages/agent-runtime`）
-- [ ] P2 会话持久化（entries 树 + 工具意图/结算 + usage ledger + model_requests）
+- [ ] P1 运行时契约与包拆分（独立 workspace `packages/agent-runtime`；`startRun` 与 `steer` 两个入口）
+- [ ] P2 会话持久化（**会话长期 + Run 一次执行**：多轮对话跨 Run 连续，含压缩摘要；一轮结束推分支，下一轮从分支接起）
 - [ ] P3 compaction（阈值 / 切点 / split turn / 结构化摘要 / 累积文件清单）
-- [ ] P4 事件统一（`AgentEvent` 唯一事件源，观察窗加上下文面板）
+- [ ] P4 事件统一（`AgentEvent` 唯一事件源，观察窗改成会话视图 + 上下文面板）
 
 **第二部分 · Environment**
 - [ ] P5 环境定义与推断（三层结构；devcontainer 子集 > Dockerfile > 信号）

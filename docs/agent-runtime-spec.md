@@ -19,7 +19,7 @@
 | 类别 | 规则 | 例子 |
 |---|---|---|
 | 数据库表 | 小写 + 下划线，见名知义；不加前缀（已有 `sandboxes` 风格） | `session_entries` / `repo_symbols` |
-| 主键 | `<前缀>_<ulid>`（与既有 `sbx_`/`exe_`/`art_` 一致，时间有序） | `ses_` / `ent_` / `inv_` / `usg_` / `env_` / `bld_` / `mcp_` |
+| 主键 | `<前缀>_<ulid>`（与既有 `sbx_`/`exe_`/`art_` 一致，时间有序） | `ses_`（会话）/ `run_`（一次执行）/ `ent_` / `inv_` / `usg_` / `req_` / `env_` / `bld_` / `mcp_` |
 | 迁移文件 | `三位序号_名字.sql`，只增不改（已执行的迁移永不编辑） | `005_agent_runtime.sql` |
 | TS 文件 | 全小写 + 连字符；一个文件一个主要导出 | `agent-loop.ts` / `cut-point.ts` |
 | 事件类型 | 小写 + 下划线（对齐 pi） | `tool_execution_start` / `message_update` |
@@ -149,7 +149,7 @@ vendor/tree-sitter/*.wasm                # 固定版本 + 记录 sha256（Phase 
 | # | Phase | 部分 | 依赖 | 人日 | 交付后可验证的事 |
 |---|---|---|---|---|---|
 | P1 | 运行时契约与包拆分 | Runtime | — | 3–4 | `agent:run` 行为不变，但循环/工具/提示词独立成包 |
-| P2 | 会话持久化 | Runtime | P1 | 4–5 | 一次 Run 的全部消息/用量/工具调用进 PG，可查询 |
+| P2 | 会话持久化（**会话长期 + Run 一次执行**） | Runtime | P1 | 5–6 | 一次 Run 的全部消息/用量/工具调用进 PG；同一会话能起第二轮 |
 | P3 | compaction | Runtime | P2 | 3–4 | 超长会话自动压缩并继续 |
 | P4 | 事件统一 | Runtime | P3 | 1–2 | 一条事件流；观察窗加上下文面板 |
 | P5 | 环境定义与推断 | Env | — | 4–5 | 三个 fixture 仓库各命中一级推断 |
@@ -196,6 +196,8 @@ P12（P1 之后任意时刻）──► P13 ──► P14
 - `src/prompt/{system,task}.ts`（从 `agent/prompt.ts` 迁出并改成分区组装）
 - CP 侧：`packages/control-plane/src/agent/` 只保留编排（`run.ts`/`events.ts`/`transcript.ts`），
   其余改为从 `@reuben-cloud/agent-runtime` 引入；`scripts/agent-run.ts` 改 import
+- CP 侧两个入口：`startRun(sessionId, userMessage)`（空闲时来了消息 → 起新一轮）与
+  `steer(runId, message)`（一轮进行中插话，注入当前 Run）——见 §A.1 的三层生命周期
 
 ### 具体如何实现
 
@@ -309,6 +311,22 @@ export const MODEL_CATALOG: Record<string, { contextWindow: number; maxTokens: n
 集成测试与 `agent-run` 脚本的入口），内部改为构造 `AgentLoopConfig` 调新循环。兼容层只做参数翻译，
 不复制逻辑；P4 结束后删除。
 
+**8. Run 与 Session 的两个入口（多轮对话的接线点）**
+
+```
+startRun(sessionId, userMessage)          // 空闲时来了消息：新一轮
+  → latestLeaf(sessionId)                 //   从会话当前 leaf 往后追加
+  → appendEntry(user message)             //   （真实的落库在 P2；本 Phase 用内存 store）
+  → 返回一个 runId；同一个循环，只是 context 从 entries 重建而非空数组
+
+steer(runId, message)                     // 一轮进行中插话：注入当前 Run
+  → 队列入 AgentLoopConfig.getSteeringMessages
+  → 不新开 Run、不中断当前工具
+```
+
+**这两个入口的分工必须在 P1 就定下**：它们是"多轮对话"与"中途插话"两个不同场景的接口，
+合起一个就会退化成"每句话都开新一轮"（历史与成本都会失控）。
+
 ### 技术边界
 
 - **不搬** pi 的 harness（operation 状态机 / lanes / forks / navigation / inbox / RPC / 三后端）；
@@ -332,11 +350,12 @@ export const MODEL_CATALOG: Record<string, { contextWindow: number; maxTokens: n
 | 10 | 重复调用检测（M0 的能力，挂在 `beforeToolCall`） | 第 3 次注入提示，第 4 次停止 |
 | 11 | prefix 稳定性 | 同一输入两次构造的 system 字节相同 |
 | 12 | 依赖方向 | 读 import 图断言 agent-runtime 不含 pg/octokit/@aws-sdk |
+| 13 | `startRun` 与 `steer` 的分工 | 空闲时来的消息进新的 Run；一轮进行中来的消息注入当前 Run（不新开） |
 
 ### 验收标准
 
 - `npm test` / `npm run typecheck` 全绿；`agent:run --local <repo> --issue ...` 仍产出 patch；
-- `packages/agent-runtime/test/` 新增 ≥ 15 个用例（上表全部）；
+- `packages/agent-runtime/test/` 新增 ≥ 16 个用例（上表全部）；
 - `git grep` 确认 `control-plane/src/agent/` 里不再有循环与工具实现（只剩编排与兼容层）。
 
 ---
@@ -349,35 +368,56 @@ export const MODEL_CATALOG: Record<string, { contextWindow: number; maxTokens: n
 - `packages/agent-runtime/src/session/{store,memory,entries,export}.ts`
 - `packages/control-plane/src/session/postgres.ts`（`SessionStore` 的 PG 实现）
 - `packages/control-plane/src/session/requests.ts`（`model_requests`：内联 or 对象存储）
-- 接线：`run.ts` 在 Run 开始时创建 session，每轮写 entry/usage，工具调用写 intent/settlement
+- 接线：`run.ts` 在 Run 开始时创建/读取 session，每轮写 entry/usage，工具调用写 intent/settlement；
+  一份 `startRun` 编排（读历史 → 建沙箱 → 跑 → 推送改动 → 关 Run）
 
 ### 具体如何实现
 
 **1. 迁移（005）**
 
+> **这一节是 v1.1 改过的重点**：会话（长期）与 Run（一次执行）是**两张表**。
+> v1 草案把它们合成一张 `run_sessions`，后果是"用户回第二句话就开了一个新会话"。
+
 ```sql
--- 会话头。run_id 可空、无外键：runs 表是 M3 的事（与 Phase 8 的 sandboxes 同一约定）。
-CREATE TABLE run_sessions (
+-- 会话：长期实体，跨 Run 存活。用户的对话历史（entries）挂在它下面。
+CREATE TABLE sessions (
   id            text PRIMARY KEY,               -- ses_<ulid>
-  run_id        text,
-  task_id       text,
+  task_id       text,                           -- 可空：tasks 表是 M3（与 sandboxes 同一约定）
   repo_key      text NOT NULL,                  -- owner/name，不含凭据
-  base_commit   text NOT NULL,
+  base_commit   text NOT NULL,                  -- 会话开始时的 commit
+  head_ref      text,                           -- 会话当前的工作分支（reuben-cloud/<task>）
+  head_commit   text,                           -- 当前分支的 head（下一轮的仓库起点）
   cwd           text NOT NULL,                  -- 沙箱内的仓库根
-  provider      text NOT NULL, model text NOT NULL,
-  env_revision  text,                           -- 用了哪个环境版本（Phase 7）
-  system_prompt text NOT NULL,                  -- 第一轮的 system（后续轮见 model_requests）
+  title         text,                           -- 给 UI 用的一句话（第一轮后生成，可空）
+  leaf_entry_id text,                           -- 当前 leaf；下一轮从这里往后接
   created_at    timestamptz NOT NULL DEFAULT now(),
-  ended_at      timestamptz,
-  stop_reason   text
+  updated_at    timestamptz NOT NULL DEFAULT now()
 );
 
--- 会话树：只追加。
+-- Run：一次执行（一个沙箱）。干完就结束；用户回话是新的 Run。
+CREATE TABLE runs (
+  id             text PRIMARY KEY,              -- run_<ulid>
+  session_id     text NOT NULL REFERENCES sessions (id),
+  sandbox_id     text,                          -- 可空：创建前；M0 的 sandboxes 表已能按它反查
+  start_entry_id text,                          -- 这一轮从哪条 entry 之后开始
+  end_entry_id   text,                          -- 结束时 leaf 在哪（下一轮的起点）
+  provider       text NOT NULL, model text NOT NULL,
+  env_revision   text,                          -- 用了哪个环境版本（Phase 7）
+  status         text NOT NULL,                 -- running | stopped | failed
+  stop_reason    text,                          -- 与 AgentStopReason 同一套取值
+  started_at     timestamptz NOT NULL DEFAULT now(),
+  ended_at       timestamptz,
+  CONSTRAINT runs_status_check CHECK (status IN ('running','stopped','failed'))
+);
+CREATE INDEX runs_session_idx ON runs (session_id, started_at DESC);
+
+-- 对话树：挂在会话上（**不是挂在 Run 上**）。只追加。
 CREATE TABLE session_entries (
   id         text PRIMARY KEY,                 -- ent_<ulid>
-  session_id text NOT NULL REFERENCES run_sessions (id),
+  session_id text NOT NULL REFERENCES sessions (id),
+  run_id     text,                             -- 哪一次执行写的（压缩/自定义条目可空）
   parent_id  text,                             -- 直线；结构上支持分叉（M3）
-  seq        bigserial NOT NULL,               -- 会话内单调（见下）
+  seq        bigserial NOT NULL,               -- 全局单调（排序与分页用）
   type       text NOT NULL,
   payload    jsonb NOT NULL,                   -- AgentMessage 或压缩条目
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -388,8 +428,9 @@ CREATE INDEX session_entries_session_idx ON session_entries (session_id, seq);
 -- 工具调用：意图 → 结算。
 CREATE TABLE tool_invocations (
   id              text PRIMARY KEY,            -- inv_<ulid>
-  session_id      text NOT NULL REFERENCES run_sessions (id),
-  turn            integer NOT NULL,
+  session_id      text NOT NULL REFERENCES sessions (id),
+  run_id          text NOT NULL,
+  turn            integer NOT NULL,            -- 本次执行内的模型往返序号
   source_index    integer NOT NULL,            -- 在 assistant 消息里的位置（顺序恢复要用）
   tool            text NOT NULL,
   args            jsonb NOT NULL,
@@ -402,14 +443,14 @@ CREATE TABLE tool_invocations (
   ended_at        timestamptz,
   CONSTRAINT tool_invocations_status_check CHECK (status IN ('intent','settled','interrupted'))
 );
-CREATE INDEX tool_invocations_session_idx ON tool_invocations (session_id, turn, source_index);
+CREATE INDEX tool_invocations_run_idx ON tool_invocations (run_id, turn, source_index);
 
 -- 用量账本：只追加。主调用 / 压缩摘要 / 环境自愈 / 技能分析全在这里。
 CREATE TABLE usage_ledger (
   id                text PRIMARY KEY,          -- usg_<ulid>
   session_id        text,                      -- 环境自愈可能没有 session
   run_id            text,
-  kind              text NOT NULL,             -- main | compaction | env_build | skill_analysis
+  kind              text NOT NULL,             -- main | compaction | env_build | embedding
   provider          text NOT NULL, model text NOT NULL,
   input_tokens      bigint NOT NULL DEFAULT 0,
   output_tokens     bigint NOT NULL DEFAULT 0,
@@ -420,11 +461,13 @@ CREATE TABLE usage_ledger (
   at                timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX usage_ledger_session_idx ON usage_ledger (session_id, at);
+CREATE INDEX usage_ledger_run_idx ON usage_ledger (run_id, at);
 
 -- 每轮模型调用看到的编译产物（可回放）。
 CREATE TABLE model_requests (
   id            text PRIMARY KEY,              -- req_<ulid>
-  session_id    text NOT NULL REFERENCES run_sessions (id),
+  session_id    text NOT NULL REFERENCES sessions (id),
+  run_id        text NOT NULL,
   turn          integer NOT NULL,
   compiled_hash text NOT NULL,
   sections      jsonb NOT NULL,                -- [{name, tokens, hash}]
@@ -436,6 +479,7 @@ CREATE TABLE model_requests (
   bytes         integer NOT NULL,
   at            timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX model_requests_run_idx ON model_requests (run_id, turn);
 ```
 
 **`seq` 为什么用 `bigserial` 而不是"会话内自增"**：全局单调即可满足排序与分页（pi 的 seq 也是
@@ -446,15 +490,27 @@ storage-assigned 全局序号）。会话内顺序用 `(session_id, seq)` 表达
 
 ```ts
 export interface SessionStore {
-  createSession(input: NewSession): Promise<SessionRef>
-  appendEntry(sessionId: string, entry: NewEntry, opts?: { usage?: UsageRow }): Promise<string>  // 一个事务
-  listEntries(sessionId: string, opts?: { limit?: number; afterSeq?: number }): Promise<StoredEntry[]>
-  beginToolInvocation(inv: NewInvocation): Promise<string>            // intent，一个事务
+  // 会话（长期）
+  createSession(input: NewSession): Promise<SessionRef>       // 建会话（第一轮之前）
+  getSession(sessionId: string): Promise<StoredSession | null>  // 含 leaf_entry_id / head_ref / head_commit
+  updateSessionHead(sessionId: string, patch: { leafEntryId?: string; headRef?: string; headCommit?: string; title?: string }): Promise<void>
+  listSessions(opts?: { limit?: number; cursor?: string }): Promise<StoredSession[]>   // UI 的会话列表
+
+  // 对话树（挂在会话上，只追加）
+  appendEntry(sessionId: string, runId: string | null, entry: NewEntry, opts?: { usage?: UsageRow }): Promise<string>  // 一个事务
+  listEntries(sessionId: string, opts?: { limit?: number; afterSeq?: number; beforeSeq?: number }): Promise<StoredEntry[]>
+
+  // Run（一次执行）
+  startRun(input: NewRun): Promise<string>                    // 记录 start_entry_id
+  endRun(runId: string, patch: { status: RunStatus; stopReason: string; endEntryId: string; sandboxId?: string }): Promise<void>
+  listRuns(sessionId: string): Promise<StoredRun[]>
+
+  // 工具调用 / 用量 / 编译产物
+  beginToolInvocation(inv: NewInvocation): Promise<string>    // intent，一个事务
   settleToolInvocation(id: string, result: { entry: NewEntry; isError: boolean; bytes: number }): Promise<void>
   recordUsage(row: UsageRow): Promise<void>
   recordRequest(row: NewRequest): Promise<void>
-  listInvocations(sessionId: string, status?: InvocationStatus): Promise<StoredInvocation[]>
-  endSession(sessionId: string, stopReason: string): Promise<void>
+  listInvocations(runId: string, status?: InvocationStatus): Promise<StoredInvocation[]>
 }
 ```
 
@@ -476,15 +532,38 @@ serialized_messages ≤ 256 KiB  →  inline_messages（jsonb）
 `compiled_hash` = sha256(sections 的 hash 列表 + system + tools_hash + messages 序列化)。**相同输入必须
 得到相同 hash**——它是"上下文是否真的稳定"的唯一客观证据（也是缓存命中分析的基础）。
 
-**5. JSONL 降级为导出格式**
+**5. 续轮（多轮对话的数据面）**
 
-`session/export.ts` 提供 `exportSession(store, sessionId)` → 与 M0 的 `transcript.jsonl` **逐字段兼容**
-（`run_start`/`request`/`response`/`tool_call`/`note`/`run_end`）。`agent:run` 增加 `--export <path>`，
+```
+startRun(sessionId, userMessage):
+  ① session = getSession()             // leaf_entry_id / head_ref / head_commit
+  ② appendEntry(user message)          // parent = leaf_entry_id；更新 leaf
+  ③ startRun({ session_id, start_entry_id: 上一步的 parent })
+  ④ 重建上下文：listEntries(sessionId) → buildContextEntries（含压缩条目）
+  ⑤ 建沙箱时仓库起点 = session.head_commit（不是 base_commit）
+  ⑥ 跑循环；结束时
+       · 有改动 → 推送到 reuben-cloud/<task> 分支 → updateSessionHead(head_commit)
+       · endRun({ end_entry_id, stop_reason }) → updateSessionHead(leaf_entry_id)
+```
+
+**两个容易写错的点**：
+
+1. **仓库起点是 `head_commit` 而不是 `base_commit`**：沙箱销毁后改动只在分支上；
+   不这么做，第二轮会在原始代码上重做一遍（而且看起来"第一轮白干了"）。
+2. **没有改动的一轮也要更新 leaf**：用户可能只是问了一句"这段代码干嘛的"，
+   那一轮没有任何文件改动，但历史必须接得上（下一轮要能看到这轮的回答）。
+
+**6. JSONL 降级为导出格式**
+
+`session/export.ts` 提供 `exportSession(store, sessionId)`（**整个会话，跨 Run**）→ 与 M0 的
+`transcript.jsonl` **逐字段兼容**（`run_start`/`request`/`response`/`tool_call`/`note`/`run_end`），
+每条前面加一行 `{"type":"run","runId":…}` 作为轮次分隔。`agent:run` 增加 `--export <path>`，
 `--keep` 时自动导出。观察窗（P4 之前）继续读内存缓冲，不受影响。
 
 ### 技术边界
 
 - **不做恢复**：`status='intent'` 的孤儿只在 M3 处理；M2 只保证它们**可见**；
+- **不做调度**：会话/运行可以连续起（`startRun`），但没有队列、优先级、并发限制与触发器（M3）；
 - 不做 `values/lists` 表（没有消费者：session 名、队列都不是持久状态）；
 - entries 不可修改、不可删除（M4 的合规删除不在范围内）；
 - 不在 `session_entries.payload` 里存二进制（图片等大对象走对象存储，payload 存引用）。
@@ -501,12 +580,17 @@ serialized_messages ≤ 256 KiB  →  inline_messages（jsonb）
 | 6 | 导出兼容 | 10 个真实 Run 的导出通过 M0 JSONL 的 schema 断言（字段名一致） |
 | 7 | 压缩条目 | `type='compaction'` 的 payload 有 `firstKeptEntryId` / `tokensBefore` / `details` |
 | 8 | 迁移可重跑 | `db:migrate` 两次幂等（沿用 M0 的迁移测试） |
+| 9 | 续轮上下文 | 第 1 轮结束后 `startRun` 第二轮 → 第二轮的 messages 里含第一轮的 entries（结构化断言） |
+| 10 | 续轮起点 | 第 1 轮推送了分支 → 第二轮的 `head_commit` 是那个分支的 head（不是 `base_commit`） |
+| 11 | 空改动的一轮 | 没有任何文件改动的一轮也能正常 `endRun` 并更新 leaf（历史接得上） |
+| 12 | 轮次标记 | `listRuns(sessionId)` 返回两轮；每轮的 `start_entry_id`/`end_entry_id` 能把 entries 切成两段而不重叠 |
 
 ### 验收标准
 
-- 一次真实 Run（`agent:run --local … --pr`）之后，`run_sessions` / `session_entries` / `usage_ledger` /
-  `tool_invocations` / `model_requests` 五张表都有正确数据；
-- 导出 JSONL 能被现有观察窗与人工排查流程直接使用；
+- 一次真实 Run（`agent:run --local … --pr`）之后，`sessions` / `runs` / `session_entries` / `usage_ledger` /
+  `tool_invocations` / `model_requests` 六张表都有正确数据；
+- 同一会话能起第二轮：上下文含第一轮历史，仓库起点是第一轮的产出（§J.1 第 9 条）；
+- 导出 JSONL（跨轮）能被现有观察窗与人工排查流程直接使用；
 - kill -9 集成测试进 `test:integration` 且通过。
 
 ---
@@ -674,8 +758,10 @@ prepareNextTurn（每轮结束、下一轮开始前）：
 2. **`exhaustive check`**：映射器写 `switch` + `never` 兜底，TS 编译期就能发现"新增事件没映射"。
    前端仍保留运行时断言（M0 的做法），因为 app.js 是纯 JS。
 
-3. **transcript 从 entries 派生**：`GET /runs/{id}/transcript` 读 `session_entries`（P2 的表）而不是
-   内存 JSONL。SSE 的**实时**部分仍走内存缓冲（观察窗的环形缓冲不变）。
+3. **transcript 从 entries 派生**：`GET /sessions/{id}/entries`（整个会话，跨 Run）与
+   `GET /runs/{id}/transcript`（本次执行）都读 `session_entries`（P2 的表）而不是内存 JSONL；
+   观察窗默认显示**会话视图**，用 `runs.start_entry_id` 标出每一轮的边界。
+   SSE 的**实时**部分仍走内存缓冲（观察窗的环形缓冲不变）。
 
 4. **上下文面板**：显示每个分区的 token 数与占比、`compiled_hash` 前 8 位、是否命中压缩。
    这是 M2 唯一新增的 UI 区块（其余 UI 在 P7/P14 各自加）。
@@ -1728,7 +1814,9 @@ executionMode：默认 parallel（除非 server 配置标 sequential）
 
 | M2 产物 | M3 怎么用 | 不能怎么用 |
 |---|---|---|
-| `session_entries`（只追加） | 跨进程恢复：读 entries 重建上下文 | 不能改成可变（要保持 append-only 才能做审计与回放） |
+| `sessions` + `runs` | 调度器与触发器（label / 评论 / cron）：什么时候起下一个 Run、谁先跑、配额与并发 | 不能让调度器重建会话表（轮次边界已经落在 `start_entry_id` / `end_entry_id` 上） |
+| `runs.sandbox_id` | 空闲沙箱复用（同一个会话的下一轮不重建沙箱） | 不能把"沙箱保活"写进循环（属于调度层） |
+| `session_entries`（只追加） | 同一个 Run 的跨进程恢复（读 entries 重建） | 不能改成可变（要保持 append-only 才能做审计与回放）；会话分叉要用 `parent_id` 扩展，不是改表 |
 | `tool_invocations`（intent/settlement） | 恢复：`replay: safe` 重放、`never` 合成中断结果 | 不能把"自动重放"塞进 M2 的循环（恢复属于调度层） |
 | `usage_ledger` | 成本看板 / 配额 / 告警 | 不能把配额判断塞进循环（属于 `shouldStopAfterTurn` 策略） |
 | `model_requests` | Trace / 回放 UI | 不能把 trace 当唯一真相（entries 才是） |

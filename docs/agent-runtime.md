@@ -1,6 +1,9 @@
 # Agent 运行时技术方案（M2：环境与上下文）
 
-> 版本 v1 · 2026-09-13
+> 版本 v1.1 · 2026-09-13
+> **v1.1 改了什么**：把「**会话是长期实体，Run 只是一次执行**」写实。v1 草案把会话与 Run 绑死
+> （`run_sessions` 一张表同时当两者用），那等于用户回第二句话时开了一个新会话、历史断掉——
+> 多轮对话是这个产品的一等场景，不是唯独一次执行。见表结构 §G 与 §A.1。
 > 目标：**任意仓库能自动跑起来**（Environment），**agent 真正"懂"这个仓库**（Context），
 > 并且把 M0 那套"能跑通闭环"的 agent 代码，换成与兄弟项目 **pi**（`/Users/reuben/Documents/pi`）同构的运行时。
 > 一句话：**环境是编译出来的，上下文也是编译出来的。**
@@ -77,13 +80,15 @@ README 里 M1 的清单，**有一半在 M0 已经顺手做掉了**：
 | # | 子系统 | 一句话 |
 |---|---|---|
 | 1 | **Agent Runtime（对齐 pi）** | 把循环 / 会话 / 上下文 / 工具拆成独立包，契约与 pi 同构 |
-| 2 | **Environment（环境构建）** | 任意仓库自动得到可用环境：三级推断 + 自愈 + 缓存 + 健康检查 |
-| 3 | **仓库索引与 Repo Map** | 让 agent 开局就有"这个仓库长什么样"的骨架 |
-| 4 | **ContextCompiler** | 每次模型调用前编译上下文：分区、预算、压缩、可回放 |
-| 5 | **Tool Registry / Skill / MCP** | 工具单一事实来源；技能按需加载；MCP 作为注册源之一 |
+| 2 | **多轮会话** | 会话是长期实体：跨 Run 的历史、压缩、续轮；一轮进行中可插话（见 §A.1） |
+| 3 | **Environment（环境构建）** | 任意仓库自动得到可用环境：三级推断 + 自愈 + 缓存 + 健康检查 |
+| 4 | **仓库索引与 Repo Map** | 让 agent 开局就有"这个仓库长什么样"的骨架 |
+| 5 | **ContextCompiler** | 每次模型调用前编译上下文：分区、预算、压缩、可回放 |
+| 6 | **Tool Registry / Skill / MCP** | 工具单一事实来源；技能按需加载；MCP 作为注册源之一 |
 
-**不做**（触发条件见 §H）：向量检索的默认开启、多 agent 协作、跨进程 Run 恢复（M3）、审批流（M3）、
-Project Memory（M3）、成本看板（M3）、gVisor/远程沙箱（M1）。
+**不做**（触发条件见 §H）：向量检索的默认开启、多 agent 协作、**同一个** Run 崩了原地续跑（M3）、
+空闲时挂沙箱等用户（M3）、会话分叉 / 并行试两种方案（M3）、审批流（M3）、Project Memory（M3）、
+成本看板（M3）、gVisor/远程沙箱（M1）。
 
 ---
 
@@ -96,7 +101,7 @@ Project Memory（M3）、成本看板（M3）、gVisor/远程沙箱（M1）。
 │  ┌────────────────────┐   ┌──────────────────────────────────────────┐  │
 │  │ run 编排            │   │ packages/agent-runtime（M2 新增）          │  │
 │  │ repo/ pr/ manager/  │──►│  loop.ts      循环（对齐 pi）             │  │
-│  │ tasks(M3)           │   │  session/     会话存储（entries 树）       │  │
+│  │ sessions/ runs/     │   │  session/     会话存储（entries 树）       │  │
 │  │                     │   │  compaction/  上下文压缩（对齐 pi）        │  │
 │  │                     │   │  context/     ContextCompiler            │  │
 │  │                     │   │  tools/       内置工具（沙箱 port 注入）   │  │
@@ -130,6 +135,51 @@ Project Memory（M3）、成本看板（M3）、gVisor/远程沙箱（M1）。
 1. Agent 循环仍然**只在 CP**（凭据、可迭代资产、可回放、零延迟代价，四条理由见 `sandbox.md` §A）；
 2. 沙箱仍然**只执行不决策**，仍然零凭据、仍然只有依赖源可出网；
 3. `SandboxProvider` 接口仍然是 3 个方法。
+
+### A.1 三个生命周期：会话 / Run / 沙箱
+
+**多轮对话是一等场景**（不是"交代一个任务就走"）。这三层的边界必须一开始就分清，
+否则第一个 Bug 就是"用户回了第二句话，历史断了"：
+
+```
+会话 Session（长期；存在 Postgres 里）
+  = 一个仓库 + 一条对话历史（entries 只追加）+ 已经压过的摘要
+  · 活多久：由用户决定（几天、几周都可以）；不随沙箱销毁而消失
+  │
+  │  用户发来一条消息 → 起一个 Run
+  ▼
+Run（一次执行；几分钟到几十分钟）
+  = 读会话历史 → 建一个沙箱 → 跑 agent 循环 → 干到停 → 收集产出
+  · 一轮结束的标志：模型收工 / 撞上限 / 被取消 / 出错
+  · 一轮里可以**中途插话**（steering）：消息注入当前 Run，不打断执行
+  │
+  ▼
+沙箱（易失；每 Run 一个，跑完销毁）
+  · 不持有业务状态；下一轮按需重建
+```
+
+**续轮怎么走**（M2 的实现，一个完整例子）：
+
+```
+第 1 轮：用户"修掉 #123 的登录问题"
+  → Run-1：clone（base commit）→ 灌沙箱 → 循环 → 改动 → **推送到 reuben-cloud/<task> 分支**
+          → entries 落库（这一轮的 user 消息、工具调用、最终回答）
+第 2 轮：用户"再给这个分支补个单测"
+  → 此刻没有活跃的 Run，所以起 Run-2：
+       ① 从 entries 重建上下文（含压缩摘要；上一轮的完整历史都在）
+       ② 仓库起点 = 上一轮推上去的分支（不是原始 base commit）——所以上一轮的改动接得住
+       ③ 新沙箱（上一轮那个已经销毁）→ 继续干活
+```
+
+**三条由此确定的规则**（都为了"第二句话不会让历史断掉"）：
+
+1. **entries 挂在会话上，不挂在 Run 上**。`sessions` 是长期实体，`runs` 只是"哪一段时间在干活"。
+2. **每轮结束必须把改动持久化**（推到任务分支）：沙箱会销毁，而下一轮要接着上一轮改，
+   起点只能是"上一轮的产出"。没有改动的一轮（比如只问了句"这段代码啥意思"）不用推。
+3. **`waiting_for_input` 不是 M2 的状态**。M2 里 Run 干完就结束，用户回话 = 新 Run。
+   让一个 Run 挂着等用户（占着沙箱）是 M3 的调度问题（见 §H）。
+
+**这不影响隔离与凭据红线**：会话历史在 CP 的 Postgres 里，沙箱依然什么都不知道、什么都没有。
 
 ---
 
@@ -270,8 +320,8 @@ RunEvent.type 都必须在前端有分支"的单测——那是在给两套真�
 
 | pi 的能力 | 为什么 M2 不搬 | 什么时候才需要 |
 |---|---|---|
-| 完整的 operation 状态机（run/compaction/navigation + `accept`/`drive`/`requestAbort`/`inspectExecution`） | 它是为"多入口调度 + 崩溃后可恢复"设计的；M2 的 Run 是单进程顺序执行，CP 已经有 sandbox 状态机 | M3「检查点恢复 / 云端多进程执行」——那时照它的形状做，而不是现在先建空壳 |
-| Branch / Lane / 会话树分叉 / navigation | 交互式产品才需要"回退到某个节点再试另一条路"；我们的 Run 是一条直线 | M3+ 如果要"同一任务并行试两种方案" |
+| 完整的 operation 状态机（`accept` / `drive` / `requestAbort` / `inspectExecution`、durable restart point、恢复规程） | 它解决的是"**同一个 Run** 被中断后原样续跑"（多入口调度 + 崩溃恢复）。M2 要的是"**会话**能续轮"——那就是 §A.1 的 `sessions` + `runs`，不需要每个操作都有一套可恢复状态 | M3「检查点恢复 / 云端多进程执行」——那时照它的形状做，而不是现在先建空壳 |
+| Branch / Lane / 会话树分叉 / navigation | **多轮对话不需要分叉**：一条对话就是一条直线，第 N 轮追加在第 N-1 轮后面（§A.1 已经做掉这件事）。被推迟的是"**从某一点并行试两种方案**"——那对分支/导航/结果合并的需求完全不同 | M3 的并行 Run（README §5 已有此条） |
 | 多 owner / RPC / inbox / 服务器托管 | 我们没有远端 session 服务 | 明确不做（非目标） |
 | JSONL / SQLite / Memory 三后端 | pi 要同时支持本地文件与嵌入式库；我们只有 Postgres + 测试用的内存实现 | 保持两个实现：Postgres（生产）、memory（单测） |
 | token 级 `Extension` 插件系统（`extensions/**`） | 它解决的是"第三方在不改核心的前提下加工具/命令/UI"；我们的扩展点是 Skill 与 MCP，两者都有标准协议 | 出现"用户要写代码扩展 runtime"的诉求时 |
@@ -443,6 +493,17 @@ README §3.3 列了五层索引。M2 的取舍要写清楚（避免"什么都做
 | 仓库地图 | 符号图 + PageRank | ✅ **做**（M2 的核心） | 见 D.3；单位收益最高 |
 | 依赖图 | import/call graph | ⚠️ **只做文件级** | 精确的 call graph 需要类型解析（每个语言一套，成本极高）；文件级引用图已经够 Repo Map 用 |
 | 向量索引 | pgvector + embedding | ❌ **M2 不做**（触发式，见 §I） | 没有评估集，无法判断"语义检索有没有让它更好"；而它有确定的成本（embedding 费用 + 索引时间 + 一致性维护） |
+
+**什么叫"向量检索"（给没有检索背景的读者）**：普通搜索是**字面匹配**——搜 `catch`，只有写了 `catch`
+的代码会被找到。向量检索是**按意思找**：用模型把每段代码转成一串数字（这就是 embedding / 向量），
+意思相近的代码数字也相近；于是搜"重试逻辑在哪"也能把叫 `retryWithBackoff` 的代码找出来。
+它需要一个装了 pgvector 扩展的 Postgres 存这些数字，还要一个 embedding 模型去算（要花钱、
+代码一改就要重算）。
+
+**为什么它排在后面**：Repo Map 回答的是"这个仓库的结构长什么样"——稳定、可解释、一次算好；
+向量检索回答的是"某个模糊概念大概在哪"——依赖切块策略、依赖模型、结果不稳定。
+前者属于"没有它 agent 会迷路"，后者属于"有了它可能少走几步"。而"少走几步"必须靠评估集度量；
+没有度量就上线，等于用感觉决定烧钱方向（与 README §3.8"没有评估集的进化是随机游走"同一条原则）。
 
 **这条取舍的依据不是"省事"，是"可比性"**：Repo Map 给的是**结构**（稳定、可解释、模型一看就懂），
 向量检索给的是**相关片段**（不稳定、依赖 chunk 策略、效果要测）。先做前者，后者等有评估集
@@ -808,14 +869,19 @@ repo_symbols          符号行（path, name, kind, signature, start/end line, l
 repo_refs             文件级引用边（from_path, to_path, symbol, weight）
 repo_maps             (repo_key, commit, personalization_hash, budget) → 渲染产物 + hash
 
-run_sessions          Run 的会话头（run_id, repo, base_commit, model, provider, env_revision…）
-session_entries       会话树（id, session_id, parent_id, seq, type, payload jsonb）
-model_requests        每轮模型调用的编译产物（sections/hash/正文内联或引用）
+sessions              会话（长期实体）：repo / 起点 commit / cwd / 标题 / 当前 leaf
+runs                  一次执行（一个沙箱）：session_id / start_entry_id / end_entry_id / 停止原因
+session_entries       会话的对话树（id, session_id, parent_id, seq, type, payload jsonb）——只追加
+model_requests        每轮模型调用的编译产物（session_id + run_id + turn；正文内联或引用）
 tool_invocations      工具调用的意图与结算（见 G.3）
 usage_ledger          每次模型调用的用量与成本（含压缩摘要 / 环境自愈 / 技能分析）
 skills / skill_runs   技能清单与每次加载记录（谁在什么任务里用了哪个技能、结果如何）
 mcp_servers / mcp_calls  MCP 服务器配置与调用记录
 ```
+
+**`sessions` 与 `runs` 的分工是这张表里最不能写错的一处**：entries / 用量 / 工具调用都挂
+`session_id`（长期），同时带一个 `run_id` 标记"这一段是哪次执行干的"。如果反过来把 entries
+挂在 Run 上，第二句话就会开一个新会话（§A.1 的那个 Bug）。
 
 **与既有表的关系**：`sandboxes` / `executions` / `artifacts` 一行不改。新表的 `run_id` 仍是
 **可空 text、无外键**（与 M0 Phase 8 同一个理由：`runs` 表是 M3 的事，现在建了就是空壳）。
@@ -825,7 +891,7 @@ mcp_servers / mcp_calls  MCP 服务器配置与调用记录
 | 字段 | 说明 |
 |---|---|
 | `id` | `ent_<ulid>`（时间有序，与既有 ID 风格一致） |
-| `session_id` | 归属 |
+| `session_id` | 归属（**长期实体**；一个会话可以有多个 Run） |
 | `parent_id` | 会话树的父指针（M2 是一条直线，但结构上支持分叉，M3 直接用） |
 | `seq` | 会话内单调递增（存储分配），排序与分页都用它 |
 | `type` | `message` / `compaction` / `custom`（M2 只有这三种用得上） |
@@ -834,10 +900,14 @@ mcp_servers / mcp_calls  MCP 服务器配置与调用记录
 
 **只追加，不修改，不删除**（压缩不改历史，只加一条）。唯一的例外是 M4 的合规删除，M2 不做。
 
+**下一轮的起点 = 当前 leaf**：会话里最新的那条 entry 就是下一轮开始的地方。
+`runs.start_entry_id` 记着"这一轮从哪条之后开始"，`runs.end_entry_id` 记着"结束时 leaf 在哪"——
+两个字段加起来就能回答"第 2 轮看到的是第 1 轮的哪些内容"。
+
 ### G.3 `tool_invocations`：意图 → 结算
 
 ```
-TX[intent]    INSERT tool_invocations(status='intent', tool, args,
+TX[intent]    INSERT tool_invocations(status='intent', session_id, run_id, tool, args,
                                       replay, turn, source_index, result_entry_id)
                               ↓
                         执行工具（可能耗时几分钟）
@@ -864,7 +934,9 @@ TX[settle]    INSERT session_entries(result_entry_id, toolResult…)
 
 | 功能 | 为什么现在不做 | 什么时候需要 |
 |---|---|---|
-| **跨进程 Run 恢复**（崩了接着跑） | M2 先保证"记录完整"；恢复要先把 operation 状态机建起来（pi 的 harness 形状），那是 M3 的量 | M3「检查点恢复」；触发点是"长任务在中途失败一次 = 几十分钟白烧" |
+| **同一个 Run 崩了原地续跑**（跨进程恢复） | M2 做的"续轮"是**会话级**的（新 Run 从 entries 重建，见 §A.1），不是**执行级**的（崩了的那个 Run 原地接上）。后者要先把 operation 状态机建起来 | M3「检查点恢复」；触发点是"长任务在中途失败一次 = 几十分钟白烧" |
+| **空闲时保留沙箱**（跨轮复用沙箱） | 每轮新建沙箱确实要重跑一次 clone + 装依赖；但"挂着沙箱等用户"要引入空闲态、TTL 与回收策略，且沙箱 TTL 本来就是 6h 安全兜底 | 一个会话的轮次间隔普遍 < 15 分钟、且重建已成为主要等待时（M3） |
+| **会话分叉 / 并行试两种方案** | 线性对话已经满足多轮；分叉要引入树结构、lane、结果合并与"选哪条"的产品交互 | M3 的并行 Run（README §5 已有此条） |
 | 向量检索 / embedding 索引 | 没有评估集就无法判断它是否让 agent 更好；Repo Map + ripgrep 已经覆盖"结构 + 精确匹配" | M4 的 Eval Harness 建好之后，作为一个"必须证明有增益才上线"的进化项 |
 | 多 agent / sub-agent | 先跑通单 agent；子 agent 的价值在"探索型任务的上下文隔离"，是 ContextCompiler 成熟后的优化 | 出现"探索步骤把主上下文撑爆"的实测数据时 |
 | 审批流（Human-in-the-loop） | M2 是单租户、本地、受信任；先积累 `tool_invocations` 里的风险数据 | M3「审批流」；接第二个用户时 |
@@ -887,7 +959,11 @@ TX[settle]    INSERT session_entries(result_entry_id, toolResult…)
 ```
 M2 交付                      M3 接什么                              接缝在哪
 ────────────────────────────┬──────────────────────────────────────┬──────────────────────────
-session_entries（只追加）    │ 跨进程恢复：读 entries 重建上下文        │ store 接口 + entries 完整
+sessions + runs（长期/一次） │ 调度器 + 触发器（label/评论/cron）：    │ run 表已有 session_id、
+                             │ 什么时候起下一个 Run、谁的消息先跑       │ started_at/ended_at；
+                             │                                      │ 状态机是新增列不是改表
+                             │ 空闲沙箱复用（会话热着的时候不重建）     │ sandbox_id 已在 runs 上
+session_entries（只追加）    │ 同一个 Run 的跨进程恢复（读 entries 重建）│ store 接口 + entries 完整
 tool_invocations（意图/结算）│ 恢复：replay=safe 重放 / never 合成中断  │ 表结构已经在
 usage_ledger                 │ 成本看板 + 配额 + 告警                  │ 每次模型调用都已记账
 model_requests               │ Trace / 回放 UI                        │ 每轮编译产物已落库
@@ -923,7 +999,11 @@ Repo Map                     │ 向量检索（触发式）                    
 7. **技能**：一个自带 `.reuben/skills/make-release/SKILL.md` 的仓库，模型在该任务里**确实加载了它**
    （`skill_runs` 有记录）并按技能指令执行；
 8. **MCP**：一个 stdio MCP server（比如官方的 filesystem / memory server）的 5 个工具里只放行 2 个，
-   模型能调用它们，未放行的工具**在工具列表里根本不存在**。
+   模型能调用它们，未放行的工具**在工具列表里根本不存在**；
+9. **多轮会话**：同一个会话里连续两轮——第 1 轮改完代码并推送，第 2 轮（新 Run、新沙箱）
+   ① 上下文里有第 1 轮的完整历史（必要时含压缩摘要）、② 仓库起点是第 1 轮的产出、
+   ③ 第 2 轮的产出包含两轮的全部改动；中间过程里，一轮进行中插入的 steering 消息
+   不会开新 Run、也不会丢。
 
 ### J.2 上下文质量（比"能不能跑"更难，必须量化）
 
@@ -987,7 +1067,7 @@ Repo Map                     │ 向量检索（触发式）                    
 | Phase | 工作量（人日） | 风险 | 关键路径 |
 |---|---|---|---|
 | P1 运行时契约与包拆分 | 3–4 | 中（动 M0 已跑通的代码） | ✅ |
-| P2 会话持久化 | 4–5 | 中（迁移 + 双实现一致） | ✅ |
+| P2 会话持久化（会话长期 + Run 一次执行） | 5–6 | 中（迁移 + 双实现一致） | ✅ |
 | P3 compaction | 3–4 | **高**（切点/估算写错会悄悄烧钱） | ✅ |
 | P4 事件统一 | 1–2 | 低 | ✅ |
 | P5 环境定义与推断 | 4–5 | 中（devcontainer 子集范围蔓延） | ✅ |
@@ -1000,7 +1080,7 @@ Repo Map                     │ 向量检索（触发式）                    
 | P12 Registry + 工具补齐 | 3–4 | 中（与 pi 行为对拍） | |
 | P13 Skills | 2–3 | 低 | |
 | P14 MCP | 3–5 | 中（协议 + 管理界面） | |
-| **合计** | **44–59 人日** | | |
+| **合计** | **45–60 人日** | | |
 
 > 换算成日历时间（单人、AI 辅助、按 M0 的实际节奏）：**6–9 周**。其中 P3（compaction）与 P8（符号索引）
 > 是唯一两处"写错了不会立刻报错"的地方（切点算错会静默烧钱；多语言解析覆盖不全只会在某些仓库上退化成没地图），
@@ -1008,7 +1088,7 @@ Repo Map                     │ 向量检索（触发式）                    
 
 **交付切分建议（M2a / M2b）**：
 
-- **M2a（P1–P10，约 33–44 人日）**：任意仓库能跑起来 + agent 有仓库全局感 + 上下文有预算——
+- **M2a（P1–P10，约 34–45 人日）**：任意仓库能跑起来 + agent 有仓库全局感 + 上下文有预算 + 多轮会话——
   **这是 M2 真正的价值，做完就该停手看看效果**（用 §J.2 的指标对照）；
 - **M2b（P11–P14，约 11–15 人日）**：向量检索（要评估集）、工具面扩展、技能、MCP——
   每一项都是**独立可裁剪**的，效果不佳就砍掉，不影响 M2a 的成立。
